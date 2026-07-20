@@ -90,9 +90,13 @@ class MiniTimelineEvent(BaseModel):
 
     id: str
     ts: datetime
+    timestamp: datetime | None = None
     kind: str = Field(description="audit | case_comment | status_change | investigation | …")
+    type: str | None = None
     agent: str = Field(description="actor — system | analyst@… | agent-id")
+    actor: str | None = None
     summary: str = Field(description="One-line description, plain text")
+    title: str | None = None
     payload: dict[str, Any] | None = Field(default=None)
     duration_ms: int = 0
 
@@ -332,12 +336,18 @@ def _audit_event(row: AuditLog) -> MiniTimelineEvent:
     elif isinstance(row.metadata_, dict) and row.metadata_:
         payload = dict(row.metadata_)
     actor = row.actor_email or (str(row.actor_id) if row.actor_id else "system")
+    summary_str = _summarise_audit(row)
+    kind_str = row.action or "audit"
     return MiniTimelineEvent(
         id=str(row.id),
         ts=row.created_at,
-        kind=row.action or "audit",
+        timestamp=row.created_at,
+        kind=kind_str,
+        type=kind_str,
         agent=actor,
-        summary=_summarise_audit(row),
+        actor=actor,
+        summary=summary_str,
+        title=summary_str,
         payload=payload,
     )
 
@@ -362,12 +372,18 @@ def _case_event(row: CaseTimeline) -> MiniTimelineEvent:
     payload: dict[str, Any] | None = None
     if isinstance(row.event_metadata, dict) and row.event_metadata:
         payload = dict(row.event_metadata)
+    kind_str = row.event_type or "case_event"
+    summary_str = row.content or row.event_type or "case event"
     return MiniTimelineEvent(
         id=str(row.id),
         ts=row.created_at,
-        kind=row.event_type or "case_event",
+        timestamp=row.created_at,
+        kind=kind_str,
+        type=kind_str,
         agent=actor,
-        summary=row.content or row.event_type or "case event",
+        actor=actor,
+        summary=summary_str,
+        title=summary_str,
         payload=payload,
     )
 

@@ -30,6 +30,8 @@ from app.db.engine import dispose_engine
 from app.scheduler import ConnectorScheduler, scheduler_disabled
 from app.security.cors import build_cors_kwargs
 
+# Ensure standard library logging outputs to stdout (APScheduler/ConnectorScheduler logs)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("aisoc.connectors.main")
 
 

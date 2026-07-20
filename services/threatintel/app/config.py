@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from typing import Any
+
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -11,6 +14,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=True,
         extra="ignore",
+        enable_decoding=False,
     )
 
     # Service
@@ -93,6 +97,15 @@ class Settings(BaseSettings):
     # into zero-egress mode.
     AISOC_AIRGAPPED: bool = False
     AISOC_AIRGAP_ALLOWLIST: list[str] = []
+
+    @field_validator("AISOC_AIRGAP_ALLOWLIST", mode="before")
+    @classmethod
+    def parse_airgap_allowlist(cls, v: Any) -> list[str]:
+        if isinstance(v, str):
+            return [host.strip().lower() for host in v.split(",") if host.strip()]
+        if isinstance(v, list):
+            return [str(host).strip().lower() for host in v if str(host).strip()]
+        return v
 
 
 settings = Settings()

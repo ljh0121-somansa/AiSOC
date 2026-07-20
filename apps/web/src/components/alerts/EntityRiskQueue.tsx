@@ -12,9 +12,11 @@
  */
 
 import { useState } from 'react';
+import Link from 'next/link';
 import useSWR from 'swr';
 import { clsx } from 'clsx';
 import { formatDistanceToNow } from 'date-fns';
+import { isDemoMode } from '@/lib/demoMode';
 import {
   entityRiskApi,
   type AlertSeverity,
@@ -106,6 +108,17 @@ const MOCK_ENTITY_STATS: EntityRiskStats = {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+function safeDate(d: any): Date {
+  if (!d) return new Date();
+
+  const parsed = new Date(d);
+  if (isNaN(parsed.getTime())) {
+    return new Date();
+  }
+
+  return parsed;
+}
+
 function bandFor(score: number, threshold: number): {
   label: string;
   text: string;
@@ -191,7 +204,7 @@ function RatioStat({
 function SeverityHistogram({
   histogram,
 }: {
-  histogram: Record<string, number>;
+  histogram: Record<string, number> | undefined;
 }) {
   const order: Array<keyof typeof SEVERITY_DOT> = [
     'critical',
@@ -203,7 +216,8 @@ function SeverityHistogram({
   return (
     <div className="flex items-center gap-2">
       {order.map((sev) => {
-        const count = histogram[sev] ?? 0;
+        const h = histogram || {};
+        const count = h[sev] ?? 0;
         if (count === 0) return null;
         return (
           <span
@@ -291,7 +305,7 @@ function EntityRow({
           <span className="text-gray-700">·</span>
           <span className="text-xs text-gray-500" suppressHydrationWarning>
             last seen{' '}
-            {formatDistanceToNow(new Date(record.last_seen), {
+            {formatDistanceToNow(safeDate(record.last_seen), {
               addSuffix: true,
             })}
           </span>
@@ -389,7 +403,7 @@ function EntityDetailDrawer({
               </p>
               <p className="text-[10px] text-gray-500 mt-0.5" suppressHydrationWarning>
                 first seen{' '}
-                {formatDistanceToNow(new Date(record.first_seen), {
+                {formatDistanceToNow(safeDate(record.first_seen), {
                   addSuffix: true,
                 })}
               </p>
@@ -401,9 +415,12 @@ function EntityDetailDrawer({
               <p className="text-[10px] uppercase tracking-wider text-red-300">
                 Promoted to incident
               </p>
-              <p className="text-sm font-mono text-red-200 mt-1 break-all">
+              <Link 
+                href={`/cases/${record.promoted_incident_id}`}
+                className="block text-sm font-mono text-red-200 hover:text-red-100 mt-1 break-all transition-colors underline decoration-red-500/30 underline-offset-4"
+              >
                 {record.promoted_incident_id}
-              </p>
+              </Link>
             </div>
           )}
 
@@ -411,13 +428,13 @@ function EntityDetailDrawer({
             <h3 className="text-xs uppercase tracking-wider text-gray-500 mb-2">
               Contributing alerts
             </h3>
-            {record.contributions.length === 0 ? (
+            {(record.contributions || []).length === 0 ? (
               <p className="text-sm text-gray-600">
                 No contributions in the current decay window.
               </p>
             ) : (
               <ol className="space-y-1.5">
-                {record.contributions.map((c) => (
+                {(record.contributions || []).map((c) => (
                   <li
                     key={c.alert_id}
                     className="flex items-start gap-2 text-sm border border-gray-800/60 bg-gray-900/40 rounded-lg px-3 py-2"
@@ -430,9 +447,12 @@ function EntityDetailDrawer({
                     />
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
-                        <span className="text-gray-200 truncate">
+                        <Link
+                          href={`/alerts/${c.alert_id}`}
+                          className="text-blue-300 hover:text-blue-200 truncate transition-colors"
+                        >
                           {c.title ?? c.alert_id}
-                        </span>
+                        </Link>
                         <span className="text-[10px] text-gray-500 shrink-0">
                           +{Math.round(c.raw_points)}
                         </span>
@@ -441,7 +461,7 @@ function EntityDetailDrawer({
                         {c.source && <span>{c.source}</span>}
                         {c.source && <span className="text-gray-700">·</span>}
                         <span suppressHydrationWarning>
-                          {formatDistanceToNow(new Date(c.observed_at), {
+                          {formatDistanceToNow(safeDate(c.observed_at), {
                             addSuffix: true,
                           })}
                         </span>
@@ -464,15 +484,17 @@ export function EntityRiskQueue() {
   const [promotedOnly, setPromotedOnly] = useState(false);
   const [selected, setSelected] = useState<EntityRiskRecord | null>(null);
 
+  const demo = isDemoMode();
+
   const { data: queue, error: queueError, isLoading: queueLoading } = useSWR(
     ['entity-risk-queue', promotedOnly],
     () => entityRiskApi.queue({ limit: 50, promotedOnly }),
-    { refreshInterval: 30000, fallbackData: { tenant_id: 'demo', entities: MOCK_ENTITIES, threshold: 80 } },
+    { refreshInterval: 30000, fallbackData: demo ? { tenant_id: 'demo', entities: MOCK_ENTITIES, threshold: 80 } : undefined },
   );
   const { data: stats } = useSWR<EntityRiskStats>(
     'entity-risk-stats',
     () => entityRiskApi.stats(),
-    { refreshInterval: 30000, fallbackData: MOCK_ENTITY_STATS },
+    { refreshInterval: 30000, fallbackData: demo ? MOCK_ENTITY_STATS : undefined },
   );
 
   const entities = queue?.entities ?? [];

@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -122,17 +124,40 @@ var connectorProfiles = map[string]connectorProfile{
 			"High": 4, "Medium": 3, "Low": 2, "Informational": 1,
 		},
 	},
-	"splunk_enterprise": {
+	"splunk": {
 		product:   OcsfProduct{Name: "Splunk Enterprise", VendorName: "Splunk"},
 		classUID:  4001,
-		className: "Network Activity",
+		className: "Security Finding",
 		fieldMap: map[string]string{
-			"_time": "time",
-			"src":   "src_endpoint.ip",
-			"dst":   "dst_endpoint.ip",
-			"user":  "actor.user.name",
+			"_time":                          "time",
+			"raw_event.created_at":           "time",
+			"raw_event.raw_event._time":      "time",
+			"raw_event.src":                  "src_endpoint.ip",
+			"raw_event.src_ip":               "src_endpoint.ip",
+			"raw_event.raw_event.src":        "src_endpoint.ip",
+			"raw_event.raw_event.src_ip":     "src_endpoint.ip",
+			"raw_event.dst":                  "dst_endpoint.ip",
+			"raw_event.dst_ip":               "dst_endpoint.ip",
+			"raw_event.raw_event.dst":        "dst_endpoint.ip",
+			"raw_event.raw_event.dst_ip":     "dst_endpoint.ip",
+			"raw_event.USER":                 "actor.user.name",
+			"raw_event.user":                 "actor.user.name",
+			"raw_event.raw_event.USER":       "actor.user.name",
+			"raw_event.raw_event.user":       "actor.user.name",
+			"raw_event.orig_host":            "device.name",
+			"raw_event.host":                 "device.name",
+			"raw_event.raw_event.orig_host":  "device.name",
+			"raw_event.raw_event.host":       "device.name",
+			"raw_event.raw_event.entity":     "device.name",
+			"raw_event.raw_event.risk_object": "device.name",
+			"urgency":                        "severity",
+			"raw_event.severity":             "severity",
+			"raw_event.raw_event.severity":   "severity",
 		},
-		severityMap: map[string]int{},
+		severityMap: map[string]int{
+			"critical": 5, "high": 4, "medium": 3, "low": 2, "informational": 1, "info": 1,
+			"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFORMATIONAL": 1, "INFO": 1,
+		},
 	},
 	"okta_system_log": {
 		product:   OcsfProduct{Name: "Okta System Log", VendorName: "Okta"},
@@ -250,7 +275,7 @@ func (n *Normalizer) Normalize(raw *RawEvent) (*NormalizedEvent, error) {
 			return nil, fmt.Errorf("unknown connector type: %s", raw.ConnectorType)
 		}
 		// Lenient: use generic profile
-		profile = connectorProfiles["splunk_enterprise"]
+		profile = connectorProfiles["splunk"]
 		log.Warn().Str("connector_type", raw.ConnectorType).Msg("Using generic profile for unknown connector")
 	}
 
@@ -279,8 +304,85 @@ func (n *Normalizer) Normalize(raw *RawEvent) (*NormalizedEvent, error) {
 		}
 	}
 
+	// Fallback: If Splunk _raw is present and fields are still missing, try extracting from _raw
+	if splunkRawStr := getNestedField(raw.Payload, "raw_event.raw_event._raw"); splunkRawStr != nil {
+		if s, ok := splunkRawStr.(string); ok {
+			// Extract host
+			if getNestedField(ocsf, "device.name") == nil {
+				if host := extractFromSplunkRaw(s, "orig_host"); host != "" {
+					setNestedField(ocsf, "device.name", host)
+				} else if host := extractFromSplunkRaw(s, "entity"); host != "" {
+					setNestedField(ocsf, "device.name", host)
+				}
+			}
+			// Extract user
+			if getNestedField(ocsf, "actor.user.name") == nil {
+				if user := extractFromSplunkRaw(s, "USER"); user != "" {
+					setNestedField(ocsf, "actor.user.name", user)
+				}
+			}
+			// Extract IPs
+			if getNestedField(ocsf, "src_endpoint.ip") == nil {
+				if ip := extractFromSplunkRaw(s, "src_ip"); ip != "" {
+					setNestedField(ocsf, "src_endpoint.ip", ip)
+				} else if ip := extractFromSplunkRaw(s, "src"); ip != "" {
+					setNestedField(ocsf, "src_endpoint.ip", ip)
+				}
+			}
+			// Extract Title
+			if getNestedField(ocsf, "message") == nil && getNestedField(ocsf, "activity_name") == nil {
+				if title := extractFromSplunkRaw(s, "orig_rule_title"); title != "" {
+					setNestedField(ocsf, "message", title)
+				}
+			}
+			// Extract Description
+			if getNestedField(ocsf, "raw_data") == nil || ocsf["raw_data"] == "" {
+				if desc := extractFromSplunkRaw(s, "risk_message"); desc != "" {
+					setNestedField(ocsf, "raw_data", desc)
+				} else if desc := extractFromSplunkRaw(s, "orig_rule_description"); desc != "" {
+					setNestedField(ocsf, "raw_data", desc)
+				}
+			}
+			// Extract Risk Score
+			if score := extractFromSplunkRaw(s, "risk_score"); score != "" {
+				if fScore, err := strconv.ParseFloat(score, 64); err == nil {
+					setNestedField(ocsf, "risk_score", fScore)
+				}
+			}
+		}
+	}
+
 	// Map severity
-	if sevField, ok := raw.Payload["severity"].(string); ok {
+	var sevField string
+	if val, ok := raw.Payload["severity"].(string); ok && val != "" {
+		sevField = val
+	} else if val := getNestedField(raw.Payload, "raw_event.severity"); val != nil {
+		if s, ok := val.(string); ok && s != "" {
+			sevField = s
+		}
+	} else if val := getNestedField(raw.Payload, "raw_event.raw_event.severity"); val != nil {
+		if s, ok := val.(string); ok && s != "" {
+			sevField = s
+		}
+	}
+
+	// Fallback to Splunk _raw parsing
+	var splunkRaw string
+	if val := getNestedField(raw.Payload, "raw_event.raw_event._raw"); val != nil {
+		if s, ok := val.(string); ok {
+			splunkRaw = s
+		}
+	} else if val := getNestedField(raw.Payload, "raw_event._raw"); val != nil {
+		if s, ok := val.(string); ok {
+			splunkRaw = s
+		}
+	}
+
+	if sevField == "" && splunkRaw != "" {
+		sevField = extractFromSplunkRaw(splunkRaw, "severity")
+	}
+
+	if sevField != "" {
 		if sevID, found := profile.severityMap[sevField]; found {
 			ocsf["severity_id"] = sevID
 			ocsf["severity"] = sevField
@@ -380,13 +482,33 @@ func extractTechniqueIDs(payload map[string]interface{}) []string {
 	seen := map[string]struct{}{}
 	var results []string
 
+	// Check _raw string fallback
+	if splunkRawStr := getNestedField(payload, "raw_event.raw_event._raw"); splunkRawStr != nil {
+		if s, ok := splunkRawStr.(string); ok {
+			mitre := extractFromSplunkRaw(s, "annotations.mitre_attack")
+			if mitre == "" {
+				mitre = extractFromSplunkRaw(s, "mitre_attack")
+			}
+			if mitre != "" {
+				if tid := normalizeTechniqueID(mitre); tid != "" {
+					seen[tid] = struct{}{}
+					results = append(results, tid)
+				}
+			}
+		}
+	}
+
 	candidateKeys := []string{
 		"technique_id", "mitre_technique", "attck_technique", "tactic_id",
 		"mitre_techniques", "attack_technique",
+		"raw_event.annotations.mitre_attack",
+		"raw_event.raw_event.annotations.mitre_attack",
+		"raw_event.raw_event.annotations.mitre_attack_id",
+		"raw_event.raw_event.mitre_techniques",
 	}
 	for _, key := range candidateKeys {
-		val, ok := payload[key]
-		if !ok {
+		val := getNestedField(payload, key)
+		if val == nil {
 			continue
 		}
 		switch v := val.(type) {
@@ -416,8 +538,20 @@ func extractTechniqueIDs(payload map[string]interface{}) []string {
 // normalizeTechniqueID extracts a clean ATT&CK technique ID from a string.
 func normalizeTechniqueID(s string) string {
 	s = strings.TrimSpace(strings.ToUpper(s))
-	// Accept T1234 or T1234.001
-	if len(s) >= 5 && s[0] == 'T' {
+	if len(s) < 5 || s[0] != 'T' {
+		return ""
+	}
+	// Extract the leading alphanumeric/dot prefix (e.g. T1496)
+	var clean []rune
+	for _, r := range s {
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' {
+			clean = append(clean, r)
+		} else {
+			break
+		}
+	}
+	s = string(clean)
+	if len(s) >= 5 {
 		parts := strings.SplitN(s, ".", 2)
 		if len(parts[0]) >= 5 && len(parts[0]) <= 7 {
 			return s
@@ -446,6 +580,9 @@ func normalizeTime(t string) string {
 
 // getNestedField retrieves a value from a nested map using dot notation
 func getNestedField(m map[string]interface{}, path string) interface{} {
+	if val, ok := m[path]; ok {
+		return val
+	}
 	parts := strings.SplitN(path, ".", 2)
 	val, ok := m[parts[0]]
 	if !ok {
@@ -482,4 +619,28 @@ func generateEventID(raw *RawEvent) string {
 		key += ":" + id
 	}
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(key)).String()
+}
+
+// extractFromSplunkRaw extracts a value from a Splunk _raw string by key.
+// Matches key="value" or key=value patterns, supporting spaces in unquoted text.
+func extractFromSplunkRaw(raw string, key string) string {
+	// Look for key="value"
+	reQuote := regexp.MustCompile(regexp.QuoteMeta(key) + `\s*=\s*"([^"\\]*(?:\\.[^"\\]*)*)"`)
+	matchesQuote := reQuote.FindStringSubmatch(raw)
+	if len(matchesQuote) > 1 {
+		return strings.ReplaceAll(matchesQuote[1], "\\\"", "\"")
+	}
+
+	// Look for key=value (no quotes)
+	reNoQuote := regexp.MustCompile(regexp.QuoteMeta(key) + `\s*=\s*([^=]*?)(?:\s+[a-zA-Z0-9_]+=|\s*$)`)
+	matchesNoQuote := reNoQuote.FindStringSubmatch(raw)
+	if len(matchesNoQuote) > 1 {
+		val := strings.TrimSpace(matchesNoQuote[1])
+		if strings.HasSuffix(val, ",") {
+			val = strings.TrimSpace(strings.TrimSuffix(val, ","))
+		}
+		return val
+	}
+
+	return ""
 }

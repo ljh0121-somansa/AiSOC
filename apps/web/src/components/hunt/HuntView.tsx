@@ -535,14 +535,27 @@ function SavedList({
 
 function ResultRow({ result }: { result: HuntResult }) {
   const [open, setOpen] = useState(false);
+  const fields = result.fields || (result as any).raw || {};
   const fieldEntries = useMemo(
-    () => Object.entries(result.fields ?? {}),
-    [result.fields],
+    () => Object.entries(fields),
+    [fields],
   );
-  const summaryFields = ['host', 'user', 'process.name', 'process.command_line'];
+  const summaryFields = ['host', 'user', 'process.name', 'process_name', 'process.command_line', 'cmdline'];
   const summary = summaryFields
-    .map((k) => [k, result.fields?.[k]] as const)
+    .map((k) => [k, fields[k]] as const)
     .filter(([, v]) => v != null && v !== '');
+
+  let formattedTime = 'Unknown Time';
+  if (result.timestamp) {
+    try {
+      const d = new Date(result.timestamp);
+      if (!isNaN(d.getTime())) {
+        formattedTime = format(d, 'MMM dd HH:mm:ss');
+      }
+    } catch (e) {
+      formattedTime = 'Invalid Date';
+    }
+  }
 
   return (
     <li className="border-b border-slate-800/60 last:border-b-0">
@@ -561,7 +574,7 @@ function ResultRow({ result }: { result: HuntResult }) {
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-400">
             <span className="font-mono text-slate-300" suppressHydrationWarning>
-              {format(new Date(result.timestamp), 'MMM dd HH:mm:ss')}
+              {formattedTime}
             </span>
             <span className="text-slate-600">·</span>
             <span className="rounded bg-slate-800/60 px-1.5 py-0.5 text-[10px] text-slate-400">
@@ -1131,8 +1144,8 @@ export function HuntView() {
                 Hunt results
                 {results && (
                   <span className="ml-2 text-xs font-normal text-slate-400">
-                    {results.total.toLocaleString()} hits ·{' '}
-                    {results.took.toLocaleString()}ms
+                    {(results.total ?? 0).toLocaleString()} hits ·{' '}
+                    {(results.took ?? (results as any).took_ms ?? 0).toLocaleString()}ms
                   </span>
                 )}
               </h3>

@@ -679,7 +679,7 @@ async def _call_llm_for_summary(
     """
     started = time.monotonic()
     base = llm_config.base_url.rstrip("/")
-    url = f"{base}/v1/chat/completions"
+    url = f"{base}/chat/completions" if base.endswith("/v1") else f"{base}/v1/chat/completions"
 
     prompt_alert = {
         "title": alert.title,

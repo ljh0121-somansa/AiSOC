@@ -52,7 +52,7 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -262,6 +262,11 @@ class ConnectorScheduler:
                 continue
 
             interval = _coerce_poll_interval(inst.connector_config)
+            # Spread first-fire by seconds-since-epoch hash so 100
+            # connectors don't all stampede at the same instant.
+            jitter_seconds = inst.id.int % min(interval, 30)
+            next_run = datetime.now(UTC) + timedelta(seconds=jitter_seconds)
+
             self._scheduler.add_job(
                 self._poll_one,
                 "interval",
@@ -271,9 +276,7 @@ class ConnectorScheduler:
                 max_instances=1,
                 # Don't pile up missed polls if the source was slow/dead.
                 coalesce=True,
-                # Spread first-fire by seconds-since-epoch hash so 100
-                # connectors don't all stampede at the same instant.
-                next_run_time=None,
+                next_run_time=next_run,
                 kwargs={"connector_id": inst.id},
             )
             self._known_signatures[cid] = sig

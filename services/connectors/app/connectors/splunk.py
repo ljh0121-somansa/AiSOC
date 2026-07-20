@@ -55,6 +55,14 @@ class SplunkConnector(BaseConnector):
                     default=True,
                     help_text="Disable only for self-signed certificates in private deployments.",
                 ),
+                Field(
+                    "poll_interval_seconds",
+                    "integer",
+                    "Polling Interval (seconds)",
+                    required=False,
+                    default=300,
+                    help_text="How often to query Splunk for alerts (e.g. 300 for 5 min, 86400 for 24 hours).",
+                ),
             ],
         )
 
@@ -77,6 +85,7 @@ class SplunkConnector(BaseConnector):
         token: str,
         saved_search: str = "AiSOC_Alerts",
         ssl_verify: bool = True,
+        **kwargs: Any,
     ):
         self._base_url = base_url.rstrip("/")
         self._token = token
@@ -100,48 +109,34 @@ class SplunkConnector(BaseConnector):
                 resp.raise_for_status()
                 version = resp.json().get("entry", [{}])[0].get("content", {}).get("version")
                 return {"success": True, "connector": self.connector_id, "version": version}
-            except Exception as exc:
+            except httpx.HTTPStatusError as exc:
+                logger.warning("splunk.test_connection.failed", error_type=type(exc).__name__, status_code=exc.response.status_code)
+                err_msg = f"Connection failed: HTTP {exc.response.status_code} {exc.response.reason_phrase}"
+                return {"success": False, "connector": self.connector_id, "error": err_msg}
+            except httpx.TimeoutException as exc:
                 logger.warning("splunk.test_connection.failed", error_type=type(exc).__name__)
-                return {"success": False, "connector": self.connector_id, "error": "Connection failed"}
+                return {"success": False, "connector": self.connector_id, "error": "Connection failed: Request timed out"}
+            except httpx.ConnectError as exc:
+                logger.warning("splunk.test_connection.failed", error_type=type(exc).__name__, error=str(exc))
+                err_str = str(exc).lower()
+                if "cert" in err_str or "ssl" in err_str or "handshake" in err_str:
+                    return {"success": False, "connector": self.connector_id, "error": "Connection failed: SSL Certificate Verification Failed. Try unchecking 'Verify SSL certificate'."}
+                return {"success": False, "connector": self.connector_id, "error": "Connection failed: Server unreachable or connection refused"}
+            except Exception as exc:
+                logger.warning("splunk.test_connection.failed", error_type=type(exc).__name__, error=str(exc))
+                return {"success": False, "connector": self.connector_id, "error": f"Connection failed: {str(exc) or type(exc).__name__}"}
 
     async def fetch_alerts(self, since_seconds: int = 300) -> list[dict[str, Any]]:
         search_query = f"search index=notable earliest=-{since_seconds}s | head 100"
 
         async with httpx.AsyncClient(timeout=60.0, verify=self._ssl_verify) as client:
-            # Create search job
             resp = await client.post(
                 f"{self._base_url}/services/search/jobs",
                 headers=self._headers(),
-                data={"search": search_query, "output_mode": "json"},
+                data={"search": search_query, "output_mode": "json", "exec_mode": "oneshot"},
             )
             resp.raise_for_status()
-            sid = resp.json().get("sid")
-
-            if not sid:
-                return []
-
-            # Wait for completion (simple polling)
-            import asyncio
-
-            for _ in range(10):
-                status_resp = await client.get(
-                    f"{self._base_url}/services/search/jobs/{sid}",
-                    headers=self._headers(),
-                    params={"output_mode": "json"},
-                )
-                dispatch_state = status_resp.json().get("entry", [{}])[0].get("content", {}).get("dispatchState", "")
-                if dispatch_state == "DONE":
-                    break
-                await asyncio.sleep(2)
-
-            # Fetch results
-            results_resp = await client.get(
-                f"{self._base_url}/services/search/jobs/{sid}/results",
-                headers=self._headers(),
-                params={"output_mode": "json", "count": 100},
-            )
-            results_resp.raise_for_status()
-            results = results_resp.json().get("results", [])
+            results = resp.json().get("results", [])
 
         return [self.normalize(r) for r in results]
 

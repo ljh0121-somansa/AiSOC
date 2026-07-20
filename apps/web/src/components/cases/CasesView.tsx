@@ -9,6 +9,7 @@ import { clsx } from 'clsx';
 import { format } from 'date-fns';
 import { EmptyState, EmptyStateIcons } from '@/components/ui/EmptyState';
 import { SavedViewsBar } from '@/components/saved-views/SavedViewsBar';
+import { isDemoMode } from '@/lib/demoMode';
 
 // WS-F3 — the saved-views API stores an opaque filter blob per view, so we
 // flatten the three filter slices Cases tracks today into a single shape the
@@ -153,12 +154,14 @@ export function CasesView({ initialCases }: CasesViewProps = {}) {
   const [severityFilter, setSeverityFilter] = useState<Case['severity'] | 'all'>('all');
   const [search, setSearch] = useState('');
 
-  const fallback: CasesResponse = initialCases ?? {
+  const demo = isDemoMode();
+
+  const fallback: CasesResponse | undefined = initialCases ?? (demo ? {
     cases: MOCK_CASES,
     total: MOCK_CASES.length,
     page: 1,
     pageSize: MOCK_CASES.length,
-  };
+  } : undefined);
 
   const { data: casesData, isLoading } = useSWR(
     ['cases', statusFilter, severityFilter],

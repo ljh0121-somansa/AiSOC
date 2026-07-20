@@ -16,9 +16,27 @@ import structlog
 
 logger = structlog.get_logger()
 
-_ENRICHMENT_URL = os.getenv("ENRICHMENT_SERVICE_URL", "http://enrichment:8080")
+import socket
+from urllib.parse import urlparse
+
+_DEFAULT_ENRICHMENT_URL = "http://enrichment:8082"
 _API_URL = os.getenv("API_SERVICE_URL", "http://api:8000")
 _TIMEOUT = 10.0
+
+
+def _enrichment_url() -> str:
+    raw_url = os.getenv("ENRICHMENT_SERVICE_URL", "").strip() or os.getenv("ENRICHMENT_URL", "").strip() or _DEFAULT_ENRICHMENT_URL
+    try:
+        parsed = urlparse(raw_url)
+        if parsed.hostname and not parsed.hostname.replace(".", "").isdigit():
+            # Resolve the hostname to its IPv4 address (e.g. "enrichment" -> "172.18.0.14")
+            # to prevent httpx/anyio IPv6 resolution/connection races inside docker.
+            ip = socket.gethostbyname(parsed.hostname)
+            port_suffix = f":{parsed.port}" if parsed.port else ""
+            return f"{parsed.scheme}://{ip}{port_suffix}{parsed.path}"
+    except Exception as e:
+        logger.debug("enrichment_dns_resolve_failed", error=str(e))
+    return raw_url
 
 
 # ---------------------------------------------------------------------------
@@ -34,7 +52,7 @@ async def enrich_ioc(ioc_value: str, ioc_type: str) -> dict[str, Any]:
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             resp = await client.post(
-                f"{_ENRICHMENT_URL}/enrich",
+                f"{_enrichment_url()}/enrich",
                 json={"value": ioc_value, "type": ioc_type},
             )
             resp.raise_for_status()

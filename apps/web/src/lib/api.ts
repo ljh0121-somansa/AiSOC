@@ -734,7 +734,11 @@ export const alertsApi = {
       params: filters as Record<string, string>,
     });
     return {
-      alerts: Array.isArray(raw.alerts) ? raw.alerts.map(normalizeAlert) : [],
+      alerts: Array.isArray(raw.alerts)
+        ? raw.alerts.map(normalizeAlert)
+        : Array.isArray((raw as any).items)
+          ? (raw as any).items.map(normalizeAlert)
+          : [],
       total: typeof raw.total === 'number' ? raw.total : 0,
       page: typeof raw.page === 'number' ? raw.page : 1,
       pageSize:

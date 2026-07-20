@@ -43,7 +43,7 @@ from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Response, status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
@@ -1105,18 +1105,22 @@ async def case_investigate(
     user: AuthUser,
 ) -> dict[str, Any]:
     cid = await _resolve_case_id(case_id, db, user.tenant_id)
-    exists = (
+    case_row = (
         await db.execute(
-            text("SELECT 1 FROM aisoc_cases WHERE id = :id AND tenant_id = :tenant_id").bindparams(id=cid, tenant_id=user.tenant_id)
+            text("SELECT description, title FROM aisoc_cases WHERE id = :id AND tenant_id = :tenant_id").bindparams(id=cid, tenant_id=user.tenant_id)
         )
     ).fetchone()
-    if not exists:
+    if not case_row:
         raise HTTPException(status_code=404, detail="Case not found.")
+
+    alert_summary = body.alert_summary
+    if not alert_summary:
+        alert_summary = case_row.description or case_row.title or ""
 
     resp = await _agents_proxy(
         "POST",
         f"/api/v1/cases/{cid}/investigate",
-        json={"alert_summary": body.alert_summary or ""},
+        json={"alert_summary": alert_summary},
     )
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
@@ -1324,6 +1328,38 @@ async def case_investigation_pdf(
             ),
         },
     )
+
+
+@router.get(
+    "/{case_id}/investigations/{run_id}/report.md",
+    summary="Download investigation Markdown report",
+)
+async def case_investigation_report_md(
+    case_id: str,
+    run_id: str,
+    user: AuthUser,
+) -> PlainTextResponse:
+    safe_run_id = quote(run_id, safe="")
+    resp = await _agents_proxy("GET", f"/api/v1/investigations/{safe_run_id}/report.md")
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return PlainTextResponse(content=resp.text)
+
+
+@router.get(
+    "/{case_id}/investigations/{run_id}/report.html",
+    summary="Download investigation HTML report",
+)
+async def case_investigation_report_html(
+    case_id: str,
+    run_id: str,
+    user: AuthUser,
+) -> HTMLResponse:
+    safe_run_id = quote(run_id, safe="")
+    resp = await _agents_proxy("GET", f"/api/v1/investigations/{safe_run_id}/report.html")
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return HTMLResponse(content=resp.text)
 
 
 @router.get("/{case_id}/related", summary="List related cases (by alert/observable overlap)")

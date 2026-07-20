@@ -61,9 +61,62 @@ def is_router_investigate_enabled() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Simple in-memory run store (swap for Redis in production)
+# Redis-backed Run Store
 # ---------------------------------------------------------------------------
-_runs: dict[str, dict[str, Any]] = {}
+import redis.asyncio as aioredis
+
+_REDIS_CLIENT: aioredis.Redis | None = None
+_FALLBACK_RUNS: dict[str, dict[str, Any]] = {}
+
+
+def _get_redis_client() -> aioredis.Redis | None:
+    global _REDIS_CLIENT
+    if _REDIS_CLIENT is not None:
+        return _REDIS_CLIENT
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        return None
+    try:
+        _REDIS_CLIENT = aioredis.from_url(url, decode_responses=True)
+        return _REDIS_CLIENT
+    except Exception as exc:
+        logger.debug("investigate.redis_unavailable", error=str(exc))
+        return None
+
+
+def _run_key(run_id: str) -> str:
+    return f"aisoc:investigate:runs:{run_id}"
+
+
+async def _save_run(run_id: str, run_data: dict[str, Any]) -> None:
+    r = _get_redis_client()
+    if r is not None:
+        try:
+            # Expire after 24 hours (86400 seconds)
+            await r.setex(_run_key(run_id), 86400, json.dumps(run_data, default=str))
+            return
+        except Exception as exc:
+            logger.warning("investigate.redis_set_error", run_id=run_id, error=str(exc))
+    _FALLBACK_RUNS[run_id] = run_data
+
+
+async def _load_run(run_id: str) -> dict[str, Any] | None:
+    r = _get_redis_client()
+    if r is not None:
+        try:
+            raw = await r.get(_run_key(run_id))
+            return json.loads(raw) if raw is not None else None
+        except Exception as exc:
+            logger.warning("investigate.redis_get_error", run_id=run_id, error=str(exc))
+    return _FALLBACK_RUNS.get(run_id)
+
+
+async def _update_run(run_id: str, updates: dict[str, Any]) -> None:
+    run = await _load_run(run_id) or {}
+    run.update(updates)
+    await _save_run(run_id, run)
+
+
 _orch = InvestigatorOrchestrator()
 _router_orch = RouterOrchestrator()
 
@@ -169,14 +222,15 @@ async def _run_and_store(run_id: str, case_id: str, req: InvestigateRequest) -> 
         ):
             if event.get("type") == "step":
                 audit_log.append(event)
-                # Update the in-memory run so pollers see progress
-                _runs[run_id]["audit_log"] = audit_log
+                # Update the Redis run so pollers see progress
+                await _update_run(run_id, {"audit_log": audit_log})
                 # Broadcast to realtime → WebSocket clients
                 await _emit_event(run_id, req.tenant_id, event)
 
             elif event.get("type") == "done":
                 state_data = event.get("state", {})
-                _runs[run_id].update(
+                await _update_run(
+                    run_id,
                     {
                         "status": "completed",
                         "report_md": state_data.get("report_md", ""),
@@ -202,7 +256,7 @@ async def _run_and_store(run_id: str, case_id: str, req: InvestigateRequest) -> 
 
             elif event.get("type") == "error":
                 err_msg = event.get("error", "Unknown error")
-                _runs[run_id].update({"status": "failed", "error": err_msg})
+                await _update_run(run_id, {"status": "failed", "error": err_msg})
                 await _emit_event(
                     run_id,
                     req.tenant_id,
@@ -216,7 +270,7 @@ async def _run_and_store(run_id: str, case_id: str, req: InvestigateRequest) -> 
 
     except Exception as exc:  # noqa: BLE001
         logger.error("investigation_bg_task failed", run_id=run_id, error=str(exc))
-        _runs[run_id].update({"status": "failed", "error": str(exc)})
+        await _update_run(run_id, {"status": "failed", "error": str(exc)})
 
 
 # ---------------------------------------------------------------------------
@@ -232,12 +286,12 @@ async def launch_investigation(
 ):
     """Launch a Pillar-1 autonomous investigation for a case."""
     run_id = str(uuid4())
-    _runs[run_id] = {
+    await _save_run(run_id, {
         "run_id": run_id,
         "case_id": case_id,
         "status": "running",
         "started_at": datetime.utcnow().isoformat(),
-    }
+    })
     background_tasks.add_task(_run_and_store, run_id, case_id, body)
     logger.info("investigation.launched", run_id=run_id, case_id=case_id)
     return InvestigateResponse(
@@ -251,7 +305,7 @@ async def launch_investigation(
 @router.get("/investigations/{run_id}")
 async def get_investigation(run_id: str):
     """Poll investigation status and results."""
-    run = _runs.get(run_id)
+    run = await _load_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Investigation run not found")
     # Strip large fields from polling response — use dedicated endpoints instead
@@ -259,26 +313,46 @@ async def get_investigation(run_id: str):
     return slim
 
 
+async def _load_report_from_db(run_id: str, kind: str) -> str | None:
+    """Fallback to fetch completed reports directly from Postgres artifacts table."""
+    try:
+        from app.investigator.ledger import get_pool
+        pool = await get_pool()
+        if pool:
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT content FROM investigation_artifacts WHERE run_id = $1 AND kind = $2 LIMIT 1",
+                    UUID(run_id),
+                    kind,
+                )
+                return row["content"] if row else None
+    except Exception as e:
+        logger.warning("ledger_report_fallback_failed", error=str(e))
+    return None
+
+
 @router.get("/investigations/{run_id}/report.md", response_class=PlainTextResponse)
 async def get_report_md(run_id: str):
     """Download the Markdown incident report."""
-    run = _runs.get(run_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="Run not found")
-    if run["status"] != "completed":
-        raise HTTPException(status_code=409, detail=f"Investigation is {run['status']}")
-    return run.get("report_md", "")
+    run = await _load_run(run_id)
+    report = run.get("report_md", "") if run else None
+    if not report:
+        report = await _load_report_from_db(run_id, "report_md")
+    if not report:
+        raise HTTPException(status_code=404, detail="Markdown report not found")
+    return report
 
 
 @router.get("/investigations/{run_id}/report.html", response_class=HTMLResponse)
 async def get_report_html(run_id: str):
     """Download the HTML incident report."""
-    run = _runs.get(run_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="Run not found")
-    if run["status"] != "completed":
-        raise HTTPException(status_code=409, detail=f"Investigation is {run['status']}")
-    return run.get("report_html", "<html><body>No report yet.</body></html>")
+    run = await _load_run(run_id)
+    report = run.get("report_html", "") if run else None
+    if not report:
+        report = await _load_report_from_db(run_id, "report_html")
+    if not report:
+        raise HTTPException(status_code=404, detail="HTML report not found")
+    return report
 
 
 @router.get("/investigations/{run_id}/report.pdf")
@@ -286,15 +360,12 @@ async def get_report_pdf(run_id: str):
     """Download the PDF incident report (rendered from HTML via weasyprint)."""
     from fastapi.responses import Response as FastAPIResponse
 
-    run = _runs.get(run_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="Run not found")
-    if run["status"] != "completed":
-        raise HTTPException(status_code=409, detail=f"Investigation is {run['status']}")
-
-    html_content: str = run.get("report_html", "")
+    run = await _load_run(run_id)
+    html_content = run.get("report_html", "") if run else None
     if not html_content:
-        raise HTTPException(status_code=404, detail="Report not yet generated")
+        html_content = await _load_report_from_db(run_id, "report_html")
+    if not html_content:
+        raise HTTPException(status_code=404, detail="HTML report for PDF generation not found")
 
     try:
         import weasyprint  # type: ignore
@@ -333,10 +404,11 @@ async def stream_investigation(ws: WebSocket, run_id: str):
     await ws.accept()
     try:
         # If a background run exists, tail it via polling
-        if run_id in _runs:
+        run = await _load_run(run_id)
+        if run:
             seen = 0
             while True:
-                run = _runs.get(run_id, {})
+                run = await _load_run(run_id) or {}
                 audit = run.get("audit_log", [])
                 # Send any new audit entries
                 for entry in audit[seen:]:

@@ -577,7 +577,7 @@ async def _llm_summary(
         import httpx
 
         base = llm_config.base_url.rstrip("/")
-        url = f"{base}/v1/chat/completions"
+        url = f"{base}/chat/completions" if base.endswith("/v1") else f"{base}/v1/chat/completions"
         model = llm_config.model
 
         tech_lines = [f"- {t['id']} {t['name']} ({', '.join(t.get('tactic_names') or []) or 'unknown tactic'})" for t in mitre_techs]

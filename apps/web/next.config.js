@@ -66,7 +66,7 @@ const nextConfig = {
     NEXT_PUBLIC_ENRICHMENT_URL: process.env.NEXT_PUBLIC_ENRICHMENT_URL || '',
     NEXT_PUBLIC_WS_URL: process.env.NEXT_PUBLIC_WS_URL || '',
     NEXT_PUBLIC_REALTIME_URL: process.env.NEXT_PUBLIC_REALTIME_URL || '',
-    NEXT_PUBLIC_TENANT_ID: process.env.NEXT_PUBLIC_TENANT_ID || 'default',
+    NEXT_PUBLIC_TENANT_ID: process.env.NEXT_PUBLIC_TENANT_ID || '00000000-0000-0000-0000-000000000001',
     NEXT_PUBLIC_PURPLE_TEAM_API: process.env.NEXT_PUBLIC_PURPLE_TEAM_API || '',
     NEXT_PUBLIC_HONEYTOKENS_URL: process.env.NEXT_PUBLIC_HONEYTOKENS_URL || '',
     NEXT_PUBLIC_OSQUERY_TLS_URL: process.env.NEXT_PUBLIC_OSQUERY_TLS_URL || '',
@@ -135,6 +135,11 @@ const nextConfig = {
       {
         source: '/api/v1/contextual/:path*',
         destination: `${AGENTS_HOST}/api/v1/contextual/:path*`,
+      },
+      // Agents streaming alert explainer (POST /api/v1/explain)
+      {
+        source: '/api/v1/explain',
+        destination: `${AGENTS_HOST}/api/v1/explain`,
       },
       {
         source: '/api/v1/playbooks/:path*',

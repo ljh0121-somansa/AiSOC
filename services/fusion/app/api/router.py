@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query
@@ -98,9 +99,24 @@ def _require_entity_risk():
     return eng
 
 
+def _resolve_tenant_id(v: Any) -> UUID:
+    if isinstance(v, UUID):
+        return v
+    s = str(v).strip().lower()
+    if s == "default":
+        return UUID("00000000-0000-0000-0000-000000000001")
+    try:
+        return UUID(s)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid tenant_id format: '{v}'. Must be a valid UUID or 'default'.",
+        ) from exc
+
+
 @router.get("/entity-risk/queue")
 async def entity_risk_queue(
-    tenant_id: UUID,
+    tenant_id: str,
     limit: int = Query(default=25, ge=1, le=200),
     promoted_only: bool = False,
 ):
@@ -111,30 +127,33 @@ async def entity_risk_queue(
     alerts are surfaced as evidence. Closes the 2026 KPI bar of
     ``alert-to-incident ratio ≥ 50:1``.
     """
+    t_id = _resolve_tenant_id(tenant_id)
     eng = _require_entity_risk()
-    records = await eng.top_entities(tenant_id, limit=limit, promoted_only=promoted_only)
+    records = await eng.top_entities(t_id, limit=limit, promoted_only=promoted_only)
     return {
-        "tenant_id": str(tenant_id),
+        "tenant_id": str(t_id),
         "threshold": eng.threshold,
         "entities": [r.to_dict() for r in records],
     }
 
 
 @router.get("/entity-risk/stats")
-async def entity_risk_stats(tenant_id: UUID):
+async def entity_risk_stats(tenant_id: str):
     """Tenant-scoped queue stats for dashboards (banding, totals, threshold)."""
+    t_id = _resolve_tenant_id(tenant_id)
     eng = _require_entity_risk()
-    return {"tenant_id": str(tenant_id), **(await eng.stats(tenant_id))}
+    return {"tenant_id": str(t_id), **(await eng.stats(t_id))}
 
 
 @router.get("/entity-risk/{entity_type}/{entity_value}")
-async def entity_risk_detail(entity_type: str, entity_value: str, tenant_id: UUID):
+async def entity_risk_detail(entity_type: str, entity_value: str, tenant_id: str):
     """Return the full risk record (contributing alerts + severity histogram)
     for a single entity, used by the alert-detail drawer."""
     if entity_type == "ip":
         entity_type = "src_ip"
+    t_id = _resolve_tenant_id(tenant_id)
     eng = _require_entity_risk()
-    record = await eng.get(tenant_id, entity_type, entity_value)
+    record = await eng.get(t_id, entity_type, entity_value)
     if record is None:
         raise HTTPException(status_code=404, detail="entity_not_found")
     return record.to_dict()

@@ -69,15 +69,6 @@ async def start_investigation(
     )
 
 
-@router.get("/investigations/{run_id}")
-async def get_investigation(run_id: str):
-    """Get the status and results of an investigation run."""
-    run = _runs.get(run_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="Investigation run not found")
-    return run
-
-
 @router.get("/health")
 async def health():
     return {"status": "healthy", "service": "aisoc-agents"}

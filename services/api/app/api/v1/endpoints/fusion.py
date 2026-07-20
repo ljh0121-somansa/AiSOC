@@ -34,6 +34,7 @@ from uuid import UUID
 import httpx
 from fastapi import APIRouter, HTTPException, Query
 
+
 from app.core.logging import safe_log_value
 
 logger = logging.getLogger(__name__)
@@ -142,16 +143,32 @@ async def ml_status() -> dict[str, Any]:
 _DEFAULT_THRESHOLD = 100.0
 
 
+def _resolve_tenant_id(v: Any) -> UUID:
+    if isinstance(v, UUID):
+        return v
+    s = str(v).strip().lower()
+    if s == "default":
+        return UUID("00000000-0000-0000-0000-000000000001")
+    try:
+        return UUID(s)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid tenant_id format: '{v}'. Must be a valid UUID or 'default'.",
+        ) from exc
+
+
 @router.get("/entity-risk/queue", summary="Top entities by risk score")
 async def entity_risk_queue(
-    tenant_id: UUID,
+    tenant_id: str,
     limit: int = Query(default=25, ge=1, le=200),
     promoted_only: bool = False,
 ) -> dict[str, Any]:
+    t_id = _resolve_tenant_id(tenant_id)
     upstream = await _proxy_get(
         "/entity-risk/queue",
         params={
-            "tenant_id": str(tenant_id),
+            "tenant_id": str(t_id),
             "limit": limit,
             "promoted_only": str(promoted_only).lower(),
         },
@@ -159,22 +176,23 @@ async def entity_risk_queue(
     if upstream is not None:
         return upstream
     return {
-        "tenant_id": str(tenant_id),
+        "tenant_id": str(t_id),
         "threshold": _DEFAULT_THRESHOLD,
         "entities": [],
     }
 
 
 @router.get("/entity-risk/stats", summary="Entity-risk queue stats")
-async def entity_risk_stats(tenant_id: UUID) -> dict[str, Any]:
+async def entity_risk_stats(tenant_id: str) -> dict[str, Any]:
+    t_id = _resolve_tenant_id(tenant_id)
     upstream = await _proxy_get(
         "/entity-risk/stats",
-        params={"tenant_id": str(tenant_id)},
+        params={"tenant_id": str(t_id)},
     )
     if upstream is not None:
         return upstream
     return {
-        "tenant_id": str(tenant_id),
+        "tenant_id": str(t_id),
         "threshold": _DEFAULT_THRESHOLD,
         "total": 0,
         "promoted": 0,
@@ -190,7 +208,7 @@ async def entity_risk_stats(tenant_id: UUID) -> dict[str, Any]:
 async def entity_risk_detail(
     entity_type: str,
     entity_value: str,
-    tenant_id: UUID,
+    tenant_id: str,
 ) -> dict[str, Any]:
     if entity_type == "ip":
         entity_type = "src_ip"
@@ -198,9 +216,10 @@ async def entity_risk_detail(
     # `?`, `#`, or other URL syntax into the proxied path.
     safe_type = quote(entity_type, safe="")
     safe_value = quote(entity_value, safe="")
+    t_id = _resolve_tenant_id(tenant_id)
     upstream = await _proxy_get(
         f"/entity-risk/{safe_type}/{safe_value}",
-        params={"tenant_id": str(tenant_id)},
+        params={"tenant_id": str(t_id)},
     )
     if upstream is not None:
         return upstream

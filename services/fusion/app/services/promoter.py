@@ -27,6 +27,7 @@ we log it rather than crash the consumer).
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime
 from typing import Any
@@ -133,6 +134,33 @@ def should_promote(ocsf: dict[str, Any]) -> bool:
     return isinstance(severity_id, int) and severity_id >= _PROMOTE_SEVERITY_FLOOR
 
 
+def _extract_splunk_kv(raw_data: str, key: str) -> str | None:
+    """Extract a key="value" or key=value from a Splunk _raw string."""
+    if not isinstance(raw_data, str) or not raw_data:
+        return None
+    # Match key="value"
+    match = re.search(re.escape(key) + r'\s*=\s*"([^"\\]*(?:\\.[^"\\]*)*)"', raw_data)
+    if match:
+        return match.group(1).replace('\\"', '"')
+    # Match key=value (with potential spaces, up to next key= or end of string)
+    match = re.search(re.escape(key) + r'\s*=\s*(.*?)(?=\s+[a-zA-Z0-9_]+=|$)', raw_data)
+    if match:
+        val = match.group(1).strip()
+        if val.endswith(","):
+            val = val[:-1].strip()
+        return val
+    return None
+
+def _extract_splunk_mitre(raw_data: str) -> list[str]:
+    """Extract T1234 from dirty annotations like T1496 (Resource Hijacking)."""
+    val = _extract_splunk_kv(raw_data, "annotations.mitre_attack") or _extract_splunk_kv(raw_data, "mitre_attack")
+    if not val:
+        return []
+    # Match T followed by 4 digits, optionally .001
+    matches = re.findall(r'T\d{4}(?:\.\d{3})?', val)
+    return list(set(matches))
+
+
 def promote_normalized_event(message: dict[str, Any]) -> RawAlert | None:
     """Convert one ``aisoc.raw_events`` message into a RawAlert, or ``None``.
 
@@ -161,17 +189,44 @@ def promote_normalized_event(message: dict[str, Any]) -> RawAlert | None:
     severity = _SEVERITY_BY_ID.get(severity_id if isinstance(severity_id, int) else 0, AlertSeverity.MEDIUM)
 
     tactics, techniques = _mitre(ocsf)
+    
+    # ─── Splunk Airgap Fallback (Parse raw_data) ───
+    # If the Go normalizer failed to parse fields because the server is airgapped
+    # and the new Go binary couldn't be built, we rescue the fields here in Python.
+    raw_data_str = str(ocsf.get("raw_data") or "")
+    if "Splunk" in str(ocsf.get("metadata", {}).get("product", {}).get("name", "")) or "splunk" in str(message.get("connector_type", "")):
+        if severity == AlertSeverity.MEDIUM:
+            raw_sev = _extract_splunk_kv(raw_data_str, "severity") or _extract_splunk_kv(raw_data_str, "urgency")
+            if raw_sev:
+                raw_sev = raw_sev.lower()
+                if raw_sev == "critical": severity = AlertSeverity.CRITICAL
+                elif raw_sev == "high": severity = AlertSeverity.HIGH
+                elif raw_sev == "low": severity = AlertSeverity.LOW
+                elif raw_sev in ("info", "informational"): severity = AlertSeverity.INFO
+        
+        if not techniques:
+            techniques = _extract_splunk_mitre(raw_data_str)
+            
+    src_ip = _get_nested(ocsf, "src_endpoint", "ip") or _extract_splunk_kv(raw_data_str, "src_ip") or _extract_splunk_kv(raw_data_str, "src")
+    hostname = _get_nested(ocsf, "device", "name") or _extract_splunk_kv(raw_data_str, "orig_host") or _extract_splunk_kv(raw_data_str, "entity")
+    username = _get_nested(ocsf, "actor", "user", "name") or _extract_splunk_kv(raw_data_str, "USER") or _extract_splunk_kv(raw_data_str, "user")
+    
+    desc = raw_data_str
+    if _extract_splunk_kv(raw_data_str, "risk_message"):
+        desc = _extract_splunk_kv(raw_data_str, "risk_message")
+    elif _extract_splunk_kv(raw_data_str, "orig_rule_description"):
+        desc = _extract_splunk_kv(raw_data_str, "orig_rule_description")
 
     return RawAlert(
         tenant_id=tenant_id,
         source=_source(ocsf),
         title=_title(ocsf),
-        description=str(ocsf.get("raw_data") or "")[:2000],
+        description=desc[:2000],
         severity=severity,
-        src_ip=_get_nested(ocsf, "src_endpoint", "ip"),
+        src_ip=src_ip,
         dst_ip=_get_nested(ocsf, "dst_endpoint", "ip"),
-        hostname=_get_nested(ocsf, "device", "name"),
-        username=_get_nested(ocsf, "actor", "user", "name"),
+        hostname=hostname,
+        username=username,
         file_hash=_first_file_hash(ocsf),
         mitre_tactics=tactics,
         mitre_techniques=techniques,

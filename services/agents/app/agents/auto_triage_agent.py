@@ -176,7 +176,7 @@ async def run_auto_triage(state: InvestigationState) -> InvestigationState:
 
     alert_context = _build_alert_context(state)
 
-    model_name = os.getenv("AISOC_LLM_MODEL", "gpt-4o-mini")
+    model_name = os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or os.getenv("AISOC_LLM_MODEL", "gpt-4o-mini")
     llm = ChatOpenAI(model=model_name, temperature=0.0, max_tokens=512)
 
     t0 = time.monotonic()

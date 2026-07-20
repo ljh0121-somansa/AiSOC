@@ -407,9 +407,9 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
               toast.success('Investigation complete — report ready');
               // Fetch the Markdown report
               fetch(`/api/v1/cases/${caseId}/investigations/${runId}/report.md`)
-                .then((r) => r.ok ? r.text() : '')
-                .then((md) => { if (md) setReportMd(md); })
-                .catch(() => { /* best-effort */ });
+                .then((r) => r && r.ok ? r.text() : '')
+                .then((md) => { if (md && typeof md === 'string') setReportMd(md); })
+                .catch((e) => { console.warn('Failed to fetch report.md:', e); });
               // Also fetch full data
               casesApi.getInvestigation(caseId, runId)
                 .then((inv) => setInvestigationData(inv as Record<string, unknown>))
@@ -463,8 +463,15 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
               toast.success('Investigation complete — report ready');
               try {
                 const resp = await fetch(`/api/v1/cases/${caseId}/investigations/${result.run_id}/report.md`);
-                if (resp.ok) setReportMd(await resp.text());
-              } catch { /* best-effort */ }
+                if (resp && resp.ok) {
+                  const text = await resp.text();
+                  if (text && typeof text === 'string') {
+                    setReportMd(text);
+                  }
+                }
+              } catch (e) {
+                console.warn('Failed to load report.md:', e);
+              }
             } else {
               toast.error(`Investigation failed: ${inv.error ?? 'unknown error'}`);
             }
@@ -1178,10 +1185,10 @@ function InvestigationPanel({
           {responder?.summary != null && <p className="text-xs text-slate-400">{String(responder.summary)}</p>}
           {Array.isArray(responder?.recommended_actions) && (
             <ul className="space-y-1">
-              {(responder.recommended_actions as string[]).slice(0, 4).map((action, i) => (
+              {(responder.recommended_actions as any[]).slice(0, 4).map((action, i) => (
                 <li key={i} className="flex items-start gap-1.5 text-xs text-slate-300">
                   <span className="mt-0.5 h-1.5 w-1.5 flex-none rounded-full bg-amber-400" />
-                  {action}
+                  {typeof action === 'string' ? action : action?.action ?? JSON.stringify(action)}
                 </li>
               ))}
             </ul>

@@ -66,6 +66,16 @@ class EntitySignal:
     occurred_at: datetime
 
 
+def _safe_iso(dt: datetime | None) -> str:
+    if not dt:
+        return ""
+    s = dt.isoformat()
+    if s.endswith("+00:00"):
+        return s.replace("+00:00", "Z")
+    if dt.tzinfo is None and not s.endswith("Z"):
+        return s + "Z"
+    return s
+
 @dataclass
 class EntityRiskRecord:
     """The current decayed risk picture for one entity."""
@@ -82,17 +92,37 @@ class EntityRiskRecord:
     contributors: list[dict] | None = None
 
     def to_dict(self) -> dict:
+        formatted_contributions = []
+        for c in (self.contributors or []):
+            # Clean up potentially broken date strings from old Redis records
+            at_str = c.get("at", "") or c.get("observed_at", "")
+            if at_str.endswith("+00:00Z"):
+                at_str = at_str.replace("+00:00Z", "Z")
+            
+            formatted_contributions.append({
+                "alert_id": c.get("alert_id", ""),
+                "title": c.get("detection", "") or c.get("title", ""),
+                "severity": c.get("severity", "medium"),
+                "source": c.get("source", "Splunk Enterprise"),
+                "raw_points": c.get("points", 0) or c.get("raw_points", 0),
+                "observed_at": at_str,
+                "points": c.get("points", 0),
+                "at": at_str,
+            })
         return {
             "tenant_id": self.tenant_id,
             "entity_type": self.entity_type,
             "entity_value": self.entity_value,
             "score": round(self.score, 2),
             "alert_count": self.alert_count,
-            "last_seen": self.last_seen.isoformat() + "Z",
+            "last_seen": _safe_iso(self.last_seen),
+            "first_seen": _safe_iso(self.last_seen),  # Fallback to last_seen
             "contributing_alerts": self.contributing_alerts,
             "severities": self.severities,
-            "promoted_at": (self.promoted_at.isoformat() + "Z") if self.promoted_at else None,
-            "contributors": self.contributors or [],
+            "severity_histogram": self.severities,  # Map both to avoid frontend crash
+            "promoted_at": _safe_iso(self.promoted_at) if self.promoted_at else None,
+            "contributors": formatted_contributions,
+            "contributions": formatted_contributions,  # Map both to avoid frontend crash
         }
 
 
@@ -270,7 +300,7 @@ class EntityRiskEngine:
                 "severity": sig.severity,
                 "detection": sig.detection,
                 "points": sig.points,
-                "at": sig.occurred_at.isoformat() + "Z",
+                "at": _safe_iso(sig.occurred_at),
             }
         )
         if len(contributors) > 25:

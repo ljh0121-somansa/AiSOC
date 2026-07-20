@@ -36,6 +36,8 @@ asyncpg = ">=0.29,<0.32"
 sqlalchemy = {extras = ["asyncio"], version = "^2.0.25"}
 apscheduler = "^3.10.4"
 pyyaml = "^6.0.1"
+cryptography = ">=44.0.1,<49"
+cffi = ">=1.16.0,<2"
 # jsonschema is consumed by the NL → playbook drafter (T3.7) to validate
 # every drafted playbook against schemas/playbook.schema.json before the
 # editor loads it, and by scripts/lint_playbooks.py. Pinned to the
