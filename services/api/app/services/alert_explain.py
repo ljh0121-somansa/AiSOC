@@ -52,7 +52,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.airgap import AirgapViolation, enforce_airgap_for_url
@@ -309,6 +309,21 @@ async def _resolve_rule_lineage(db: AsyncSession, alert: Alert) -> tuple[Detecti
 # ---------------------------------------------------------------------------
 
 
+def _coerce_mitre_to_ids(values: Any) -> list[str]:
+    """Extract technique IDs as flat strings from a list of strings or dicts."""
+    if not values:
+        return []
+    out: list[str] = []
+    for item in values:
+        if isinstance(item, str):
+            out.append(item.strip())
+        elif isinstance(item, dict):
+            tid = item.get("id") or item.get("technique_id") or item.get("name")
+            if tid:
+                out.append(str(tid).strip())
+    return [x for x in out if x]
+
+
 async def _historical_fp_rate(
     db: AsyncSession,
     *,
@@ -342,19 +357,40 @@ async def _historical_fp_rate(
         extra_filters = [Alert.category == rule.category] if rule.category else []
         rule_techniques = list(rule.mitre_techniques or [])
         if rule_techniques:
-            # Postgres JSONB ?| asks "does any of these top-level keys
-            # appear in the array?". We use the SQLAlchemy ``op`` form
-            # so we don't depend on the dialect-specific extension.
-            extra_filters.append(Alert.mitre_techniques.op("?|")(rule_techniques))
+            tech_ids = _coerce_mitre_to_ids(rule_techniques)
+            if tech_ids:
+                extra_filters.append(
+                    text(
+                        """
+                        EXISTS (
+                            SELECT 1 FROM jsonb_array_elements(alerts.mitre_techniques) AS elem
+                            WHERE (jsonb_typeof(elem) = 'string' AND elem #>> '{}' = ANY(:tech_ids))
+                               OR (jsonb_typeof(elem) = 'object' AND elem->>'id' = ANY(:tech_ids))
+                        )
+                        """
+                    ).bindparams(tech_ids=tech_ids)
+                )
         scope = "rule"
         notes = (
             f"Approximated by category={rule.category!r} and MITRE techniques matching {rule.name!r}; alerts don't carry a direct rule FK."
         )
     elif alert.category and (alert.mitre_techniques or []):
+        tech_ids = _coerce_mitre_to_ids(alert.mitre_techniques)
         extra_filters = [
             Alert.category == alert.category,
-            Alert.mitre_techniques.op("?|")(list(alert.mitre_techniques or [])),
         ]
+        if tech_ids:
+            extra_filters.append(
+                text(
+                    """
+                    EXISTS (
+                        SELECT 1 FROM jsonb_array_elements(alerts.mitre_techniques) AS elem
+                        WHERE (jsonb_typeof(elem) = 'string' AND elem #>> '{}' = ANY(:tech_ids))
+                           OR (jsonb_typeof(elem) = 'object' AND elem->>'id' = ANY(:tech_ids))
+                    )
+                    """
+                ).bindparams(tech_ids=tech_ids)
+            )
         scope = "category"
         notes = f"Computed across category={alert.category!r} alerts sharing at least one MITRE technique with this alert."
     elif alert.category:
@@ -618,29 +654,37 @@ def _deterministic_summary(
     the LLM call fails. The prose is intentionally bland — it exists
     to keep the drawer useful, not to delight.
     """
-    title = alert.title or "Security alert"
-    severity = (alert.severity or "unknown").lower()
-    source = alert.connector_type or "an upstream connector"
+    title = alert.title or "보안 탐지"
+    severity = (alert.severity or "중요도 미지정").lower()
+    # Translate severities to Korean for deterministic fallback
+    sev_map = {
+        "critical": "치명적(critical)",
+        "high": "높음(high)",
+        "medium": "중간(medium)",
+        "low": "낮음(low)",
+        "info": "정보(info)",
+    }
+    sev_kor = sev_map.get(severity, severity)
+    source = alert.connector_type or "업스트림 커넥터"
 
-    parts = [f"{title} fired at {severity} severity from {source}."]
+    parts = [f"[{source}] 탐지명: '{title}' ({sev_kor} 수준) 이/가 발생했습니다."]
 
     if rule_lineage.rule_name and rule_lineage.confidence != "none":
         confidence_note = (
-            f"matched detection rule {rule_lineage.rule_name!r}"
+            f"탐지 룰 '{rule_lineage.rule_name}'에 의해 분석됨 (일치 신뢰도: {rule_lineage.confidence})"
             if rule_lineage.confidence == "high"
-            else f"likely produced by {rule_lineage.rule_name!r} (match confidence: {rule_lineage.confidence})"
+            else f"탐지 룰 '{rule_lineage.rule_name}' 관련 가능성 높음 (일치 신뢰도: {rule_lineage.confidence})"
         )
-        parts.append(f"This alert was {confidence_note}.")
+        parts.append(f"{confidence_note}.")
 
     if mitre_techniques:
         ids = ", ".join(t.id for t in mitre_techniques[:3])
-        parts.append(f"MITRE ATT&CK coverage: {ids}.")
+        parts.append(f"MITRE ATT&CK 기법 분류: {ids}.")
 
     if fp.sample_size >= 10:
         pct = round(fp.fp_rate * 100, 1)
         parts.append(
-            f"Historically {pct}% of similar alerts ({fp.sample_size} sampled in the last "
-            f"{fp.lookback_days} days) were resolved as false positives."
+            f"과거 통계상 유사한 탐지 중 {pct}%({fp.sample_size}개 중)가 오탐(False Positive)으로 처리되었습니다."
         )
 
     desc = (alert.description or "").strip()
@@ -715,11 +759,12 @@ async def _call_llm_for_summary(
                 "detection rule that fired (when known), a list of MITRE ATT&CK "
                 "techniques pulled from the local corpus, and the historical "
                 "false-positive rate for similar alerts, write a tight 3-5 "
-                "sentence brief for an L1/L2 SOC analyst. Be concrete about "
-                "WHAT happened, WHY it matters, and what the FP context implies "
+                "sentence brief for an L1/L2 SOC analyst in natural, professional Korean. "
+                "Be concrete about WHAT happened, WHY it matters, and what the FP context implies "
                 "for triage urgency. Never invent technique IDs, vendor names, "
                 "or IOCs that aren't in the input. No bullet lists, no headings — "
-                "just prose. Do not promise to take actions; the analyst decides."
+                "just prose in Korean. Do not promise to take actions; the analyst decides. "
+                "Ensure all sentences are written in clear, natural Korean."
             ),
         },
         {

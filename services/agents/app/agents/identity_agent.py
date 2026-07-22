@@ -54,8 +54,9 @@ You MUST respond with a JSON object and nothing else:
   "identity_indicators": ["<indicator1>", "<indicator2>", ...],
   "attack_type": "impossible_travel" | "credential_stuffing" | "brute_force" |
                  "privilege_escalation" | "session_anomaly" | "unknown",
-  "rationale": "<2-4 sentence explanation>"
+  "rationale": "<2-4 sentence explanation in Korean>"
 }
+- LANGUAGE RULE: To optimize token usage, perform all internal reasoning and JSON keys in English, but you MUST write the "rationale" value in natural, professional Korean for the security analyst UI.
 """
 
 

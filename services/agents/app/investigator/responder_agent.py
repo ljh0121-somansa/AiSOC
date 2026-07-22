@@ -36,6 +36,10 @@ _SYSTEM_PROMPT = """You are the ResponderAgent of an AI Security Operations Cent
 Based on the forensic findings, generate a concrete incident response plan.
 All actions are DRY-RUN only — do NOT perform any real actions.
 
+CRITICAL:                                                                                                                                                                                                             
+   - Write the value of "action", "rationale", containment/eradication/recovery steps, and the "summary" strictly in Korean.                                                                                    
+   - The JSON keys MUST remain in English.                                                                                                                                                                               
+   - The values for 'risk' and 'risk_level' MUST strictly be one of: "low", "medium", "high", "critical" (do NOT translate these system status keywords).
 Respond ONLY with a JSON object:
 {
   "recommended_actions": [
@@ -46,7 +50,7 @@ Respond ONLY with a JSON object:
   "recovery_steps": ["..."],
   "estimated_effort_hours": 4.0,
   "risk_level": "low|medium|high|critical",
-  "summary": "Two-sentence response summary."
+  "summary": "Two-sentence response summary in Korean."
 }
 """
 
@@ -147,12 +151,12 @@ async def _llm_responder(state: InvestigatorState) -> dict[str, Any]:
     )
     return {
         "recommended_actions": [],
-        "containment_steps": ["Isolate affected systems immediately."],
-        "eradication_steps": ["Remove identified malicious artefacts."],
-        "recovery_steps": ["Restore from last known good backup."],
+        "containment_steps": ["영향을 받는 시스템을 즉각 격리하십시오."],
+        "eradication_steps": ["확인된 악성 아티팩트 및 파일을 삭제/제거하십시오."],
+        "recovery_steps": ["검증된 최신 정상 백업으로부터 시스템을 복구하십시오."],
         "estimated_effort_hours": 8.0,
         "risk_level": "high",
-        "summary": "Automated response plan generation was not available.",
+        "summary": "자동화 대응 계획 생성을 사용할 수 없어 보수적인 고위험 격리 템플릿으로 대체되었습니다.",
     }
 
 

@@ -47,8 +47,9 @@ You MUST respond with a JSON object and nothing else:
   "verdict": "true_positive" | "false_positive" | "benign",
   "confidence": <float 0.0–1.0>,
   "phishing_indicators": ["<indicator1>", "<indicator2>", ...],
-  "rationale": "<2-4 sentence explanation>"
+  "rationale": "<2-4 sentence explanation in Korean>"
 }
+- LANGUAGE RULE: To optimize token usage, perform all internal reasoning and JSON keys in English, but you MUST write the "rationale" value in natural, professional Korean for the security analyst UI.
 """
 
 
