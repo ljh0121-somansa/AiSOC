@@ -333,7 +333,7 @@ def _build_messages(req: ContextualActionRequest) -> tuple[str, str]:
             detail=f"Unknown contextual action: page={req.page!r} action={req.action!r}",
         )
 
-    system = _SYSTEM_PROMPTS[key]
+    system = _SYSTEM_PROMPTS[key] + "- LANGUAGE RULE: you MUST write the response in natural, professional Korean for the security analyst UI."
     entity_blob = _serialize_entity(req.entity, req.entity_id)
 
     user_lines = [

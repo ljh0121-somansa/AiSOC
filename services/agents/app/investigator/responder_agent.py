@@ -37,17 +37,25 @@ Based on the forensic findings, generate a concrete incident response plan.
 All actions are DRY-RUN only — do NOT perform any real actions.
 
 CRITICAL:                                                                                                                                                                                                             
-   - Write the value of "action", "rationale", containment/eradication/recovery steps, and the "summary" strictly in Korean.                                                                                    
+   - Return ONLY a valid JSON matching the schema below. No markdown wrappers around JSON, no explanations outside JSON.
+   - Value language: Write 'action', 'rationale', step lists, and 'summary' strictly in KOREAN.
+   - Tech specs: You MUST separate the exact CLI command or script (e.g. PowerShell, Bash, netsh, iptables, AD cmdlets) into the 'command' field of recommended_actions. Do NOT embed CLI commands inside the 'action' field, keep them in 'command' field separately for better readability. For steps arrays, include the command in backticks (`...`) inside the Korean text description.
    - The JSON keys MUST remain in English.                                                                                                                                                                               
    - The values for 'risk' and 'risk_level' MUST strictly be one of: "low", "medium", "high", "critical" (do NOT translate these system status keywords).
 Respond ONLY with a JSON object:
 {
   "recommended_actions": [
-    {"priority": 1, "action": "...", "rationale": "...", "risk": "low|medium|high"}
+    {
+      "priority": 1,
+      "action": "Korean action description explaining what to do",
+      "command": "Exact CLI command or script to execute (e.g., netsh interface ipv4 set subinterface ...)",
+      "rationale": "Korean rationale",
+      "risk": "low|medium|high"
+    }
   ],
-  "containment_steps": ["Step 1: ...", "Step 2: ..."],
-  "eradication_steps": ["..."],
-  "recovery_steps": ["..."],
+  "containment_steps": ["Step 1: ...", "Step 2: ..." all steps in Korean text with `CLI command`],
+  "eradication_steps": ["Korean text with `CLI command`"],
+  "recovery_steps": ["Korean text with `CLI command`"],
   "estimated_effort_hours": 4.0,
   "risk_level": "low|medium|high|critical",
   "summary": "Two-sentence response summary in Korean."
