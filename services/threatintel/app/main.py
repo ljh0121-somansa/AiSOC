@@ -28,12 +28,15 @@ from app.actors.attribution import ThreatActorAttributionEngine
 from app.airgap import airgap_status, is_host_allowed_for_airgap
 from app.api.actor_attribution import router as actor_attribution_router
 from app.clients.cisa_kev import CisaKevClient
+from app.clients.abuse_ch import ThreatFoxClient, UrlhausClient
 from app.clients.misp import MispClient
 from app.clients.otx import OtxClient
 from app.clients.taxii import TaxiiClient
 from app.config import settings
 from app.feeds.handlers import (
     handle_cisa_kev_feed,
+    handle_threatfox_feed,
+    handle_urlhaus_feed,
     handle_misp_feed,
     handle_otx_feed,
     handle_taxii_feed,
@@ -186,6 +189,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
 
     kev_client = CisaKevClient()
+    threatfox_client = ThreatFoxClient()
+    urlhaus_client = UrlhausClient()
 
     # ── Scheduler ─────────────────────────────────────────────────────────────
     scheduler = FeedScheduler(pipeline)
@@ -234,6 +239,30 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             feed_name="cisa-kev",
             handler=partial(handle_cisa_kev_feed, client=kev_client, pipeline=pipeline),
             interval_seconds=settings.CISA_KEV_POLL_INTERVAL,
+        )
+
+    # Abuse.ch ThreatFox (CC0, commercially free C2 feed)
+    if _airgap_check_feed_url("threatfox", "https://threatfox.abuse.ch"):
+        scheduler.register(
+            feed_name="threatfox",
+            handler=partial(
+                handle_threatfox_feed,
+                client=threatfox_client,
+                pipeline=pipeline,
+            ),
+            interval_seconds=86400,  # Polled daily
+        )
+
+    # Abuse.ch URLhaus (CC0, commercially free malware URL feed)
+    if _airgap_check_feed_url("urlhaus", "https://urlhaus.abuse.ch"):
+        scheduler.register(
+            feed_name="urlhaus",
+            handler=partial(
+                handle_urlhaus_feed,
+                client=urlhaus_client,
+                pipeline=pipeline,
+            ),
+            interval_seconds=86400,  # Polled daily
         )
 
     scheduler.start()

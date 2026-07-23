@@ -18,7 +18,9 @@ from app.clients.cisa_kev import CisaKevClient
 from app.clients.misp import MispClient
 from app.clients.otx import OtxClient
 from app.clients.taxii import TaxiiClient
+from app.clients.abuse_ch import ThreatFoxClient, UrlhausClient
 from app.parsers.stix import StixParser
+from app.parsers.abuse_ch import parse_threatfox_ioc, parse_urlhaus_ioc
 
 if TYPE_CHECKING:
     from app.feeds.pipeline import ThreatIntelPipeline
@@ -143,3 +145,41 @@ async def handle_cisa_kev_feed(
 
     except Exception as exc:
         logger.error("CISA KEV feed handler failed", error=str(exc))
+
+
+# ─── Abuse.ch ThreatFox Feed Handler ──────────────────────────────────────────
+
+
+async def handle_threatfox_feed(
+    client: ThreatFoxClient,
+    pipeline: ThreatIntelPipeline,
+) -> None:
+    """Fetch active C2 threat indicators from ThreatFox and ingest them."""
+    logger.info("Polling ThreatFox C2 feed")
+    try:
+        entries = await client.fetch_recent_iocs()
+        iocs = [parse_threatfox_ioc(e) for e in entries if e]
+        if iocs:
+            stats = await pipeline.ingest_iocs(iocs, source="threatfox")
+            logger.info("ThreatFox IOCs ingested", **stats)
+    except Exception as exc:
+        logger.error("ThreatFox feed handler failed", error=str(exc))
+
+
+# ─── Abuse.ch URLhaus Feed Handler ────────────────────────────────────────────
+
+
+async def handle_urlhaus_feed(
+    client: UrlhausClient,
+    pipeline: ThreatIntelPipeline,
+) -> None:
+    """Fetch active malware URLs from URLhaus and ingest them."""
+    logger.info("Polling URLhaus malware URL feed")
+    try:
+        entries = await client.fetch_recent_urls()
+        iocs = [parse_urlhaus_ioc(e) for e in entries if e]
+        if iocs:
+            stats = await pipeline.ingest_iocs(iocs, source="urlhaus")
+            logger.info("URLhaus IOCs ingested", **stats)
+    except Exception as exc:
+        logger.error("URLhaus feed handler failed", error=str(exc))
