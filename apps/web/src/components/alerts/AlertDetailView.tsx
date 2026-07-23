@@ -342,13 +342,18 @@ function LedgerEvidenceChain({ runId }: { runId: string }) {
 
 // ─── AI Investigation Panel ───────────────────────────────────────────────────
 
-function AIInvestigation({ alertId }: { alertId: string }) {
+function AIInvestigation({ alertId, alert }: { alertId: string; alert?: Alert }) {
   const [investigation, setInvestigation] = useState<AgentInvestigation | null>(null);
   const [isRunning, setIsRunning] = useState(false);
-  const startInvestigation = async () => {
+
+  const startInvestigation = async (reinvestigate = false) => {
     setIsRunning(true);
     try {
-      const result = await agentsApi.investigate(alertId);
+      const result = await agentsApi.investigate(
+        alertId,
+        reinvestigate,
+        alert as unknown as Record<string, unknown>,
+      );
       setInvestigation(result);
     } catch (err) {
       // Show mock investigation for demo
@@ -356,36 +361,35 @@ function AIInvestigation({ alertId }: { alertId: string }) {
         id: 'inv-1',
         alertId,
         status: 'completed',
-        findings: `## AI Investigation Summary
+        findings: `## AI 알럿 분석 요약
 
-**Threat Classification:** Advanced Persistent Threat (APT) - High Confidence
+**위협 분류:** 고위험 악성 행위 탐지 (Advanced Persistent Threat) - 높은 신뢰도
 
-### Executive Summary
-The PowerShell execution event represents a multi-stage attack with C2 communication. The attacker leveraged legitimate administrative credentials obtained via credential stuffing to execute an obfuscated downloader script.
+### 개요
+PowerShell 실행 이벤트에 대한 자동 분석 결과, 외부 C2 통신 및 난독화된 다운로더 스크립트 실행 정황이 포착되었습니다.
 
-### Key Findings
-1. **Initial Access**: Credential abuse from IP 185.220.101.45 (known Tor exit node)
-2. **Execution**: Obfuscated PowerShell base64 encoded payload downloading secondary stage
-3. **C2 Communication**: Established encrypted channel to payload-c2.xyz (newly registered domain, 3 days old)
-4. **Lateral Movement Risk**: Current user has admin rights on 12 additional systems
+### 주요 발견 사항 (Key Findings)
+1. **최초 접근 (Initial Access)**: Tor 출구 노드 IP(185.220.101.45)로부터의 자격 증명 남용 시도
+2. **실행 행위 (Execution)**: 난독화된 PowerShell Base64 페이로드 실행
+3. **C2 통신 정황**: 생성된 지 3일 된 신규 도메인(payload-c2.xyz)으로 암호화 채널 형성 시도
+4. **측면 이동 위험 (Lateral Movement)**: 현재 계정의 12개 추가 시스템 관리자 권한 보유 확인
 
-### MITRE ATT&CK Coverage
-- T1059.001 (PowerShell) → Active
-- T1027 (Obfuscation) → Active  
-- T1071 (Application Layer Protocol) → Active
+### MITRE ATT&CK 맵핑
+- T1059.001 (PowerShell) → 활성
+- T1027 (Obfuscation) → 활성  
+- T1071 (Application Layer Protocol) → 활성
 
-### Recommended Actions
-1. Isolate affected endpoint immediately
-2. Block IP 185.220.101.45 at perimeter firewall
-3. Block domain payload-c2.xyz at DNS level
-4. Reset credentials for affected user account
-5. Hunt for similar PowerShell patterns across fleet`,
+### 추천 대응 조치
+1. 영향을 받는 단말(DESKTOP-ABC123) 즉시 네트워크 격리
+2. 경계 방화벽에서 IP 185.220.101.45 차단
+3. DNS 수준에서 도메인 payload-c2.xyz 차단
+4. 관련 사용자 계정 비밀번호 재설정`,
         recommendations: [
-          'Isolate endpoint DESKTOP-ABC123 from network immediately',
-          'Block IP 185.220.101.45 at firewall',
-          'Block domain payload-c2.xyz at DNS',
-          'Reset password for user john.doe@company.com',
-          'Review admin rights across all systems',
+          '영향을 받는 단말 장비 DESKTOP-ABC123을 네트워크에서 즉시 격리하십시오.',
+          '방화벽에서 IP 185.220.101.45를 차단하십시오.',
+          'DNS 수준에서 도메인 payload-c2.xyz를 차단하십시오.',
+          '관련 사용자 계정 john.doe@company.com의 비밀번호를 즉시 재설정하십시오.',
+          '전사 시스템의 관리자 권한 보유 현황을 재검토하십시오.',
         ],
         actions: [
           { type: 'isolate_endpoint', target: 'DESKTOP-ABC123', status: 'pending' },
@@ -394,6 +398,7 @@ The PowerShell execution event represents a multi-stage attack with C2 communica
         ],
         startedAt: new Date().toISOString(),
         completedAt: new Date().toISOString(),
+        cached: false,
       });
     }
     setIsRunning(false);
@@ -405,7 +410,7 @@ The PowerShell execution event represents a multi-stage attack with C2 communica
         <p className="text-sm text-gray-400 mb-1">Agent investigation</p>
         <p className="text-xs text-gray-600 mb-4">Run the agent on this alert to produce a markdown report, MITRE mapping, and a list of recommended actions. Every step is recorded in the case ledger.</p>
         <button
-          onClick={startInvestigation}
+          onClick={() => void startInvestigation(false)}
           disabled={isRunning}
           className="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium px-6 py-2 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
         >
@@ -433,12 +438,18 @@ The PowerShell execution event represents a multi-stage attack with C2 communica
             'bg-red-500'
           )} />
           <span className="text-xs text-gray-400 capitalize">{investigation.status}</span>
+          {investigation.cached && (
+            <span className="text-[10px] bg-blue-500/10 text-blue-400 border border-blue-500/20 px-1.5 py-0.5 rounded font-mono">
+              cached
+            </span>
+          )}
         </div>
         <button
-          onClick={startInvestigation}
-          className="text-xs text-blue-400 hover:text-blue-300"
+          onClick={() => void startInvestigation(true)}
+          disabled={isRunning}
+          className="text-xs text-blue-400 hover:text-blue-300 disabled:opacity-50"
         >
-          Re-investigate
+          {isRunning ? 'Re-investigating...' : 'Re-investigate'}
         </button>
       </div>
 
@@ -1055,7 +1066,7 @@ export function AlertDetailView({ alertId }: { alertId: string }) {
           {/* Right column - 1/3 */}
           <div className="space-y-4">
             <Section title="AI Investigation">
-              <AIInvestigation alertId={alertId} />
+              <AIInvestigation alertId={alertId} alert={alert} />
             </Section>
 
             <Section title="Verdict & feedback">
