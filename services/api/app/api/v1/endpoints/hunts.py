@@ -38,6 +38,7 @@ from sqlalchemy import text
 
 from app.api.v1.deps import AuthUser, DBSession
 from app.core.airgap import AirgapViolation, enforce_airgap_for_url
+from app.services.hunt_query_generator import generate_queries_tiered
 
 logger = logging.getLogger(__name__)
 
@@ -116,64 +117,8 @@ class HuntResponse(BaseModel):
     updated_at: datetime
     completed_at: datetime | None
     created_by: str | None
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# LLM query generation helper
-# ────────────────────────────────────────────────────────────────────────────
-
-_HUNT_SYSTEM = """You are a senior threat hunter. Given a threat hypothesis, generate
-detection queries for the listed platforms.
-
-Return ONLY valid JSON with this structure:
-{
-  "esql": "<ES|QL query string>",
-  "spl": "<Splunk SPL string>",
-  "kql": "<KQL string>"
-}
-No prose. Just JSON."""
-
-
-async def _generate_queries(hypothesis: str, mitre: str | None) -> dict[str, str] | None:
-    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY")
-    if not api_key:
-        return None
-    base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-    model = os.getenv("LLM_MODEL", "gpt-4o-mini")
-    user_msg = f"HYPOTHESIS: {hypothesis}"
-    if mitre:
-        user_msg += f"\nMITRE TECHNIQUE: {mitre}"
-    user_msg += "\nGenerate ES|QL, SPL, and KQL hunt queries."
-    completions_url = f"{base_url}/chat/completions"
-    enforce_airgap_for_url(completions_url)
-    try:
-        async with httpx.AsyncClient(timeout=45) as client:
-            resp = await client.post(
-                completions_url,
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": _HUNT_SYSTEM},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    "temperature": 0.2,
-                    "response_format": {"type": "json_object"},
-                },
-            )
-        resp.raise_for_status()
-        return json.loads(resp.json()["choices"][0]["message"]["content"])
-    except Exception:
-        return None
-
-
-def _fallback_queries(hypothesis: str) -> dict[str, str]:
-    escaped = hypothesis.replace('"', '\\"')
-    return {
-        "esql": f'FROM logs-* | WHERE message LIKE "%{escaped[:60]}%" | LIMIT 100',
-        "spl": f'index=* "{escaped[:60]}" | head 100',
-        "kql": f'// KQL hunt — adapt field names\nSecurityEvent\n| where Activity has "{escaped[:60]}"\n| limit 100',
-    }
+    query_generation_mode: Literal["ai", "fallback"] = "ai"
+    warnings: str | None = None
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -201,6 +146,8 @@ def _row_to_hunt(row: Any) -> HuntResponse:
         updated_at=row.updated_at,
         completed_at=row.completed_at,
         created_by=row.created_by,
+        query_generation_mode=getattr(row, "query_generation_mode", "ai"),
+        warnings=getattr(row, "warnings", None),
     )
 
 
@@ -242,27 +189,34 @@ async def list_hunts(
         raise HTTPException(status_code=503, detail="Database error") from exc
 
 
-@router.post("", response_model=HuntResponse, status_code=status.HTTP_201_CREATED, summary="Create hunt hypothesis")
-async def create_hunt(body: CreateHuntRequest, db: DBSession, user: AuthUser) -> HuntResponse:
+@router.post(
+    "",
+    response_model=HuntResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create hunt hypothesis",
+)
+async def create_hunt(
+    body: CreateHuntRequest,
+    db: DBSession,
+    user: AuthUser,
+) -> HuntResponse:
     mitre = body.mitre_technique or body.mitre_tactic
-    # In air-gapped mode the LLM call is refused (AirgapViolation); fall back to
-    # the deterministic query templates so hunt creation still succeeds offline
-    # rather than surfacing a 500. Mirrors the phishing submit/retriage pattern.
-    try:
-        queries = await _generate_queries(body.hypothesis, mitre) or _fallback_queries(body.hypothesis)
-    except AirgapViolation:
-        queries = _fallback_queries(body.hypothesis)
+    # Outsource translation to the tiered query generator service (SRP compliance)
+    queries = await generate_queries_tiered(
+        db, user.tenant_id, body.hypothesis, mitre
+    )
+
     hunt_id = uuid.uuid4()
     now = datetime.now(UTC)
     q = text("""
         INSERT INTO aisoc_hunts (
             id, tenant_id, title, hypothesis, mitre_tactic, mitre_technique,
             priority, assigned_to, tags, query_esql, query_spl, query_kql,
-            created_at, updated_at, created_by
+            query_generation_mode, warnings, created_at, updated_at, created_by
         ) VALUES (
             :id, :tenant_id, :title, :hypothesis, :tactic, :technique,
             :priority, :assigned, CAST(:tags AS TEXT[]), :esql, :spl, :kql,
-            :now, :now, :user
+            :query_generation_mode, :warnings, :now, :now, :user
         ) RETURNING *
     """).bindparams(
         id=hunt_id,
@@ -277,6 +231,8 @@ async def create_hunt(body: CreateHuntRequest, db: DBSession, user: AuthUser) ->
         esql=queries.get("esql"),
         spl=queries.get("spl"),
         kql=queries.get("kql"),
+        query_generation_mode=queries.get("query_generation_mode", "ai"),
+        warnings=queries.get("warnings"),
         now=now,
         user=user.email or "system",
     )

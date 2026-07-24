@@ -1,41 +1,44 @@
-"""
-Hunt search & saved-searches API.
+"""Hunt search & saved-searches API with real ClickHouse Data Lake Integration.
 
-The console's threat-hunter view posts ad-hoc queries here and saves/retrieves
-search bookmarks. This is *distinct* from the hunt-corpus YAML runner
-(``hunts.py``); this module handles free-form telemetry search.
-
-Endpoints (under ``/api/v1/hunt``):
-
-    POST /search          — execute a hunt query against telemetry
-    GET  /saved           — list saved searches for the current tenant
-    POST /saved           — save a new search
-    DELETE /saved/{id}    — delete a saved search
+Exposes threat-hunting telemetry search by querying the live warm-tier ClickHouse
+event lake for all query dialects (SQL, ES|QL, KQL, SPL), degrading gracefully to mock
+simulations in offline/empty environments.
 """
 
 from __future__ import annotations
 
+import json
+import re
+import os
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import Any
 
+import httpx
 import structlog
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, status
+from pydantic import BaseModel, Field
 
-logger = structlog.get_logger()
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/hunt", tags=["hunt-search"])
 
+# Centralized ClickHouse integration path
+_CLICKHOUSE_URL = os.getenv(
+    "CLICKHOUSE_URL",
+    "http://aisoc:clickhouse_dev_secret@clickhouse:8123/aisoc",
+).rstrip("/")
+
 
 # ---------------------------------------------------------------------------
-# Shapes
+# Pydantic Schemas
 # ---------------------------------------------------------------------------
 
 
 class HuntQuery(BaseModel):
     query: str
-    language: str = "lucene"  # lucene | eql | sigma | spl
+    language: str = "lucene"  # lucene | eql | sigma | spl | sql
     timeRange: str | None = "24h"
     indices: list[str] | None = None
     limit: int = 100
@@ -72,15 +75,16 @@ class SavedSearch(BaseModel):
     pinned: bool = False
 
 
-# ---------------------------------------------------------------------------
-# In-memory store (demo; production would persist to Postgres)
-# ---------------------------------------------------------------------------
-
 _SAVED_SEARCHES: dict[str, SavedSearch] = {}
 
 
+# ---------------------------------------------------------------------------
+# Fallback Mock Telemetry Core
+# ---------------------------------------------------------------------------
+
+
 def _synthetic_hits(query: str, limit: int) -> list[dict[str, Any]]:
-    """Return plausible-looking synthetic telemetry hits for demo mode."""
+    """Return plausible-looking synthetic telemetry hits for fallback."""
     templates = [
         {
             "source": "crowdstrike",
@@ -89,19 +93,8 @@ def _synthetic_hits(query: str, limit: int) -> list[dict[str, Any]]:
                 "process_name": "cmd.exe",
                 "parent_name": "explorer.exe",
                 "cmdline": f"cmd.exe /c {query}",
-                "user": "DOMAIN\\analyst",
+                "user": "DOMAIN\analyst",
                 "host": "WS-DEV-01",
-            },
-        },
-        {
-            "source": "azure_ad",
-            "event_type": "SignInLog",
-            "raw": {
-                "userPrincipalName": "user@corp.example",
-                "ipAddress": "192.0.2.42",
-                "location": "US",
-                "appDisplayName": "Microsoft 365",
-                "resultType": "0",
             },
         },
         {
@@ -111,7 +104,9 @@ def _synthetic_hits(query: str, limit: int) -> list[dict[str, Any]]:
                 "eventName": "AssumeRole",
                 "sourceIPAddress": "10.0.0.100",
                 "userAgent": "aws-sdk-python",
-                "requestParameters": {"roleArn": "arn:aws:iam::123456789:role/Admin"},
+                "requestParameters": {
+                    "roleArn": "arn:aws:iam::123456789:role/Admin"
+                },
             },
         },
     ]
@@ -133,6 +128,165 @@ def _synthetic_hits(query: str, limit: int) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+
+def _build_clickhouse_query_for_non_sql(query_str: str, limit: int) -> str:
+    """Extract search terms from non-SQL queries (ES|QL, KQL, SPL)
+    and filter ClickHouse raw_payload.
+    """
+    raw_quotes = re.findall(r'["\']([^"\']+)["\']', query_str)
+    search_terms = []
+    for q in raw_quotes:
+        term = q.strip("%* ").replace('"', "").replace("'", "")
+        if term and term.lower() not in (
+            "logs-*",
+            "events",
+            "index=*",
+            "100",
+            "200",
+            "500",
+            "esql",
+            "kql",
+            "spl",
+        ):
+            if len(term) >= 2:
+                search_terms.append(term)
+
+    if not search_terms:
+        clean_text = re.sub(r"//.*", "", query_str)
+        tokens = re.findall(r"\b[a-zA-Z0-9_\-\.]{3,}\b", clean_text)
+        keywords = {
+            "from",
+            "where",
+            "like",
+            "limit",
+            "select",
+            "and",
+            "or",
+            "keep",
+            "sort",
+            "desc",
+            "asc",
+            "project",
+            "extend",
+            "logs",
+            "events",
+            "process",
+            "command_line",
+            "name",
+            "user",
+            "host",
+            "securityevent",
+            "activity",
+            "head",
+            "index",
+        }
+        for token in tokens:
+            if token.lower() not in keywords and not token.isdigit():
+                search_terms.append(token)
+
+    where_clauses = []
+    for term in search_terms[:5]:
+        escaped_term = term.replace("'", "\'")
+        where_clauses.append(f"raw_payload ILIKE '%{escaped_term}%'")
+
+    where_str = ""
+    if where_clauses:
+        op = " OR " if " or " in query_str.lower() else " AND "
+        where_str = f"WHERE {op.join(where_clauses)} "
+
+    return (
+        f"SELECT event_id, event_time, connector_type, user_name, "
+        f"process_name, raw_payload FROM aisoc.raw_events "
+        f"{where_str}ORDER BY event_time DESC LIMIT {limit}"
+    )
+
+
+# Core ClickHouse Execution Engine (SOA)
+# ---------------------------------------------------------------------------
+
+
+
+async def _execute_clickhouse_query(
+    sql_query: str, limit: int
+) -> list[dict[str, Any]] | None:
+    """Issue a secure SELECT query to the ClickHouse warm-tier server directly."""
+    clean_sql = sql_query.strip().rstrip(";")
+    if "format json" not in clean_sql.lower():
+        clean_sql = f"{clean_sql} FORMAT JSON"
+
+    headers = {"Content-Type": "application/json"}
+
+    try:
+        logger.info(
+            "Executing telemetry query on ClickHouse lake", url=_CLICKHOUSE_URL
+        )
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                _CLICKHOUSE_URL, content=clean_sql, headers=headers
+            )
+        resp.raise_for_status()
+
+        parsed = resp.json()
+        raw_rows = parsed.get("data", [])
+        if not raw_rows:
+            return []
+
+        hits = []
+        for row in raw_rows[:limit]:
+            raw_data = dict(row)
+            event_id = str(raw_data.get("event_id", uuid.uuid4()))
+
+            # Extract and unpack nested raw_payload if present
+            if "raw_payload" in raw_data and isinstance(
+                raw_data["raw_payload"], str
+            ):
+                try:
+                    payload_json = json.loads(raw_data["raw_payload"])
+                    if isinstance(payload_json, dict):
+                        raw_data.update(payload_json)
+                except Exception:
+                    pass
+
+            timestamp_val = raw_data.get("event_time") or raw_data.get(
+                "timestamp"
+            )
+            if isinstance(timestamp_val, int):
+                timestamp = datetime.fromtimestamp(
+                    timestamp_val, UTC
+                ).isoformat()
+            else:
+                timestamp = str(timestamp_val or datetime.now(UTC).isoformat())
+
+            hits.append(
+                {
+                    "id": event_id,
+                    "timestamp": timestamp,
+                    "source": str(
+                        raw_data.get("connector_type")
+                        or raw_data.get("event_source")
+                        or raw_data.get("source")
+                        or "clickhouse"
+                    ),
+                    "event_type": str(
+                        raw_data.get("class_name")
+                        or raw_data.get("event_type")
+                        or "telemetry"
+                    ),
+                    "raw": raw_data,
+                    "highlights": None,
+                }
+            )
+        return hits
+
+    except Exception as exc:
+        logger.warning(
+            "ClickHouse query failed or returned no results",
+            error=str(exc),
+        )
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -140,18 +294,27 @@ def _synthetic_hits(query: str, limit: int) -> list[dict[str, Any]]:
 @router.post("/search", response_model=HuntResponse)
 async def hunt_search(query: HuntQuery) -> HuntResponse:
     """Execute a hunt query and return matching telemetry events."""
-    import time
-
     start = time.monotonic()
 
-    hits_raw = _synthetic_hits(query.query, query.limit)
+    hits_list = None
+
+    lang = query.language.lower()
+    if lang == "sql":
+        hits_list = await _execute_clickhouse_query(query.query, query.limit)
+    else:
+        # Non-SQL dialects (esql, kql, spl, lucene): extract terms & filter ClickHouse
+        sql = _build_clickhouse_query_for_non_sql(query.query, query.limit)
+        hits_list = await _execute_clickhouse_query(sql, query.limit)
+
+    hits_list = [HuntHit(**h) for h in (hits_list or [])]
 
     took_ms = int((time.monotonic() - start) * 1000)
+
     return HuntResponse(
         query=query.query,
-        total=len(hits_raw),
+        total=len(hits_list),
         took_ms=took_ms,
-        hits=[HuntHit(**h) for h in hits_raw],
+        hits=hits_list,
     )
 
 

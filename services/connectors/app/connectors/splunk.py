@@ -5,6 +5,7 @@ Runs saved searches and fetches notable events from Splunk SIEM.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import httpx
@@ -160,13 +161,46 @@ class SplunkConnector(BaseConnector):
             return list(resp.json().get("results", []))
 
     def normalize(self, raw: dict[str, Any]) -> dict[str, Any]:
-        urgency_map = {"critical": "critical", "high": "high", "medium": "medium", "low": "low", "informational": "info"}
+        urgency_map = {
+            "critical": "critical",
+            "high": "high",
+            "medium": "medium",
+            "low": "low",
+            "informational": "info",
+        }
+        
+        # Try to extract the real severity from the _raw string
+        raw_sev = "medium"
+        raw_event_data = raw.get("raw_event", raw)
+        _raw_str = ""
+        if isinstance(raw_event_data, dict):
+            _raw_str = raw_event_data.get("_raw", "")
+            if not _raw_str:
+                # Check deeper nested raw_event
+                _raw_str = raw_event_data.get("raw_event", {}).get("_raw", "")
+
+        if _raw_str:
+            # Match severity="value" or severity=value
+            match = re.search(r'severity\s*=\s*\\?"([a-zA-Z0-9_]+)\\?"', _raw_str)
+            if match:
+                raw_sev = match.group(1).lower()
+            else:
+                match = re.search(r'severity\s*=\s*([a-zA-Z0-9_]+)', _raw_str)
+                if match:
+                    raw_sev = match.group(1).lower()
+        else:
+            raw_sev = (
+                str(raw.get("severity") or raw.get("urgency") or "medium")
+                .strip()
+                .lower()
+            )
+
         return {
             "source": self.connector_id,
             "external_id": raw.get("event_id", raw.get("_cd", "")),
             "title": raw.get("source", "Splunk Notable Event"),
             "description": raw.get("description", ""),
-            "severity": urgency_map.get(raw.get("urgency", "medium"), "medium"),
+            "severity": urgency_map.get(raw_sev, "medium"),
             "src_ip": raw.get("src", raw.get("src_ip")),
             "hostname": raw.get("host"),
             "raw_event": raw,

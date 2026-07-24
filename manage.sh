@@ -10,6 +10,7 @@
 # 도커 컴포즈 파일 경로 지정
 # COMPOSE_PATH="infra/compose/docker-compose.dev.yml"
 COMPOSE_PATH="docker-compose.yml"
+CONTAINER_PREFIX="aisoc-dev1"
 
 # TTY 지원 여부에 따라 Docker 실행 옵션 동적 선택 (스크립트 및 자동화 대응)
 if [ -t 0 ]; then
@@ -67,7 +68,7 @@ case "$1" in
         echo -e "${BLUE}[1/3] 기존 컨테이너를 중지하는 중...${NC}"
         docker compose -f "$COMPOSE_PATH" down
         echo -e "${BLUE}[2/3] ZooKeeper 동기화 불일치를 방지하기 위해 Kafka 데이터 볼륨을 초기화합니다...${NC}"
-        docker volume rm aisoc_kafka_data compose_kafka_data 2>/dev/null || true
+        docker volume rm ${CONTAINER_PREFIX}_kafka_data compose_kafka_data 2>/dev/null || true
         docker compose -f "$COMPOSE_PATH" build
         echo -e "${BLUE}[3/3] 컨테이너를 재생성하여 시작하는 중...${NC}"
         docker compose -f "$COMPOSE_PATH" up -d
@@ -81,21 +82,21 @@ case "$1" in
         
     seed)
         echo -e "${BLUE}[+] 표준 데모 데이터(15개 인시던트)를 적재하는 중...${NC}"
-        if ! docker ps | grep -q "aisoc-api"; then
-            echo -e "${RED}[ERROR] aisoc-api 컨테이너가 켜져 있지 않습니다. 먼저 './manage.sh start'를 실행하세요.${NC}"
+        if ! docker ps | grep -q "${CONTAINER_PREFIX}-api"; then
+            echo -e "${RED}[ERROR] ${CONTAINER_PREFIX}-api 컨테이너가 켜져 있지 않습니다. 먼저 './manage.sh start'를 실행하세요.${NC}"
             exit 1
         fi
-        docker exec $DOCKER_OPTS aisoc-api python -m app.scripts.seed_demo
+        docker exec $DOCKER_OPTS ${CONTAINER_PREFIX}-api python -m app.scripts.seed_demo
         echo -e "${GREEN}[✔] 표준 데모 데이터 적재가 완료되었습니다!${NC}"
         ;;
         
     seed-live)
         echo -e "${BLUE}[+] 기존 데이터를 리셋하고 AI 에이전트 분석을 강제 개시합니다 (라이브 시드)...${NC}"
-        if ! docker ps | grep -q "aisoc-api"; then
-            echo -e "${RED}[ERROR] aisoc-api 컨테이너가 켜져 있지 않습니다. 먼저 './manage.sh start'를 실행하세요.${NC}"
+        if ! docker ps | grep -q "${CONTAINER_PREFIX}-api"; then
+            echo -e "${RED}[ERROR] ${CONTAINER_PREFIX}-api 컨테이너가 켜져 있지 않습니다. 먼저 './manage.sh start'를 실행하세요.${NC}"
             exit 1
         fi
-        docker exec -e AGENTS_API_URL=http://agents:8084 $DOCKER_OPTS aisoc-api python app/scripts/demo_seed.py --reset --kickoff-investigation
+        docker exec -e AGENTS_API_URL=http://agents:8084 $DOCKER_OPTS ${CONTAINER_PREFIX}-api python app/scripts/demo_seed.py --reset --kickoff-investigation
         echo -e "${GREEN}[✔] 에이전트 분석 시드가 성공적으로 구동되었습니다!${NC}"
         ;;
         

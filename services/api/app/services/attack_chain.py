@@ -276,6 +276,20 @@ _SEVERITY_RANK: dict[str, int] = {
 }
 
 
+def _normalize_tech_ids(items: Iterable[Any] | None) -> set[str]:
+    if not items:
+        return set()
+    out: set[str] = set()
+    for item in items:
+        if isinstance(item, str):
+            out.add(item)
+        elif isinstance(item, dict):
+            tech_id = item.get("id") or item.get("technique_id") or item.get("name")
+            if tech_id and isinstance(tech_id, str):
+                out.add(tech_id)
+    return out
+
+
 def _risk_overlap(seed: CandidateAlert, cand: CandidateAlert) -> float:
     """MITRE-Jaccard + severity-weighted overlap, ∈ [0, 1].
 
@@ -287,8 +301,8 @@ def _risk_overlap(seed: CandidateAlert, cand: CandidateAlert) -> float:
 
     The two terms are averaged so neither dominates.
     """
-    a = set(seed.mitre_techniques or ())
-    b = set(cand.mitre_techniques or ())
+    a = _normalize_tech_ids(seed.mitre_techniques)
+    b = _normalize_tech_ids(cand.mitre_techniques)
     if a or b:
         jaccard = len(a & b) / max(1, len(a | b))
     else:
@@ -477,7 +491,7 @@ async def compute_attack_chain(
                 distance=distance,
                 dt_seconds=dt_s,
                 shared_entities=shared,
-                mitre_techniques=list(cand.mitre_techniques),
+                mitre_techniques=list(_normalize_tech_ids(cand.mitre_techniques)),
                 connector_type=cand.connector_type,
                 source_event_ids=list(cand.source_event_ids),
             )

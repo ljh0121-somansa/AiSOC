@@ -52,12 +52,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.api.v1.deps import AuthUser
 
-# Defer import of the NL translator helpers — `nl_query.py` already does the
-# vendored-tree resolution dance at import time and we want the same module
-# instance so a future LLM enhancement applies uniformly.
-from app.api.v1.endpoints.nl_query import (  # noqa: E402
-    deterministic_translate,
-)
+from app.api.v1.endpoints.nl_query import _delegate_translation_to_agents
 from app.db.rls import TenantDBSession
 from app.models.saved_hunt import SavedHunt
 
@@ -224,15 +219,23 @@ def _coerce_uuid(value: str) -> uuid.UUID:
         ) from exc
 
 
-def _translate(nl_query: str) -> TranslatedQueryEnvelope:
-    """Translate ``nl_query`` deterministically.
+async def _translate(nl_query: str) -> TranslatedQueryEnvelope:
+    """Translate ``nl_query`` by delegating to the agents service via REST.
 
-    Wrapped so test code can monkeypatch one symbol. The deterministic
-    translator never raises on valid input — the grammar validators are
-    internal to it — so there's no exception swallow needed here.
+    Enforces Service-Oriented Architecture (SOA) and keeps the API service
+    decoupled from agents modules.
     """
-    tq = deterministic_translate(nl_query)
-    return TranslatedQueryEnvelope.from_translator(tq)
+    tq = await _delegate_translation_to_agents(
+        question=nl_query,
+        index_pattern="logs-*",
+        time_range_hours=24,
+    )
+    return TranslatedQueryEnvelope(
+        esql=tq.get("esql", ""),
+        kql=tq.get("kql", ""),
+        spl=tq.get("spl", ""),
+        explanation=tq.get("explanation", ""),
+    )
 
 
 async def _load_owned_hunt(
@@ -302,7 +305,7 @@ async def create_saved_hunt(
         )
     schedule = _validate_cron(payload.schedule) if payload.schedule else None
 
-    translated = _translate(nl_query)
+    translated = await _translate(nl_query)
 
     now = datetime.now(UTC)
     row = SavedHunt(
@@ -405,7 +408,7 @@ async def run_saved_hunt(
     hunt_uuid = _coerce_uuid(hunt_id)
     row = await _load_owned_hunt(db, hunt_uuid, user)
 
-    translated = _translate(row.nl_query)
+    translated = await _translate(row.nl_query)
     now = datetime.now(UTC)
 
     # Persist the refreshed translation alongside the run timestamp so the
