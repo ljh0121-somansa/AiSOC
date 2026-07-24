@@ -148,6 +148,14 @@ def _parse_sample_events(sample: str | None) -> list[dict[str, Any]]:
     if not text:
         return [{}]
 
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                return [data]
+        except Exception:
+            pass
+            
     # Try JSON array first.
     if text.startswith("["):
         try:

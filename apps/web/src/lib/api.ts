@@ -2694,13 +2694,14 @@ export interface AgentInvestigation {
   actions?: Array<{ type: string; target: string; status: string }>;
   startedAt: string;
   completedAt?: string;
+  cached?: boolean;
 }
 
 export const agentsApi = {
-  investigate: (alertId: string) =>
+  investigate: (alertId: string, reinvestigate = false, alertPayload?: Record<string, unknown>) =>
     request<AgentInvestigation>('/api/v1/agents/investigate', {
       method: 'POST',
-      body: JSON.stringify({ alertId }),
+      body: JSON.stringify({ alertId, reinvestigate, alert: alertPayload }),
     }),
 
   getInvestigation: (id: string) =>

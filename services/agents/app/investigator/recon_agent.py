@@ -33,8 +33,13 @@ _SYSTEM_PROMPT = """You are the ReconAgent of an AI Security Operations Centre.
 Your task is to analyse a security alert and:
 1. List all unique IOCs (IPs, domains, URLs, file hashes) found in the alert.
 2. Identify probable MITRE ATT&CK techniques based on the alert description.
-3. Hypothesise which threat-actor group(s) may be responsible, citing your evidence.
-4. Summarise the attack surface at risk.
+3. Hypothesise which threat-actor group(s) may be responsible, citing your evidence in Korean.
+4. Summarise the attack surface at risk in Korean.
+
+CRITICAL:                                                                                                                                                                                                             
+   - Write the value of "summary" and any descriptions strictly in Korean.                                                                                                                                      
+   - The JSON keys MUST remain in English.                                                                                                                                                                               
+   - Threat actor group names or MITRE technique names should remain in English (e.g. "APT28", "T1566").
 
 Respond ONLY with a JSON object matching this schema:
 {
@@ -42,7 +47,7 @@ Respond ONLY with a JSON object matching this schema:
   "mitre_techniques": ["T1566", ...],
   "threat_actors": ["APT28", ...],
   "attack_surface": {"affected_systems": [...], "data_at_risk": "..."},
-  "summary": "One-paragraph reconnaissance summary."
+  "summary": "One-paragraph reconnaissance summary in Korean."
 }
 """
 

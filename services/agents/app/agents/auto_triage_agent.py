@@ -59,7 +59,7 @@ You MUST respond with a JSON object and nothing else:
 {
   "verdict": "true_positive" | "false_positive" | "benign",
   "confidence": <float 0.0–1.0>,
-  "rationale": "<2-4 sentence explanation of your reasoning>"
+  "rationale": "<2-4 sentence explanation of your reasoning in Korean>"
 }
 
 Reasoning guidelines:
@@ -69,6 +69,7 @@ Reasoning guidelines:
 - Informational alerts with no IOCs and low risk lean benign.
 - Be conservative: when uncertain, lean toward true_positive to avoid missing threats.
 - confidence should reflect how certain you are, not the severity of the threat.
+- LANGUAGE RULE: To optimize token usage, perform all internal reasoning and JSON keys in English, but you MUST write the "rationale" value in natural, professional Korean for the security analyst UI.
 """
 
 

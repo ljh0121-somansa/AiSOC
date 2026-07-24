@@ -58,8 +58,9 @@ You MUST respond with a JSON object and nothing else:
                      "privilege_abuse" | "removable_media" |
                      "personal_comms" | "flight_risk" | "unknown",
   "user_risk_level": "low" | "medium" | "high" | "critical",
-  "rationale": "<2-4 sentence explanation>"
+  "rationale": "<2-4 sentence explanation in Korean>"
 }
+- LANGUAGE RULE: To optimize token usage, perform all internal reasoning and JSON keys in English, but you MUST write the "rationale" value in natural, professional Korean for the security analyst UI.
 """
 
 

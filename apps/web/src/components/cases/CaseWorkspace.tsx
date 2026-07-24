@@ -1184,11 +1184,18 @@ function InvestigationPanel({
           <h4 className="text-xs font-semibold uppercase tracking-wide text-amber-300">Response</h4>
           {responder?.summary != null && <p className="text-xs text-slate-400">{String(responder.summary)}</p>}
           {Array.isArray(responder?.recommended_actions) && (
-            <ul className="space-y-1">
+            <ul className="space-y-2">
               {(responder.recommended_actions as any[]).slice(0, 4).map((action, i) => (
                 <li key={i} className="flex items-start gap-1.5 text-xs text-slate-300">
-                  <span className="mt-0.5 h-1.5 w-1.5 flex-none rounded-full bg-amber-400" />
-                  {typeof action === 'string' ? action : action?.action ?? JSON.stringify(action)}
+                  <span className="mt-1 h-1.5 w-1.5 flex-none rounded-full bg-amber-400" />
+                  <div className="flex flex-col gap-1 w-full">
+                    <span>{typeof action === 'string' ? action : action?.action ?? JSON.stringify(action)}</span>
+                    {typeof action !== 'string' && action?.command && (
+                      <code className="text-[10px] bg-slate-950/80 px-2 py-1 rounded text-amber-200 font-mono select-all block w-full mt-1 border border-slate-800/80 overflow-x-auto whitespace-nowrap">
+                        {action.command}
+                      </code>
+                    )}
+                  </div>
                 </li>
               ))}
             </ul>

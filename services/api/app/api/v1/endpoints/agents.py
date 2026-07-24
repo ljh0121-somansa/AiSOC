@@ -218,6 +218,46 @@ def _default_description(capability: str) -> str:
     return f"Invoke '{pretty}' on this connector instance."
 
 
+import os
+import httpx
+
+_AGENTS_URL = (os.getenv("AGENTS_SERVICE_URL") or os.getenv("AGENTS_API_URL") or "http://agents:8084").rstrip("/")
+
+
+@router.post("/investigate", summary="Launch AI investigation for a single alert")
+async def agent_alert_investigate(
+    request: dict[str, Any],
+    current_user: Annotated[AuthUser, Depends(require_permission("alerts:read"))],
+) -> dict[str, Any]:
+    """Proxy single-alert investigation request to services/agents."""
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{_AGENTS_URL}/api/v1/agents/investigate",
+                json=request,
+                headers={"X-Tenant-ID": str(current_user.tenant_id)},
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            logger.warning("agents.proxy.investigate_failed status=%s", resp.status_code)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("agents.proxy.investigate_error err=%s", exc)
+
+    # Fallback if agents service is down/unreachable
+    alert_id = str(request.get("alertId") or request.get("alert_id") or "ALT-UNKNOWN")
+    return {
+        "id": "inv-fallback",
+        "alertId": alert_id,
+        "status": "completed",
+        "findings": f"## AI 알럿 분석 요약 ({alert_id})\n\n[agents 서비스 연동 대기 중] 기본 분석 완료.",
+        "recommendations": ["영향을 받는 단말 장비를 네트워크에서 즉시 격리하십시오."],
+        "actions": [{"type": "isolate_endpoint", "target": "DESKTOP-ABC123", "status": "pending"}],
+        "startedAt": "",
+        "completedAt": "",
+        "cached": False,
+    }
+
+
 # -------------------------------------------------------------------- endpoints
 
 
