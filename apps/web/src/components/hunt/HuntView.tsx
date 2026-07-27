@@ -784,15 +784,13 @@ export function HuntView() {
       setResults(res);
       setDemoMode(false);
     } catch (err) {
-      // Demo fallback so the page still feels alive without a seeded backend.
       setResults({
-        total: DEMO_RESULTS.length,
-        took: 42,
-        hits: DEMO_RESULTS,
+        total: 0,
+        took: 0,
+        hits: [],
       });
-      setDemoMode(true);
+      setDemoMode(false);
       setRunError(err);
-      toast('Backend unreachable — showing demo results');
     } finally {
       setRunning(false);
     }
@@ -1141,10 +1139,10 @@ export function HuntView() {
           <div className="overflow-hidden rounded-xl border border-slate-800/80 bg-slate-900/40">
             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 px-4 py-2.5">
               <h3 className="text-sm font-semibold text-slate-200">
-                Hunt results
+                수색 결과
                 {results && (
                   <span className="ml-2 text-xs font-normal text-slate-400">
-                    {(results.total ?? 0).toLocaleString()} hits ·{' '}
+                    {(results.total ?? 0).toLocaleString()} 건 ·{' '}
                     {(results.took ?? (results as any).took_ms ?? 0).toLocaleString()}ms
                   </span>
                 )}
@@ -1169,20 +1167,20 @@ export function HuntView() {
               </div>
             ) : !results ? (
               <EmptyState
-                title="Press Run to begin"
-                description="Tip: ask a question above, pick a saved hunt, or pivot from an alert."
+                title="수색을 시작하려면 Run 버튼을 누르세요"
+                description="팁: 상단에 가설 질문을 작성하거나, 저장된 수색 조건을 선택하세요."
               />
             ) : results.hits.length === 0 ? (
               <div className="flex flex-col items-center justify-center px-6 py-10">
                 <p className="text-sm font-medium text-emerald-300">
-                  No matches in the selected window
+                  조회된 수색 결과가 없습니다 (0건)
                 </p>
                 <p className="mt-1 text-xs text-slate-500">
                   {runError
-                    ? 'Backend unreachable — but here is the parsed query so you can refine it.'
+                    ? '백엔드 데이터베이스에 연결할 수 없으나, 해석된 쿼리를 에디터에서 수정할 수 있습니다.'
                     : nlSubmittedQuery
-                      ? 'The translator parsed your question (see editor) but found no events. Try a wider time range.'
-                      : 'Either the data is clean, or the query is too tight.'}
+                      ? 'AI 번역기가 가설 질문을 해석했으나 조건에 맞는 로그를 찾지 못했습니다. 시간 범위를 넓혀보세요.'
+                      : '현재 수집된 데이터가 깨끗하거나 검색 조건이 너무 엄격합니다.'}
                 </p>
               </div>
             ) : (

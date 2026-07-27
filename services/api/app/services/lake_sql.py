@@ -168,7 +168,8 @@ def rewrite_for_tenant(
     # attack — a caller sending ``SELECT 1; DROP TABLE x;`` is rejected
     # even though the first statement on its own would have been fine.
     try:
-        statements = [stmt for stmt in sqlglot.parse(sql, read="clickhouse") if stmt is not None]
+        sql_clean = sql.replace("logs-*", "raw_events").replace("LOGS-*", "raw_events")
+        statements = [stmt for stmt in sqlglot.parse(sql_clean, read="clickhouse") if stmt is not None]
     except sqlglot.errors.ParseError as exc:
         raise LakeSqlSyntaxError(f"unable to parse SQL: {exc}") from exc
 
@@ -218,6 +219,11 @@ def rewrite_for_tenant(
 
     for select in selects:
         _validate_and_rewrite_select(select, tenant_id, cte_aliases, referenced)
+
+    # Remap SIEM pseudo-column names (e.g. _time -> event_time) across AST
+    for col in list(tree.find_all(exp.Column)):
+        if col.name.lower() == "_time":
+            col.replace(exp.Column(this=exp.to_identifier("event_time")))
 
     # ── Step 5: clamp the outer LIMIT ────────────────────────────────
     _clamp_outer_limit(root, effective_cap)
@@ -279,6 +285,12 @@ def _validate_and_rewrite_select(
             # Non-function table without a name — degenerate; reject.
             raise LakeSqlForbiddenError("unrecognised table reference in FROM/JOIN")
 
+        # Map SIEM pseudo-tables (logs-*, logs, events) to aisoc.raw_events in AST
+        if bare_name.lower() in {"logs-*", "logs", "events"}:
+            table.set("this", exp.to_identifier("raw_events"))
+            table.set("db", exp.to_identifier(DEFAULT_SCHEMA))
+            bare_name = "raw_events"
+
         # CTE references: allowed, but skipped (no allowlist check, no
         # predicate injection — the CTE body already has its own SELECT
         # and is rewritten on its own visit).
@@ -302,6 +314,8 @@ def _validate_and_rewrite_select(
         # Every direct table was a CTE alias — predicates already applied
         # inside the CTE bodies. Nothing more to do here.
         return
+
+
 
     # ── Inject `tenant_id = '<uuid>'` predicates ──────────────────────
     #
