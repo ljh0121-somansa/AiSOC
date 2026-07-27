@@ -24,6 +24,7 @@ import { clsx } from 'clsx';
 import { motion, AnimatePresence } from 'framer-motion';
 import { format, formatDistanceToNow } from 'date-fns';
 import toast from 'react-hot-toast';
+import { RoleBadge } from '@/components/layout/RoleBadge';
 import {
   ApiError,
   authApi,
@@ -907,10 +908,8 @@ function WorkspacePanel() {
 
   const availableRoles = useMemo(() => {
     const baseRoles = [
-      { name: 'tenant_admin', label: 'Tenant Admin (테넌트 관리자)' },
-      { name: 'soc_lead', label: 'SOC Lead' },
-      { name: 'soc_analyst', label: 'SOC Analyst' },
-      { name: 'threat_hunter', label: 'Threat Hunter' },
+      { name: 'admin', label: 'Admin' },
+      { name: 'analyst', label: 'Analyst' },
       { name: 'viewer', label: 'Viewer' },
     ];
     if (!rbacRoles || rbacRoles.length === 0) return baseRoles;
@@ -930,7 +929,7 @@ function WorkspacePanel() {
   const [email, setEmail] = useState('');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const [role, setRole] = useState('soc_analyst');
+  const [role, setRole] = useState('analyst');
   const [creating, setCreating] = useState(false);
 
   // Workspace Name editing state
@@ -1216,6 +1215,9 @@ function WorkspacePanel() {
           <ul className="mt-4 divide-y divide-gray-800 rounded-lg border border-gray-800 bg-gray-950/40">
             {activeMembers.map((m) => {
               const isMe = m.email === currentUser?.email || m.id === currentUser?.id;
+              const isTargetPlatformAdmin = m.role === 'platform_admin';
+              const canEditMember = !isMe && !isTargetPlatformAdmin && isAdmin;
+
               return (
                 <li
                   key={m.id || m.email}
@@ -1233,10 +1235,8 @@ function WorkspacePanel() {
                     <p className="truncate text-xs text-gray-400">{m.email}</p>
                   </div>
                   <div className="flex items-center gap-2">
-                    <span className="rounded-full border border-blue-500/20 bg-blue-500/10 px-2.5 py-1 text-xs font-medium text-blue-400 capitalize">
-                      {m.role}
-                    </span>
-                    {!isMe && isAdmin && (
+                    <RoleBadge role={m.role} />
+                    {canEditMember && (
                       <button
                         type="button"
                         onClick={() => setEditingMember(m)}

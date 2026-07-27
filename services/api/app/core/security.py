@@ -141,8 +141,9 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
     ],
 }
 
-# Backwards-compatibility alias: "admin" maps to "tenant_admin"
+# Backwards-compatibility aliases
 ROLE_PERMISSIONS["admin"] = ROLE_PERMISSIONS["tenant_admin"]
+ROLE_PERMISSIONS["analyst"] = ROLE_PERMISSIONS["soc_analyst"]
 
 
 def _to_bcrypt_input(password: str) -> bytes:

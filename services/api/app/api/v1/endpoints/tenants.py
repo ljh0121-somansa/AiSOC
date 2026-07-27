@@ -147,7 +147,11 @@ async def list_users(
     db: DBSession,
 ) -> list[UserResponse]:
     """List all users in the current tenant."""
-    result = await db.execute(select(User).where(User.tenant_id == current_user.tenant_id).order_by(User.created_at))
+    result = await db.execute(
+        select(User)
+        .where(User.tenant_id == current_user.tenant_id, User.is_active == True)  # noqa: E712
+        .order_by(User.created_at)
+    )
     users = result.scalars().all()
     return [UserResponse.model_validate(u) for u in users]
 
@@ -211,6 +215,12 @@ async def update_user(
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
+    if (user.role == "platform_admin") and current_user.role != "platform_admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="최고 플랫폼 관리자 계정은 수정할 수 없습니다.",
+        )
+
     updates: dict = {}
     for field in ["username", "role", "is_active"]:
         val = getattr(request, field, None)
@@ -267,7 +277,20 @@ async def delete_user(
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
-    await db.execute(delete(User).where(User.id == user_id))
+    if (user.role == "platform_admin") and current_user.role != "platform_admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="최고 플랫폼 관리자 계정은 삭제할 수 없습니다.",
+        )
+
+    try:
+        await db.execute(delete(User).where(User.id == user_id))
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        # Fallback to soft delete (deactivation) if Foreign Key constraints prevent hard deletion
+        await db.execute(update(User).where(User.id == user_id).values(is_active=False, updated_at=datetime.now(UTC)))
+        await db.commit()
 
     try:
         await emit_audit(
@@ -281,10 +304,9 @@ async def delete_user(
             changes={"email": user.email, "username": user.username},
             request=req,
         )
+        await db.commit()
     except Exception:  # noqa: BLE001
         pass
-
-    await db.commit()
 
 
 @router.post("", response_model=TenantResponse, status_code=status.HTTP_201_CREATED)
@@ -308,13 +330,27 @@ async def create_tenant(
     if existing.scalar_one_or_none() is not None:
         slug = f"{base_slug}-{uuid.uuid4().hex[:4]}"
 
+    user_res = await db.execute(select(User).where(User.id == current_user.user_id))
+    creator_user = user_res.scalar_one_or_none()
+    home_parent_id = creator_user.tenant_id if creator_user else current_user.tenant_id
+
+    # Link new tenant as a child of the current parent workspace if applicable
+    parent_tenant = await db.get(Tenant, home_parent_id)
+    if parent_tenant and parent_tenant.mssp_role != "child":
+        parent_tenant.mssp_role = "parent"
+        parent_id = home_parent_id
+        mssp_role = "child"
+    else:
+        parent_id = None
+        mssp_role = "standalone"
+
     new_tenant = Tenant(
         id=uuid.uuid4(),
         name=clean_name,
         slug=slug,
         plan=request.plan,
-        parent_tenant_id=None,
-        mssp_role="standalone",
+        parent_tenant_id=parent_id,
+        mssp_role=mssp_role,
     )
     db.add(new_tenant)
 
@@ -327,8 +363,6 @@ async def create_tenant(
         pass
 
     # Automatically register creator into users table for the new tenant
-    user_res = await db.execute(select(User).where(User.id == current_user.user_id))
-    creator_user = user_res.scalar_one_or_none()
     if creator_user:
         new_user = User(
             id=uuid.uuid4(),
