@@ -1,11 +1,15 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
+import useSWR from 'swr';
 import { clsx } from 'clsx';
 import toast from 'react-hot-toast';
 import { EmptyState, EmptyStateIcons } from '@/components/ui/EmptyState';
+import { isDemoMode } from '@/lib/demoMode';
+import { request, msspApi, tenantsApi } from '@/lib/api';
 
 interface Tenant {
+  id?: string;
   name: string;
   activeAlerts: number;
   openCases: number;
@@ -15,6 +19,7 @@ interface Tenant {
   slaStatus: 'compliant' | 'warning' | 'breach';
   arr: number;
   analystAllocation: number;
+  isChild?: boolean;
 }
 
 const TENANTS: Tenant[] = [
@@ -35,29 +40,125 @@ const SLA_STYLES: Record<Tenant['slaStatus'], { bg: string; text: string; label:
 function kpiCards(tenants: Tenant[]) {
   const totalTenants = tenants.length;
   const totalOpenCases = tenants.reduce((s, t) => s + t.openCases, 0);
-  const avgMTTD = tenants.reduce((s, t) => s + t.mttd, 0) / totalTenants;
-  const avgMTTR = tenants.reduce((s, t) => s + t.mttr, 0) / totalTenants;
+
+  const validMTTD = tenants.filter((t) => t.mttd > 0);
+  const avgMTTD = validMTTD.length > 0 ? validMTTD.reduce((s, t) => s + t.mttd, 0) / validMTTD.length : 0;
+
+  const validMTTR = tenants.filter((t) => t.mttr > 0);
+  const avgMTTR = validMTTR.length > 0 ? validMTTR.reduce((s, t) => s + t.mttr, 0) / validMTTR.length : 0;
+
   const compliant = tenants.filter((t) => t.slaStatus === 'compliant').length;
-  const slaCompliance = Math.round((compliant / totalTenants) * 100);
+  const slaCompliance = totalTenants > 0 ? Math.round((compliant / totalTenants) * 100) : 100;
   const totalARR = tenants.reduce((s, t) => s + t.arr, 0);
 
   return [
     { label: 'Total Tenants',    value: totalTenants },
     { label: 'Total Open Cases', value: totalOpenCases },
-    { label: 'Avg MTTD',         value: `${avgMTTD.toFixed(1)} min` },
-    { label: 'Avg MTTR',         value: `${avgMTTR.toFixed(0)} min` },
+    { label: 'Avg MTTD',         value: avgMTTD > 0 ? `${avgMTTD.toFixed(1)} min` : '—' },
+    { label: 'Avg MTTR',         value: avgMTTR > 0 ? `${avgMTTR.toFixed(0)} min` : '—' },
     { label: 'SLA Compliance',   value: `${slaCompliance}%` },
-    { label: 'Total ARR',        value: `$${(totalARR / 1000).toFixed(0)}K` },
+    { label: 'Total ARR',        value: totalARR > 0 ? `$${(totalARR / 1000).toFixed(0)}K` : '—' },
   ];
 }
 
 type SLAFilter = 'all' | 'compliant' | 'warning' | 'breach';
 
 export default function MSSPDashboardView() {
-  const [tenants] = useState(TENANTS);
   const [slaFilter, setSlaFilter] = useState<SLAFilter>('all');
-  const cards = kpiCards(tenants);
 
+  const { data: childTenants, mutate: mutateChildren } = useSWR(
+    '/api/v1/mssp/children',
+    () => msspApi.listChildren().catch(() => []),
+    { revalidateOnFocus: false },
+  );
+
+  const { data: myTenants, mutate: mutateMyTenants } = useSWR(
+    '/api/v1/tenants/my-tenants',
+    () => tenantsApi.listMyTenants().catch(() => []),
+    { revalidateOnFocus: false },
+  );
+
+  const tenants: Tenant[] = useMemo(() => {
+    const list: Tenant[] = [];
+    const seen = new Set<string>();
+
+    if (Array.isArray(childTenants)) {
+      for (const ct of childTenants) {
+        if (!seen.has(ct.id)) {
+          seen.add(ct.id);
+          list.push({
+            id: ct.id,
+            name: ct.name,
+            activeAlerts: 0,
+            openCases: 0,
+            mttd: 0,
+            mttr: 0,
+            riskScore: 0,
+            slaStatus: 'compliant',
+            arr: 0,
+            analystAllocation: 0,
+            isChild: true,
+          });
+        }
+      }
+    }
+
+    if (Array.isArray(myTenants)) {
+      for (const mt of myTenants) {
+        if (!seen.has(mt.id)) {
+          seen.add(mt.id);
+          list.push({
+            name: mt.name,
+            activeAlerts: 0,
+            openCases: 0,
+            mttd: 0,
+            mttr: 0,
+            riskScore: 0,
+            slaStatus: 'compliant',
+            arr: 0,
+            analystAllocation: 0,
+          });
+        }
+      }
+    }
+
+    if (list.length > 0) return list;
+    return isDemoMode() ? TENANTS : [];
+  }, [childTenants, myTenants]);
+
+  const handleDeleteChildTenant = async (t: Tenant) => {
+    if (!t.id) return;
+    if (confirm(`정말로 '${t.name}' 테넌트를 삭제하시겠습니까?\n모든 데이터가 완전히 제거됩니다.`)) {
+      try {
+        await tenantsApi.deleteTenant(t.id);
+        toast.success(`테넌트 '${t.name}'가 삭제되었습니다.`);
+        mutateChildren();
+        mutateMyTenants();
+      } catch (err: any) {
+        toast.error(err?.message || '테넌트 삭제 실패');
+      }
+    }
+  };
+
+  if (tenants.length === 0) {
+    return (
+      <div className="space-y-8 p-6 max-w-7xl mx-auto">
+        <div>
+          <h1 className="text-2xl font-bold text-white">MSSP Executive Dashboard</h1>
+          <p className="text-gray-400 mt-1">Cross-tenant security operations overview</p>
+        </div>
+        <div className="rounded-xl border border-gray-800 bg-gray-900/40 p-12 text-center">
+          <EmptyState
+            icon={EmptyStateIcons.cases}
+            title="No Child Tenants Configured"
+            description="MSSP multi-tenant monitoring will display customer organization metrics here once child tenants are attached in Settings."
+          />
+        </div>
+      </div>
+    );
+  }
+
+  const cards = kpiCards(tenants);
   const filteredTenants = slaFilter === 'all' ? tenants : tenants.filter((t) => t.slaStatus === slaFilter);
 
   return (
@@ -132,27 +233,39 @@ export default function MSSPDashboardView() {
                 <th className="px-5 py-3 font-medium text-right">ARR</th>
                 <th className="px-5 py-3 font-medium text-right">Analysts</th>
                 <th className="px-5 py-3 font-medium text-center">SLA Status</th>
+                <th className="px-5 py-3 font-medium text-center">Actions</th>
               </tr>
             </thead>
             <tbody>
               {filteredTenants.map((t) => {
                 const sla = SLA_STYLES[t.slaStatus];
                 return (
-                  <tr key={t.name} className="border-b border-gray-800/40 hover:bg-gray-800/30 transition-colors">
+                  <tr key={t.id || t.name} className="border-b border-gray-800/40 hover:bg-gray-800/30 transition-colors">
                     <td className="px-5 py-3 font-medium text-white">{t.name}</td>
                     <td className="px-5 py-3 text-right text-gray-300">{t.activeAlerts}</td>
                     <td className="px-5 py-3 text-right text-gray-300">{t.openCases}</td>
-                    <td className="px-5 py-3 text-right text-gray-300">{t.mttd.toFixed(1)}</td>
-                    <td className="px-5 py-3 text-right text-gray-300">{t.mttr}</td>
+                    <td className="px-5 py-3 text-right text-gray-300">{t.mttd > 0 ? `${t.mttd.toFixed(1)} min` : '—'}</td>
+                    <td className="px-5 py-3 text-right text-gray-300">{t.mttr > 0 ? `${t.mttr} min` : '—'}</td>
                     <td className={clsx('px-5 py-3 text-right font-medium', t.riskScore >= 80 ? 'text-red-400' : t.riskScore >= 60 ? 'text-amber-400' : 'text-green-400')}>
-                      {t.riskScore}
+                      {t.riskScore > 0 ? t.riskScore : '—'}
                     </td>
-                    <td className="px-5 py-3 text-right text-gray-300">${(t.arr / 1000).toFixed(0)}K</td>
-                    <td className="px-5 py-3 text-right text-gray-300">{t.analystAllocation}</td>
+                    <td className="px-5 py-3 text-right text-gray-300">{t.arr > 0 ? `$${(t.arr / 1000).toFixed(0)}K` : '—'}</td>
+                    <td className="px-5 py-3 text-right text-gray-300">{t.analystAllocation > 0 ? t.analystAllocation : '—'}</td>
                     <td className="px-5 py-3 text-center">
                       <span className={clsx('inline-block px-2.5 py-0.5 rounded-full text-xs font-medium', sla.bg, sla.text)}>
                         {sla.label}
                       </span>
+                    </td>
+                    <td className="px-5 py-3 text-center">
+                      {t.id && (
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteChildTenant(t)}
+                          className="rounded px-2 py-1 text-xs font-medium text-red-400 hover:bg-red-500/10 hover:text-red-300 transition-colors"
+                        >
+                          삭제
+                        </button>
+                      )}
                     </td>
                   </tr>
                 );
