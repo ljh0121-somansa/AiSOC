@@ -1423,8 +1423,15 @@ function SingleMemberEditModal({
   ) => Promise<void>;
   onDelete: (userToDelete: TenantUser) => Promise<void>;
 }) {
+  const normalizedInitialRole = useMemo(() => {
+    const raw = (m.role || '').toLowerCase();
+    if (raw === 'admin' || raw === 'tenant_admin' || raw === 'platform_admin') return 'admin';
+    if (raw === 'viewer' || raw === 'auditor') return 'viewer';
+    return 'analyst';
+  }, [m.role]);
+
   const [username, setUsername] = useState(m.username);
-  const [role, setRole] = useState(m.role);
+  const [role, setRole] = useState(normalizedInitialRole);
   const [password, setPassword] = useState('');
   const [saving, setSaving] = useState(false);
 
