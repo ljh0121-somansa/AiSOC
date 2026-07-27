@@ -136,6 +136,21 @@ BEGIN
     )
     ON CONFLICT DO NOTHING;
 
+    -- SOC Lead role
+    INSERT INTO roles (tenant_id, name, description, is_system)
+    VALUES (p_tenant_id, 'soc_lead', 'SOC Lead - triage and response management', TRUE)
+    ON CONFLICT (tenant_id, name) DO NOTHING;
+
+    -- SOC Analyst role
+    INSERT INTO roles (tenant_id, name, description, is_system)
+    VALUES (p_tenant_id, 'soc_analyst', 'SOC Analyst - investigate and triage alerts', TRUE)
+    ON CONFLICT (tenant_id, name) DO NOTHING;
+
+    -- Threat Hunter role
+    INSERT INTO roles (tenant_id, name, description, is_system)
+    VALUES (p_tenant_id, 'threat_hunter', 'Threat Hunter - proactive threat hunting', TRUE)
+    ON CONFLICT (tenant_id, name) DO NOTHING;
+
     -- Viewer role
     INSERT INTO roles (tenant_id, name, description, is_system)
     VALUES (p_tenant_id, 'viewer', 'Read-only access', TRUE)
@@ -154,7 +169,8 @@ BEGIN
 END;
 $$;
 
--- RLS on RBAC tables
+-- Seed default tenant system roles
+SELECT seed_system_roles('00000000-0000-0000-0000-000000000001'::uuid);
 ALTER TABLE roles            ENABLE ROW LEVEL SECURITY;
 ALTER TABLE roles            FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS roles_tenant ON roles;
