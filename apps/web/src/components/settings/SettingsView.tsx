@@ -26,22 +26,28 @@ import { format, formatDistanceToNow } from 'date-fns';
 import toast from 'react-hot-toast';
 import {
   ApiError,
+  authApi,
   connectorsApi,
   deploymentApi,
+  request,
+  tenantsApi,
   type AirgapStatus,
   type Connector,
   type ConnectorStatus,
+  type FullTenant,
   type LlmCredentialUpsert,
   type LlmCredentialView,
   type LlmProvider,
   type LlmStatus,
   type LlmWritableProvider,
+  type TenantUser,
 } from '@/lib/api';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { ErrorState } from '@/components/ui/ErrorState';
-import { EmptyState } from '@/components/ui/EmptyState';
+import { EmptyState, EmptyStateIcons } from '@/components/ui/EmptyState';
 import { AutonomyPolicyPanel } from '@/components/settings/AutonomyPolicy';
 import { useTheme, type ThemePreference } from '@/components/theme/ThemeProvider';
+import { isDemoMode } from '@/lib/demoMode';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -107,11 +113,26 @@ interface ProfileData {
 }
 
 const DEFAULT_PROFILE: ProfileData = {
-  displayName: 'Sasha Lin',
-  email: 'sasha.lin@example.com',
-  title: 'Senior SOC Analyst',
-  timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+  displayName: 'Admin User',
+  email: 'admin@somansa.com',
+  title: 'SOC Admin',
+  timezone: typeof window !== 'undefined' && Intl.DateTimeFormat().resolvedOptions().timeZone ? Intl.DateTimeFormat().resolvedOptions().timeZone : 'Asia/Seoul',
 };
+
+const COMMON_TIMEZONES = [
+  { value: 'Asia/Seoul', label: 'Asia/Seoul (KST, UTC+9)' },
+  { value: 'UTC', label: 'UTC (Coordinated Universal Time)' },
+  { value: 'Asia/Tokyo', label: 'Asia/Tokyo (JST, UTC+9)' },
+  { value: 'Asia/Shanghai', label: 'Asia/Shanghai (CST, UTC+8)' },
+  { value: 'Asia/Singapore', label: 'Asia/Singapore (SGT, UTC+8)' },
+  { value: 'Europe/London', label: 'Europe/London (GMT/BST, UTC+0)' },
+  { value: 'Europe/Paris', label: 'Europe/Paris (CET/CEST, UTC+1)' },
+  { value: 'America/New_York', label: 'America/New_York (EST/EDT, UTC-5)' },
+  { value: 'America/Chicago', label: 'America/Chicago (CST/CDT, UTC-6)' },
+  { value: 'America/Denver', label: 'America/Denver (MST/MDT, UTC-7)' },
+  { value: 'America/Los_Angeles', label: 'America/Los_Angeles (PST/PDT, UTC-8)' },
+  { value: 'Australia/Sydney', label: 'Australia/Sydney (AEST/AEDT, UTC+10)' },
+];
 
 // ─── Demo fallbacks ───────────────────────────────────────────────────────────
 
@@ -527,19 +548,115 @@ function ProfilePanel() {
   const [profile, setProfile] = useState<ProfileData>(DEFAULT_PROFILE);
   const [dirty, setDirty] = useState(false);
 
+  // Fetch real user info from backend
+  const { data: meUser, mutate: mutateMe } = useSWR(
+    '/api/v1/auth/me',
+    (url: string) => request<{ id: string; username: string; email: string; role: string; preferences?: Record<string, any> }>(url).catch(() => null),
+    { revalidateOnFocus: false },
+  );
+
+  // Password change state & modal
+  const [showPasswordModal, setShowPasswordModal] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [changingPassword, setChangingPassword] = useState(false);
+
   useEffect(() => {
-    setProfile(loadProfile());
-  }, []);
+    const saved = loadProfile();
+    if (meUser) {
+      const prefs = meUser.preferences || {};
+      setProfile({
+        displayName: meUser.username || saved.displayName,
+        email: meUser.email || saved.email,
+        title: (prefs.title as string) || (meUser.role ? meUser.role.toUpperCase() : saved.title),
+        timezone: (prefs.timezone as string) || saved.timezone,
+      });
+    } else {
+      const currentUser = authApi.currentUser();
+      if (currentUser) {
+        setProfile({
+          displayName: currentUser.username || currentUser.email.split('@')[0] || saved.displayName,
+          email: currentUser.email || saved.email,
+          title: currentUser.role ? currentUser.role.toUpperCase() : saved.title,
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+        });
+      } else {
+        setProfile(saved);
+      }
+    }
+  }, [meUser]);
 
   const update = <K extends keyof ProfileData>(key: K, value: ProfileData[K]) => {
     setProfile((p) => ({ ...p, [key]: value }));
     setDirty(true);
   };
 
-  const onSave = () => {
-    saveProfile(profile);
-    setDirty(false);
-    toast.success('Profile updated');
+  const onSave = async () => {
+    try {
+      if (profile.displayName.trim()) {
+        await request('/api/v1/auth/me', {
+          method: 'PATCH',
+          body: JSON.stringify({
+            username: profile.displayName.trim(),
+            title: profile.title.trim(),
+            timezone: profile.timezone.trim(),
+          }),
+        });
+        const currentUser = authApi.currentUser();
+        if (currentUser) {
+          const updatedUser = { ...currentUser, username: profile.displayName.trim() };
+          if (typeof window !== 'undefined') {
+            window.localStorage.setItem('aisoc.authUser', JSON.stringify(updatedUser));
+            window.dispatchEvent(new CustomEvent('aisoc:tenant-switched'));
+          }
+        }
+      }
+      saveProfile(profile);
+      mutateMe();
+      setDirty(false);
+      toast.success('프로필 정보가 성공적으로 반영 및 저장되었습니다.');
+    } catch (err: any) {
+      toast.error(err?.message || '프로필 업데이트 실패');
+    }
+  };
+
+  const onChangePassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!currentPassword || !newPassword) {
+      toast.error('현재 비밀번호와 새 비밀번호를 입력해주세요.');
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      toast.error('새 비밀번호와 비밀번호 확인이 일치하지 않습니다.');
+      return;
+    }
+    if (newPassword.length < 6) {
+      toast.error('새 비밀번호는 6자 이상이어야 합니다.');
+      return;
+    }
+    setChangingPassword(true);
+    try {
+      await authApi.changePassword(currentPassword, newPassword);
+      toast.success('비밀번호가 성공적으로 변경되었습니다.');
+      setCurrentPassword('');
+      setNewPassword('');
+      setConfirmPassword('');
+      setShowPasswordModal(false);
+    } catch (err: any) {
+      let msg = err?.message || '비밀번호 변경 실패';
+      if (err?.body) {
+        try {
+          const parsed = JSON.parse(err.body);
+          if (parsed.detail) msg = parsed.detail;
+        } catch {
+          /* not json */
+        }
+      }
+      toast.error(msg);
+    } finally {
+      setChangingPassword(false);
+    }
   };
 
   const initials = profile.displayName
@@ -548,6 +665,16 @@ function ProfilePanel() {
     .slice(0, 2)
     .map((p) => p[0]?.toUpperCase() ?? '')
     .join('');
+
+  const timezoneOptions = useMemo(() => {
+    const detected = typeof window !== 'undefined' ? (Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Seoul') : 'Asia/Seoul';
+    const current = profile.timezone || detected;
+    const exists = COMMON_TIMEZONES.some((tz) => tz.value === current);
+    if (!exists && current) {
+      return [{ value: current, label: `${current} (Detected)` }, ...COMMON_TIMEZONES];
+    }
+    return COMMON_TIMEZONES;
+  }, [profile.timezone]);
 
   return (
     <div>
@@ -604,12 +731,16 @@ function ProfilePanel() {
               placeholder="e.g. Avi Sharma"
             />
           </Field>
-          <Field label="Email" hint="Used for notifications and login.">
+          <Field label="Email" hint="계정 이메일 주소는 고유 식별자로 변경이 불가능합니다.">
             <input
               type="email"
-              className={inputClass()}
+              disabled
+              readOnly
+              className={clsx(
+                inputClass(),
+                'cursor-not-allowed bg-gray-900/60 text-gray-500 opacity-60 select-none pointer-events-none'
+              )}
               value={profile.email}
-              onChange={(e) => update('email', e.target.value)}
               placeholder="you@org.com"
             />
           </Field>
@@ -621,19 +752,132 @@ function ProfilePanel() {
               placeholder="e.g. SOC Analyst"
             />
           </Field>
-          <Field label="Timezone" hint="Used to localize timestamps.">
-            <input
+          <Field label="Timezone" hint="Used to localize timestamps. Automatically detected from your location.">
+            <select
               className={inputClass()}
               value={profile.timezone}
               onChange={(e) => update('timezone', e.target.value)}
-              placeholder="e.g. America/Los_Angeles"
-            />
+            >
+              {timezoneOptions.map((tz) => (
+                <option key={tz.value} value={tz.value}>
+                  {tz.label}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Password (비밀번호)" hint="현재 비밀번호 확인 후 변경할 수 있습니다.">
+            <div className="flex items-center gap-2">
+              <input
+                type="password"
+                disabled
+                readOnly
+                value="••••••••••••"
+                className={clsx(
+                  inputClass(),
+                  'cursor-default bg-gray-900/60 text-gray-500 select-none pointer-events-none'
+                )}
+              />
+              <button
+                type="button"
+                onClick={() => setShowPasswordModal(true)}
+                className="rounded-lg border border-gray-700 bg-gray-900 px-3.5 py-2 text-xs font-medium text-gray-200 hover:bg-gray-800 hover:text-white transition-colors shrink-0 shadow-xs"
+              >
+                수정
+              </button>
+            </div>
           </Field>
         </div>
 
         <div className="rounded-lg border border-gray-800 bg-gray-950/40 p-4 text-xs text-gray-500">
           Profile preferences are persisted to your user account and sync
           across devices when you sign in.
+        </div>
+
+        {/* Change Password Modal */}
+        {showPasswordModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-xs">
+            <div className="w-full max-w-md rounded-xl border border-gray-800 bg-gray-900 p-6 shadow-2xl">
+              <h3 className="text-base font-semibold text-white">비밀번호 변경 (Change Password)</h3>
+              <p className="mt-1 text-xs text-gray-400">
+                현재 비밀번호를 입력하여 본인 인증 후 새 비밀번호를 설정합니다.
+              </p>
+              <form onSubmit={onChangePassword} className="mt-4 space-y-4">
+                <div>
+                  <label className="block text-xs font-medium text-gray-300">현재 비밀번호</label>
+                  <input
+                    type="password"
+                    required
+                    value={currentPassword}
+                    onChange={(e) => setCurrentPassword(e.target.value)}
+                    placeholder="현재 사용 중인 비밀번호"
+                    className="mt-1 w-full rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-xs text-gray-100 focus:border-blue-500 focus:outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-300">새 비밀번호 (6자 이상)</label>
+                  <input
+                    type="password"
+                    required
+                    value={newPassword}
+                    onChange={(e) => setNewPassword(e.target.value)}
+                    placeholder="새 비밀번호 입력"
+                    className="mt-1 w-full rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-xs text-gray-100 focus:border-blue-500 focus:outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-300">새 비밀번호 확인</label>
+                  <input
+                    type="password"
+                    required
+                    value={confirmPassword}
+                    onChange={(e) => setConfirmPassword(e.target.value)}
+                    placeholder="새 비밀번호 다시 입력"
+                    className="mt-1 w-full rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-xs text-gray-100 focus:border-blue-500 focus:outline-none"
+                  />
+                </div>
+                <div className="flex justify-end gap-2 pt-2 border-t border-gray-800">
+                  <button
+                    type="button"
+                    onClick={() => setShowPasswordModal(false)}
+                    className="rounded-lg border border-gray-800 px-4 py-2 text-xs font-medium text-gray-300 hover:bg-gray-800"
+                  >
+                    취소
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={changingPassword}
+                    className="rounded-lg bg-blue-600 px-4 py-2 text-xs font-medium text-white hover:bg-blue-500 disabled:opacity-50"
+                  >
+                    {changingPassword ? '비밀번호 변경 중...' : '비밀번호 변경'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* Session Management / Logout Section */}
+        <div className="rounded-lg border border-gray-800 bg-gray-950/40 p-5 mt-6">
+          <div className="flex items-center justify-between">
+            <div>
+              <h4 className="text-sm font-semibold text-gray-200">Account Session</h4>
+              <p className="mt-1 text-xs text-gray-400">
+                Sign out of your active session on this device. You will need to log in again with your credentials.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                authApi.logout();
+                if (typeof window !== 'undefined') {
+                  window.location.href = '/login';
+                }
+              }}
+              className="rounded-lg border border-gray-700 bg-gray-900 px-4 py-2 text-xs font-medium text-gray-200 hover:bg-gray-800 hover:text-white transition-colors shadow-sm"
+            >
+              로그아웃
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -643,50 +887,666 @@ function ProfilePanel() {
 // ─── Panel: Workspace ─────────────────────────────────────────────────────────
 
 function WorkspacePanel() {
+  const { data: tenant, mutate: mutateTenant } = useSWR(
+    'settings:tenant:me',
+    () => tenantsApi.getMeFull().catch(() => null),
+    { revalidateOnFocus: false },
+  );
+
+  const { data: users, mutate: mutateUsers } = useSWR(
+    'settings:tenant:users',
+    () => tenantsApi.listUsers().catch(() => []),
+    { revalidateOnFocus: false },
+  );
+
+  const { data: rbacRoles } = useSWR<{ id: string; name: string; description?: string }[]>(
+    '/api/v1/rbac/roles',
+    (url: string) => request<{ id: string; name: string; description?: string }[]>(url).catch(() => []),
+    { revalidateOnFocus: false },
+  );
+
+  const availableRoles = useMemo(() => {
+    const baseRoles = [
+      { name: 'tenant_admin', label: 'Tenant Admin (테넌트 관리자)' },
+      { name: 'soc_lead', label: 'SOC Lead' },
+      { name: 'soc_analyst', label: 'SOC Analyst' },
+      { name: 'threat_hunter', label: 'Threat Hunter' },
+      { name: 'viewer', label: 'Viewer' },
+    ];
+    if (!rbacRoles || rbacRoles.length === 0) return baseRoles;
+
+    const names = new Set(baseRoles.map((r) => r.name));
+    const merged = [...baseRoles];
+    for (const r of rbacRoles) {
+      if (!names.has(r.name)) {
+        merged.push({ name: r.name, label: r.name });
+      }
+    }
+    return merged;
+  }, [rbacRoles]);
+
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [editingMember, setEditingMember] = useState<TenantUser | null>(null);
+  const [email, setEmail] = useState('');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [role, setRole] = useState('soc_analyst');
+  const [creating, setCreating] = useState(false);
+
+  // Workspace Name editing state
+  const [isEditingName, setIsEditingName] = useState(false);
+  const [workspaceName, setWorkspaceName] = useState('');
+  const [savingName, setSavingName] = useState(false);
+
+  // New Tenant Creation State
+  const [showCreateTenantModal, setShowCreateTenantModal] = useState(false);
+  const [newTenantName, setNewTenantName] = useState('');
+  const [newTenantPlan, setNewTenantPlan] = useState('enterprise');
+  const [creatingTenant, setCreatingTenant] = useState(false);
+
+  useEffect(() => {
+    if (tenant?.name) {
+      setWorkspaceName(tenant.name);
+    }
+  }, [tenant?.name]);
+
+  const handleSaveWorkspaceName = async () => {
+    if (!workspaceName.trim()) {
+      toast.error('Workspace name cannot be empty.');
+      return;
+    }
+    setSavingName(true);
+    try {
+      await tenantsApi.updateTenantSettings({ name: workspaceName.trim() });
+      toast.success('Workspace name updated successfully!');
+      setIsEditingName(false);
+      mutateTenant();
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('aisoc:tenant-switched'));
+      }
+    } catch (err: any) {
+      toast.error(err?.message || 'Failed to update workspace name.');
+    } finally {
+      setSavingName(false);
+    }
+  };
+
+  const handleDeleteTenant = async () => {
+    if (!tenant?.id) return;
+    if (confirm(`정말로 '${tenant.name}' 테넌트(팀스페이스)를 삭제하시겠습니까?\n삭제된 테넌트의 모든 설정 및 데이터는 복구할 수 없습니다.`)) {
+      try {
+        await tenantsApi.deleteTenant(tenant.id);
+        toast.success(`테넌트 '${tenant.name}'가 성공적으로 삭제되었습니다.`);
+        const { setActiveTenantId } = await import('@/lib/api');
+        setActiveTenantId(null);
+        window.location.reload();
+      } catch (err: any) {
+        toast.error(err?.message || '테넌트 삭제 실패');
+      }
+    }
+  };
+
+  const handleCreateTenant = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newTenantName.trim()) {
+      toast.error('테넌트 이름을 입력해주세요.');
+      return;
+    }
+    setCreatingTenant(true);
+    try {
+      const created = await tenantsApi.createTenant({
+        name: newTenantName.trim(),
+        plan: newTenantPlan,
+      });
+      toast.success(`신규 테넌트 '${created.name || newTenantName.trim()}'가 생성되었습니다.`);
+      setShowCreateTenantModal(false);
+      setNewTenantName('');
+      if (typeof window !== 'undefined') {
+        window.location.reload();
+      }
+    } catch (err: any) {
+      let msg = err?.message || '테넌트 생성 실패';
+      if (err?.body) {
+        try {
+          const parsed = JSON.parse(err.body);
+          if (parsed.detail) msg = parsed.detail;
+        } catch {
+          /* not json */
+        }
+      }
+      toast.error(msg);
+    } finally {
+      setCreatingTenant(false);
+    }
+  };
+
+  const handleCreateUser = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!email || !username || !password) {
+      toast.error('Please fill in email, username, and password.');
+      return;
+    }
+    setCreating(true);
+    try {
+      await tenantsApi.createUser({ email, username, password, role });
+      toast.success(`Team member ${username} added successfully!`);
+      setShowAddModal(false);
+      setEmail('');
+      setUsername('');
+      setPassword('');
+      mutateUsers();
+    } catch (err: any) {
+      toast.error(err?.message || 'Failed to add team member.');
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const currentUser = authApi.currentUser();
+  const isAdmin = currentUser?.role === 'admin' || currentUser?.role === 'platform_admin' || currentUser?.role === 'tenant_admin' || currentUser?.role === 'soc_lead';
+  const isParent = !tenant?.parent_tenant_id;
+
+  const handleUpdateUser = async (
+    userToUpdate: TenantUser,
+    payload: { username?: string; role?: string; password?: string },
+  ) => {
+    try {
+      await tenantsApi.updateUser(userToUpdate.id, payload);
+      toast.success(`Updated information for ${userToUpdate.email}.`);
+      mutateUsers();
+    } catch (err: any) {
+      toast.error(err?.message || 'Failed to update user.');
+    }
+  };
+
+  const handleDeleteUser = async (userToDelete: TenantUser) => {
+    if (
+      confirm(
+        `Are you sure you want to remove ${userToDelete.username} (${userToDelete.email}) from this workspace?`,
+      )
+    ) {
+      try {
+        await tenantsApi.deleteUser(userToDelete.id);
+        toast.success(`Removed ${userToDelete.username} successfully.`);
+        mutateUsers();
+      } catch (err: any) {
+        toast.error(err?.message || 'Failed to remove user.');
+      }
+    }
+  };
+
+  const activeMembers = users || [];
+  const manageableMembers = useMemo(() => {
+    if (!currentUser?.email) return activeMembers;
+    return activeMembers.filter((m) => m.email !== currentUser.email && m.id !== currentUser.id);
+  }, [activeMembers, currentUser]);
+
   return (
     <div>
       <PanelHeader
         title="Workspace"
-        description="Tenant identity and locale settings. Available to workspace administrators."
+        description="Tenant identity, configuration, and team member management."
       />
+
+      {/* Workspace Name Editable Card */}
+      <div className="border-b border-gray-800 px-6 py-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="text-xs font-medium uppercase tracking-wide text-gray-500">
+              Workspace Name
+            </p>
+            {isEditingName ? (
+              <div className="mt-2 flex items-center gap-2">
+                <input
+                  type="text"
+                  value={workspaceName}
+                  onChange={(e) => setWorkspaceName(e.target.value)}
+                  className="rounded-lg border border-gray-700 bg-gray-950 px-3 py-1.5 text-sm font-semibold text-white focus:border-blue-500 focus:outline-none"
+                  placeholder="Enter organization / workspace name"
+                />
+                <button
+                  type="button"
+                  disabled={savingName}
+                  onClick={handleSaveWorkspaceName}
+                  className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-500 disabled:opacity-50"
+                >
+                  {savingName ? 'Saving...' : 'Save'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIsEditingName(false)}
+                  className="rounded-lg border border-gray-800 px-3 py-1.5 text-xs font-medium text-gray-400 hover:bg-gray-800"
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <p className="mt-1 text-lg font-semibold text-white">
+                {tenant?.name || 'Workspace'}
+              </p>
+            )}
+          </div>
+          {isAdmin && (
+            <div className="flex items-center gap-2">
+              {!isEditingName && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setWorkspaceName(tenant?.name || '');
+                    setIsEditingName(true);
+                  }}
+                  className="rounded-lg border border-gray-800 px-3 py-1.5 text-xs font-medium text-gray-300 hover:bg-gray-800 transition-colors"
+                >
+                  이름 변경
+                </button>
+              )}
+              {isParent ? (
+                <button
+                  type="button"
+                  onClick={() => setShowCreateTenantModal(true)}
+                  className="rounded-lg bg-emerald-600 px-3.5 py-1.5 text-xs font-medium text-white hover:bg-emerald-500 transition-colors shadow-xs"
+                >
+                  + 테넌트 추가
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleDeleteTenant}
+                  className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-400 hover:bg-red-500/20 transition-colors shadow-xs"
+                >
+                  테넌트 삭제
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
       <div className="grid gap-5 px-6 py-5 sm:grid-cols-2">
-        <InfoTile label="Workspace name" value="AiSOC Demo" />
-        <InfoTile label="Tenant ID" value="tenant_demo_01H0XE4T2WJ9N6" mono />
-        <InfoTile label="Plan" value="Open-source (MIT)" />
-        <InfoTile label="Region" value="us-east-1 / Multi-AZ" />
-        <InfoTile label="Created" value={format(Date.now() - 1000 * 60 * 60 * 24 * 96, 'PPP')} />
         <InfoTile
-          label="Default locale"
-          value={`${Intl.DateTimeFormat().resolvedOptions().locale} • 24h`}
+          label="Tenant ID"
+          value={tenant?.id || '—'}
+          mono
+        />
+        <InfoTile
+          label="Plan"
+          value={tenant?.plan ? tenant.plan.toUpperCase() : 'ENTERPRISE'}
+        />
+        <InfoTile
+          label="Status"
+          value={tenant?.is_active !== false ? 'Active' : 'Inactive'}
+        />
+        <InfoTile
+          label="Created"
+          value={
+            tenant?.created_at
+              ? format(new Date(tenant.created_at), 'PPP')
+              : '—'
+          }
         />
       </div>
+
+      {/* Members Section */}
       <div className="border-t border-gray-800 px-6 py-5">
-        <h3 className="text-sm font-semibold text-gray-200">Members</h3>
-        <p className="mt-1 text-xs text-gray-500">
-          5 active operators in this workspace (demo data).
-        </p>
-        <ul className="mt-3 divide-y divide-gray-800 rounded-lg border border-gray-800 bg-gray-950/40">
-          {[
-            { name: 'Sasha Lin', email: 'sasha.lin@example.com', role: 'Admin' },
-            { name: 'Avi Sharma', email: 'avi.sharma@example.com', role: 'Analyst' },
-            { name: 'Diego Vega', email: 'diego.vega@example.com', role: 'Analyst' },
-            { name: 'Mia Ocampo', email: 'mia.ocampo@example.com', role: 'Hunter' },
-            { name: 'CI Service', email: 'ci@example.com', role: 'Service' },
-          ].map((m) => (
-            <li
-              key={m.email}
-              className="flex items-center justify-between px-4 py-3 text-sm"
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="text-sm font-semibold text-gray-200">
+              Members ({activeMembers.length})
+            </h3>
+            <p className="mt-1 text-xs text-gray-500">
+              Active operators and analysts in this workspace.
+            </p>
+          </div>
+          {isAdmin && (
+            <button
+              type="button"
+              onClick={() => setShowAddModal(true)}
+              className="rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-medium text-white transition-colors hover:bg-blue-500 shadow-sm"
             >
-              <div className="min-w-0">
-                <p className="truncate text-gray-100">{m.name}</p>
-                <p className="truncate text-xs text-gray-500">{m.email}</p>
+              + 팀원 추가
+            </button>
+          )}
+        </div>
+
+        {activeMembers.length === 0 ? (
+          <div className="mt-4 rounded-lg border border-dashed border-gray-800 bg-gray-950/20 p-6 text-center text-xs text-gray-500">
+            No team members added yet. Click "+ 팀원 추가" to invite your first operator.
+          </div>
+        ) : (
+          <ul className="mt-4 divide-y divide-gray-800 rounded-lg border border-gray-800 bg-gray-950/40">
+            {activeMembers.map((m) => {
+              const isMe = m.email === currentUser?.email || m.id === currentUser?.id;
+              return (
+                <li
+                  key={m.id || m.email}
+                  className="flex items-center justify-between px-4 py-3 text-sm"
+                >
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <p className="truncate font-medium text-gray-100">{m.username}</p>
+                      {isMe && (
+                        <span className="rounded bg-blue-500/10 border border-blue-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-blue-400 shrink-0">
+                          나 (Me)
+                        </span>
+                      )}
+                    </div>
+                    <p className="truncate text-xs text-gray-400">{m.email}</p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="rounded-full border border-blue-500/20 bg-blue-500/10 px-2.5 py-1 text-xs font-medium text-blue-400 capitalize">
+                      {m.role}
+                    </span>
+                    {!isMe && isAdmin && (
+                      <button
+                        type="button"
+                        onClick={() => setEditingMember(m)}
+                        className="rounded-lg border border-gray-700 bg-gray-900 px-2.5 py-1 text-xs font-medium text-gray-200 hover:bg-gray-800 hover:text-white transition-colors"
+                      >
+                        수정
+                      </button>
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
+
+      {/* Edit Single Member Modal */}
+      {editingMember && (
+        <SingleMemberEditModal
+          m={editingMember}
+          availableRoles={availableRoles}
+          onClose={() => setEditingMember(null)}
+          onUpdate={handleUpdateUser}
+          onDelete={handleDeleteUser}
+        />
+      )}
+
+      {/* Add Tenant Modal */}
+      {showCreateTenantModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-md rounded-xl border border-gray-800 bg-gray-900 p-6 shadow-2xl">
+            <h3 className="text-base font-semibold text-white">신규 테넌트(팀스페이스) 추가</h3>
+            <p className="mt-1 text-xs text-gray-400">
+              새로운 팀스페이스나 고객사 전용 워크스페이스를 독립적으로 생성합니다.
+            </p>
+            <form onSubmit={handleCreateTenant} className="mt-4 space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-gray-300">
+                  테넌트/회사 이름
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={newTenantName}
+                  onChange={(e) => setNewTenantName(e.target.value)}
+                  placeholder="예: SOMANSA-Dev, 삼양식품 관제팀"
+                  className="mt-1 w-full rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
+                />
               </div>
-              <span className="rounded-full bg-gray-800 px-2.5 py-1 text-xs text-gray-300 ring-1 ring-gray-700">
-                {m.role}
-              </span>
-            </li>
-          ))}
-        </ul>
+              <div>
+                <label className="block text-xs font-medium text-gray-300">
+                  플랜 (Plan)
+                </label>
+                <select
+                  value={newTenantPlan}
+                  onChange={(e) => setNewTenantPlan(e.target.value)}
+                  className="mt-1 w-full rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
+                >
+                  <option value="enterprise">Enterprise</option>
+                  <option value="standard">Standard</option>
+                  <option value="starter">Starter</option>
+                </select>
+              </div>
+              <div className="flex justify-end gap-2 pt-2 border-t border-gray-800">
+                <button
+                  type="button"
+                  onClick={() => setShowCreateTenantModal(false)}
+                  className="rounded-lg border border-gray-800 px-4 py-2 text-xs font-medium text-gray-300 hover:bg-gray-800"
+                >
+                  취소
+                </button>
+                <button
+                  type="submit"
+                  disabled={creatingTenant}
+                  className="rounded-lg bg-emerald-600 px-4 py-2 text-xs font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
+                >
+                  {creatingTenant ? '생성 중...' : '테넌트 생성'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+      {showAddModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-md rounded-xl border border-gray-800 bg-gray-900 p-6 shadow-2xl">
+            <h3 className="text-base font-semibold text-white">Add Team Member</h3>
+            <p className="mt-1 text-xs text-gray-400">
+              Create a new user account in this workspace.
+            </p>
+            <form onSubmit={handleCreateUser} className="mt-4 space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-gray-300">
+                  Email Address
+                </label>
+                <input
+                  type="email"
+                  required
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="analyst@somansa.com"
+                  className="mt-1 w-full rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-300">
+                  Username
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  placeholder="analyst_kim"
+                  className="mt-1 w-full rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-300">
+                  Password
+                </label>
+                <input
+                  type="password"
+                  required
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="Password123!"
+                  className="mt-1 w-full rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-300">
+                  Role (역할)
+                </label>
+                <select
+                  value={role}
+                  onChange={(e) => setRole(e.target.value)}
+                  className="mt-1 w-full rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
+                >
+                  {availableRoles.map((r) => (
+                    <option key={r.name} value={r.name}>
+                      {r.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex justify-end gap-2 pt-2 border-t border-gray-800">
+                <button
+                  type="button"
+                  onClick={() => setShowAddModal(false)}
+                  className="rounded-lg border border-gray-800 px-4 py-2 text-xs font-medium text-gray-300 hover:bg-gray-800"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={creating}
+                  className="rounded-lg bg-blue-600 px-4 py-2 text-xs font-medium text-white hover:bg-blue-500 disabled:opacity-50"
+                >
+                  {creating ? 'Adding...' : 'Add Member'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SingleMemberEditModal({
+  m,
+  availableRoles,
+  onClose,
+  onUpdate,
+  onDelete,
+}: {
+  m: TenantUser;
+  availableRoles: { name: string; label: string }[];
+  onClose: () => void;
+  onUpdate: (
+    userToUpdate: TenantUser,
+    payload: { username?: string; role?: string; password?: string },
+  ) => Promise<void>;
+  onDelete: (userToDelete: TenantUser) => Promise<void>;
+}) {
+  const [username, setUsername] = useState(m.username);
+  const [role, setRole] = useState(m.role);
+  const [password, setPassword] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  const handleSave = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSaving(true);
+    try {
+      const payload: { username?: string; role?: string; password?: string } = {};
+      if (username !== m.username) payload.username = username;
+      if (role !== m.role) payload.role = role;
+      if (password.trim()) payload.password = password.trim();
+
+      if (Object.keys(payload).length === 0) {
+        toast('변경할 항목이 없습니다.');
+        onClose();
+        return;
+      }
+
+      await onUpdate(m, payload);
+      onClose();
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    await onDelete(m);
+    onClose();
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-xs">
+      <div className="w-full max-w-md rounded-xl border border-gray-800 bg-gray-900 p-6 shadow-2xl">
+        <div className="flex items-center justify-between border-b border-gray-800 pb-3">
+          <div>
+            <h3 className="text-base font-semibold text-white">팀원 정보 및 권한 수정</h3>
+            <p className="text-xs text-gray-400 mt-0.5">{m.email} 계정 설정</p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-lg border border-gray-800 px-2.5 py-1 text-xs font-medium text-gray-400 hover:bg-gray-800"
+          >
+            ✕
+          </button>
+        </div>
+
+        <form onSubmit={handleSave} className="mt-4 space-y-4 text-xs">
+          <div>
+            <label className="block font-medium text-gray-300">이메일 계정 (Email)</label>
+            <input
+              type="email"
+              disabled
+              readOnly
+              value={m.email}
+              className="mt-1 w-full rounded-lg border border-gray-800 bg-gray-950/60 px-3 py-2 text-xs text-gray-400 cursor-not-allowed select-none"
+            />
+          </div>
+
+          <div>
+            <label className="block font-medium text-gray-300">사용자명 (Name)</label>
+            <input
+              type="text"
+              required
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              className="mt-1 w-full rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-xs text-gray-100 focus:border-blue-500 focus:outline-none"
+            />
+          </div>
+
+          <div>
+            <label className="block font-medium text-gray-300">역할 (Role)</label>
+            <select
+              value={role}
+              onChange={(e) => setRole(e.target.value)}
+              className="mt-1 w-full rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-xs text-gray-100 focus:border-blue-500 focus:outline-none"
+            >
+              {availableRoles.map((r) => (
+                <option key={r.name} value={r.name}>
+                  {r.label}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label className="block font-medium text-gray-300">새 비밀번호 설정 (선택)</label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="변경할 때만 입력"
+              className="mt-1 w-full rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-xs text-gray-100 focus:border-blue-500 focus:outline-none"
+            />
+          </div>
+
+          <div className="flex items-center justify-between pt-3 border-t border-gray-800">
+            <button
+              type="button"
+              onClick={handleDelete}
+              className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-400 hover:bg-red-500/20 transition-colors"
+            >
+              계정 삭제
+            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={onClose}
+                className="rounded-lg border border-gray-800 px-3 py-1.5 text-xs font-medium text-gray-300 hover:bg-gray-800"
+              >
+                취소
+              </button>
+              <button
+                type="submit"
+                disabled={saving}
+                className="rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-medium text-white hover:bg-blue-500 disabled:opacity-50 transition-colors"
+              >
+                {saving ? '저장 중...' : '변경사항 저장'}
+              </button>
+            </div>
+          </div>
+        </form>
       </div>
     </div>
   );
@@ -717,7 +1577,7 @@ function IntegrationsPanel() {
     { revalidateOnFocus: false, shouldRetryOnError: false },
   );
 
-  const useFallback = !!error;
+  const useFallback = !!error && isDemoMode();
   const connectors = data?.connectors ?? (useFallback ? DEMO_CONNECTORS : []);
 
   const counts = useMemo(() => {
@@ -776,7 +1636,7 @@ function IntegrationsPanel() {
         description="Manage the connectors that stream telemetry into AiSOC."
         action={
           <Link
-            href="/connectors/new"
+            href="/connectors"
             className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500"
           >
             + Add connector
@@ -811,7 +1671,7 @@ function IntegrationsPanel() {
             description="Add your first integration to start streaming events into AiSOC."
             action={
               <Link
-                href="/connectors/new"
+                href="/connectors"
                 className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500"
               >
                 Add connector
@@ -929,7 +1789,7 @@ function StatTile({
 // ─── Panel: API keys ──────────────────────────────────────────────────────────
 
 function ApiKeysPanel() {
-  const [keys, setKeys] = useState<ApiKey[]>(DEMO_API_KEYS);
+  const [keys, setKeys] = useState<ApiKey[]>(() => isDemoMode() ? DEMO_API_KEYS : []);
   const [draftName, setDraftName] = useState('');
   const [createdSecret, setCreatedSecret] = useState<string | null>(null);
 
@@ -2157,40 +3017,75 @@ function StatusPill({
 
 // ─── Panel: Audit ─────────────────────────────────────────────────────────────
 
+interface AuditLogRecord {
+  id: string;
+  actor_email: string | null;
+  action: string;
+  resource: string | null;
+  resource_id: string | null;
+  changes: Record<string, unknown> | null;
+  created_at: string;
+}
+
+interface AuditLogResponse {
+  items: AuditLogRecord[];
+  total: number;
+}
+
 function AuditPanel() {
+  const { data, isLoading } = useSWR<AuditLogResponse>(
+    '/api/v1/audit?page=1&page_size=30',
+    (url: string) => request<AuditLogResponse>(url),
+    { refreshInterval: 10_000, shouldRetryOnError: false, revalidateOnFocus: false },
+  );
+
+  const events = data?.items || [];
+
   return (
     <div>
       <PanelHeader
         title="Audit log"
-        description="Recent administrative events. Full searchable audit history is available via the API."
+        description="Recent administrative and authentication events recorded in real time."
       />
-      <ol className="divide-y divide-gray-800">
-        {DEMO_AUDIT.map((a) => (
-          <li key={a.id} className="flex items-start gap-3 px-6 py-4">
-            <span
-              aria-hidden
-              className={clsx(
-                'mt-1 inline-block h-2 w-2 shrink-0 rounded-full',
-                a.action === 'failed-sync'
-                  ? 'bg-red-400'
-                  : a.action === 'rotated'
-                  ? 'bg-amber-400'
-                  : 'bg-emerald-400',
-              )}
-            />
-            <div className="min-w-0 flex-1">
-              <p className="text-sm text-gray-100">
-                <span className="font-medium">{a.actor}</span>{' '}
-                <span className="text-gray-400">{a.action}</span>{' '}
-                <span>{a.target}</span>
-              </p>
-              <p className="text-xs text-gray-500" suppressHydrationWarning>
-                {formatDistanceToNow(new Date(a.at), { addSuffix: true })}
-              </p>
-            </div>
-          </li>
-        ))}
-      </ol>
+      {isLoading && !data ? (
+        <div className="p-8 text-center text-sm text-gray-500">Loading audit log...</div>
+      ) : events.length === 0 ? (
+        <div className="p-8">
+          <EmptyState
+            icon={EmptyStateIcons.history}
+            title="No Audit Events Recorded"
+            description="Administrative, authentication, and settings modification audit logs will appear here in real time."
+          />
+        </div>
+      ) : (
+        <ol className="divide-y divide-gray-800">
+          {events.map((a) => (
+            <li key={a.id} className="flex items-start gap-3 px-6 py-4">
+              <span
+                aria-hidden
+                className={clsx(
+                  'mt-1 inline-block h-2 w-2 shrink-0 rounded-full',
+                  a.action.includes('delete') || a.action.includes('failed')
+                    ? 'bg-red-400'
+                    : a.action.includes('update') || a.action.includes('change')
+                    ? 'bg-amber-400'
+                    : 'bg-emerald-400',
+                )}
+              />
+              <div className="min-w-0 flex-1">
+                <p className="text-sm text-gray-100">
+                  <span className="font-medium">{a.actor_email || 'System'}</span>{' '}
+                  <span className="text-blue-400 font-mono text-xs px-1.5 py-0.5 rounded bg-blue-500/10 border border-blue-500/20">{a.action}</span>{' '}
+                  <span className="text-gray-400">{a.resource || ''} {a.resource_id ? `(${a.resource_id})` : ''}</span>
+                </p>
+                <p className="mt-1 text-xs text-gray-500" suppressHydrationWarning>
+                  {formatDistanceToNow(new Date(a.created_at), { addSuffix: true })} • {format(new Date(a.created_at), 'yyyy-MM-dd HH:mm:ss')}
+                </p>
+              </div>
+            </li>
+          ))}
+        </ol>
+      )}
     </div>
   );
 }
