@@ -47,10 +47,16 @@ export function TopBar({ demoOffset = false }: TopBarProps) {
   const pathname = usePathname();
   const [now, setNow] = useState<Date | null>(null);
   const [shortcut, setShortcut] = useState<'⌘K' | 'Ctrl K'>('⌘K');
+  const [mounted, setMounted] = useState(false);
   const { userRole } = useTenant();
-  const currentUser = authApi.currentUser();
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  const currentUser = mounted ? authApi.currentUser() : null;
   const displayUsername = currentUser?.username || currentUser?.email?.split('@')[0] || 'Operator';
-  const displayRole = userRole
+  const displayRole = mounted && userRole
     ? userRole.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
     : 'User';
   const userInitials = displayUsername.slice(0, 2).toUpperCase();

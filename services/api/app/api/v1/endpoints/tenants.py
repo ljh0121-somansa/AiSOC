@@ -225,14 +225,15 @@ async def update_user(
     for field in ["username", "role", "is_active"]:
         val = getattr(request, field, None)
         if val is not None:
+            setattr(user, field, val)
             updates[field] = val
 
     if request.password is not None and request.password.strip():
-        updates["hashed_password"] = get_password_hash(request.password)
+        user.hashed_password = get_password_hash(request.password)
+        updates["hashed_password"] = True
 
     if updates:
-        updates["updated_at"] = datetime.now(UTC)
-        await db.execute(update(User).where(User.id == user_id).values(**updates))
+        user.updated_at = datetime.now(UTC)
 
         try:
             audit_changes = {k: v for k, v in updates.items() if k != "hashed_password"}
@@ -283,6 +284,10 @@ async def delete_user(
             detail="최고 플랫폼 관리자 계정은 삭제할 수 없습니다.",
         )
 
+    user_email = user.email
+    user_username = user.username
+    target_user_id = str(user.id)
+
     try:
         await db.execute(delete(User).where(User.id == user_id))
         await db.commit()
@@ -300,8 +305,8 @@ async def delete_user(
             actor_email=current_user.email,
             action="users:delete",
             resource="user",
-            resource_id=str(user.id),
-            changes={"email": user.email, "username": user.username},
+            resource_id=target_user_id,
+            changes={"email": user_email, "username": user_username},
             request=req,
         )
         await db.commit()
