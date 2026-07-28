@@ -31,6 +31,7 @@ import {
   connectorsApi,
   deploymentApi,
   request,
+  setActiveTenantId,
   tenantsApi,
   type AirgapStatus,
   type Connector,
@@ -890,7 +891,7 @@ function ProfilePanel() {
 function WorkspacePanel() {
   const { data: tenant, mutate: mutateTenant } = useSWR(
     'settings:tenant:me',
-    () => tenantsApi.getMeFull().catch(() => null),
+    () => tenantsApi.getMeFull().catch(() => tenantsApi.me().catch(() => null)),
     { revalidateOnFocus: false },
   );
 
@@ -1000,6 +1001,9 @@ function WorkspacePanel() {
       toast.success(`신규 테넌트 '${created.name || newTenantName.trim()}'가 생성되었습니다.`);
       setShowCreateTenantModal(false);
       setNewTenantName('');
+      if (created?.id) {
+        setActiveTenantId(created.id);
+      }
       if (typeof window !== 'undefined') {
         window.location.reload();
       }
@@ -1041,8 +1045,15 @@ function WorkspacePanel() {
     }
   };
 
-  const currentUser = authApi.currentUser();
+  const { data: meUser } = useSWR<AuthUser>(
+    '/api/v1/auth/me',
+    () => request<AuthUser>('/api/v1/auth/me').catch(() => null),
+    { revalidateOnFocus: false },
+  );
+
+  const currentUser = meUser || authApi.currentUser();
   const isAdmin = currentUser?.role === 'admin' || currentUser?.role === 'platform_admin' || currentUser?.role === 'tenant_admin' || currentUser?.role === 'soc_lead';
+
   const isParent = !tenant?.parent_tenant_id;
 
   const handleUpdateUser = async (
