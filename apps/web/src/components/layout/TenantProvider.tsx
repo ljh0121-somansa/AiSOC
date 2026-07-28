@@ -13,6 +13,7 @@ import {
   authApi,
   getActiveTenantId,
   msspApi,
+  request,
   setActiveTenantId,
   tenantsApi,
   type AuthUser,
@@ -92,6 +93,11 @@ export function TenantProvider({ children }: { children: ReactNode }) {
       if (!cancelled) setUserRole(user?.role ?? null);
 
       try {
+        const userMe = await request<AuthUser>('/api/v1/auth/me').catch(() => null);
+        if (!cancelled && userMe?.role) {
+          setUserRole(userMe.role);
+        }
+
         // Fetch the canonical tenant record first; this is the only one we
         // truly need to render the badge. Children come second and any
         // failure there is non-fatal (e.g. /mssp/children 403 for a
@@ -105,10 +111,8 @@ export function TenantProvider({ children }: { children: ReactNode }) {
         const activeId = getActiveTenantId();
         let activeOption = meOption;
 
-        const isPlatformAdmin = user?.role === 'platform_admin';
-
         let children: ChildTenant[] = [];
-        if (me.mssp_role === 'parent' && isPlatformAdmin) {
+        if (me.mssp_role === 'parent') {
           try {
             children = await msspApi.listChildren();
           } catch {
