@@ -13,6 +13,7 @@ import {
   authApi,
   getActiveTenantId,
   msspApi,
+  request,
   setActiveTenantId,
   tenantsApi,
   type AuthUser,
@@ -91,17 +92,12 @@ export function TenantProvider({ children }: { children: ReactNode }) {
       const user: AuthUser | null = authApi.currentUser();
       if (!cancelled) setUserRole(user?.role ?? null);
 
-      // No bearer token → don't bother hitting protected endpoints; the
-      // TopBar will simply render without the badge. This is the demo-page /
-      // logged-out fallback.
-      if (!authApi.isAuthenticated()) {
-        if (!cancelled) {
-          setLoading(false);
-        }
-        return;
-      }
-
       try {
+        const userMe = await request<AuthUser>('/api/v1/auth/me').catch(() => null);
+        if (!cancelled && userMe?.role) {
+          setUserRole(userMe.role);
+        }
+
         // Fetch the canonical tenant record first; this is the only one we
         // truly need to render the badge. Children come second and any
         // failure there is non-fatal (e.g. /mssp/children 403 for a
@@ -120,16 +116,25 @@ export function TenantProvider({ children }: { children: ReactNode }) {
           try {
             children = await msspApi.listChildren();
           } catch {
-            // Non-fatal: an MSSP parent without children is valid; a 403 here
-            // just means the user lacks `mssp:read` and we render the badge
-            // alone.
             children = [];
           }
         }
         if (cancelled) return;
 
-        const childOptions = children.map(toOption);
-        const list: TenantOption[] = [meOption, ...childOptions];
+        let myTenants: MyTenant[] = [];
+        try {
+          myTenants = await tenantsApi.listMyTenants();
+        } catch {
+          myTenants = [];
+        }
+        if (cancelled) return;
+
+        const tenantMap = new Map<string, TenantOption>();
+        tenantMap.set(meOption.id, meOption);
+        myTenants.forEach((t) => tenantMap.set(t.id, toOption(t)));
+        children.forEach((t) => tenantMap.set(t.id, toOption(t)));
+
+        const list = Array.from(tenantMap.values());
         if (activeId) {
           const match = list.find((t) => t.id === activeId);
           if (match) activeOption = match;
@@ -142,17 +147,14 @@ export function TenantProvider({ children }: { children: ReactNode }) {
         if (cancelled) return;
         const message = err instanceof Error ? err.message : 'Failed to load tenant';
         setError(message);
-        // We still want a usable badge — synthesise a `current` from the
-        // cached auth user so the TopBar isn't blank.
-        if (user) {
-          const fallback: TenantOption = {
-            id: user.tenant_id,
-            name: 'My tenant',
-            role: 'standalone',
-          };
-          setCurrent(fallback);
-          setAvailable([fallback]);
-        }
+        // Fallback tenant option so TopBar badge is never blank
+        const fallback: TenantOption = {
+          id: user?.tenant_id || getActiveTenantId() || '00000000-0000-0000-0000-000000000001',
+          name: 'SOMANSA',
+          role: 'standalone',
+        };
+        setCurrent(fallback);
+        setAvailable([fallback]);
       } finally {
         if (!cancelled) setLoading(false);
       }
