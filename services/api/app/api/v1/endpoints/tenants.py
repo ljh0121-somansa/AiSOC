@@ -10,6 +10,7 @@ from sqlalchemy import delete, or_, select, text, update
 
 from app.api.v1.deps import AuthUser, CurrentUser, DBSession, require_permission
 from app.core.security import get_password_hash
+from app.db.rls import set_rls_context
 from app.models.tenant import Tenant, User
 from app.services.audit import emit_audit
 
@@ -335,8 +336,12 @@ async def create_tenant(
     if existing.scalar_one_or_none() is not None:
         slug = f"{base_slug}-{uuid.uuid4().hex[:4]}"
 
-    user_res = await db.execute(select(User).where(User.id == current_user.user_id))
-    creator_user = user_res.scalar_one_or_none()
+    user_res = await db.execute(
+        select(User).where(
+            or_(User.id == current_user.user_id, User.email == current_user.email)
+        )
+    )
+    creator_user = user_res.scalars().first()
     home_parent_id = creator_user.tenant_id if creator_user else current_user.tenant_id
 
     # Link new tenant as a child of the current parent workspace if applicable
@@ -361,7 +366,13 @@ async def create_tenant(
 
     await db.flush()
 
-    # Seed default RBAC roles for the new tenant
+    # Switch RLS session context to the new tenant so seed functions match RLS policies
+    try:
+        await set_rls_context(db, new_tenant.id)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Seed default RBAC roles for the new tenant via DB stored procedure
     try:
         await db.execute(text("SELECT seed_system_roles(:tid)").bindparams(tid=new_tenant.id))
     except Exception:  # noqa: BLE001
@@ -369,16 +380,21 @@ async def create_tenant(
 
     # Automatically register creator into users table for the new tenant
     if creator_user:
-        new_user = User(
-            id=uuid.uuid4(),
-            tenant_id=new_tenant.id,
-            email=creator_user.email,
-            username=creator_user.username,
-            hashed_password=creator_user.hashed_password,
-            role=creator_user.role if creator_user.role in ("platform_admin", "admin", "tenant_admin") else "tenant_admin",
-            is_active=True,
-        )
-        db.add(new_user)
+        try:
+            async with db.begin_nested():
+                new_user = User(
+                    id=uuid.uuid4(),
+                    tenant_id=new_tenant.id,
+                    email=creator_user.email,
+                    username=creator_user.username,
+                    hashed_password=creator_user.hashed_password,
+                    role=creator_user.role if creator_user.role in ("platform_admin", "admin", "tenant_admin") else "tenant_admin",
+                    is_active=True,
+                )
+                db.add(new_user)
+                await db.flush()
+        except Exception:  # noqa: BLE001
+            pass
 
     try:
         await emit_audit(
@@ -412,8 +428,12 @@ async def delete_tenant(
     if tenant is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
 
-    user_res = await db.execute(select(User).where(User.id == current_user.user_id))
-    db_user = user_res.scalar_one_or_none()
+    user_res = await db.execute(
+        select(User).where(
+            or_(User.id == current_user.user_id, User.email == current_user.email)
+        )
+    )
+    db_user = user_res.scalars().first()
     home_parent_id = db_user.tenant_id if db_user else current_user.tenant_id
 
     if tenant.id == home_parent_id:
@@ -422,18 +442,22 @@ async def delete_tenant(
             detail="Cannot delete the primary root workspace / 메인 루트 테넌트는 삭제할 수 없습니다.",
         )
 
-    if tenant.parent_tenant_id != home_parent_id and tenant.id != current_user.tenant_id:
+    if (
+        tenant.parent_tenant_id != home_parent_id
+        and tenant.id != current_user.tenant_id
+        and current_user.role != "platform_admin"
+    ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You do not have permission to delete this tenant / 이 테넌트를 삭제할 권한이 없습니다.",
         )
 
-    await db.execute(delete(Tenant).where(Tenant.id == tenant_id))
-
+    # Use surviving parent tenant ID for audit_log entry to satisfy foreign key constraint
+    audit_tenant_id = home_parent_id if home_parent_id != tenant_id else (tenant.parent_tenant_id or home_parent_id)
     try:
         await emit_audit(
             db=db,
-            tenant_id=current_user.tenant_id,
+            tenant_id=audit_tenant_id,
             actor_id=current_user.user_id,
             actor_email=current_user.email,
             action="tenant:delete",
@@ -445,6 +469,9 @@ async def delete_tenant(
     except Exception:  # noqa: BLE001
         pass
 
+    # Clean up dependent users before deleting tenant
+    await db.execute(delete(User).where(User.tenant_id == tenant_id))
+    await db.execute(delete(Tenant).where(Tenant.id == tenant_id))
     await db.commit()
 
 
@@ -490,8 +517,12 @@ async def list_my_tenants(
         sql = text("""
             SELECT DISTINCT t.id, t.name, t.mssp_role, t.parent_tenant_id, t.created_at
             FROM tenants t
-            JOIN users u ON u.tenant_id = t.id
-            WHERE u.email = :email AND u.is_active = TRUE
+            LEFT JOIN users u ON u.tenant_id = t.id AND u.email = :email AND u.is_active = TRUE
+            WHERE u.email IS NOT NULL
+               OR t.parent_tenant_id IN (
+                   SELECT tenant_id FROM users WHERE email = :email AND is_active = TRUE
+               )
+               OR t.id = :active_tid
             ORDER BY t.created_at
         """)
 
