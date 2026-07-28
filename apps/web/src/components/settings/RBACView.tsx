@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import useSWR, { mutate } from 'swr';
 import { EmptyState, EmptyStateIcons } from '@/components/ui/EmptyState';
+import { request, authApi } from '@/lib/api';
 
 interface Permission {
   id: string;
@@ -20,11 +21,7 @@ interface Role {
   permissions: Permission[];
 }
 
-const fetcher = (url: string) =>
-  fetch(url).then((r) => {
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return r.json();
-  });
+const fetcher = (url: string) => request<any>(url);
 
 const CATEGORY_COLORS: Record<string, string> = {
   cases: 'bg-blue-500/20 text-blue-300',
@@ -62,22 +59,22 @@ function RoleCard({ role, onEdit, onDelete }: { role: Role; onEdit: (r: Role) =>
           </div>
           {role.description && <p className="mt-0.5 text-sm text-gray-400">{role.description}</p>}
         </div>
-        {!role.is_system && (
-          <div className="flex shrink-0 gap-2">
-            <button
-              onClick={() => onEdit(role)}
-              className="rounded px-2 py-1 text-xs text-gray-400 hover:bg-gray-800"
-            >
-              Edit
-            </button>
+        <div className="flex shrink-0 gap-2">
+          <button
+            onClick={() => onEdit(role)}
+            className="rounded px-2.5 py-1 text-xs font-medium text-gray-300 hover:bg-gray-800 hover:text-white transition-colors"
+          >
+            수정
+          </button>
+          {!role.is_system && (
             <button
               onClick={() => onDelete(role)}
-              className="rounded px-2 py-1 text-xs text-red-400 hover:bg-red-900/30"
+              className="rounded px-2.5 py-1 text-xs font-medium text-red-400 hover:bg-red-900/30 transition-colors"
             >
-              Delete
+              삭제
             </button>
-          </div>
-        )}
+          )}
+        </div>
       </div>
       <div className="mt-3 flex flex-wrap gap-1.5">
         {role.permissions.length === 0 ? (
@@ -99,9 +96,16 @@ interface RoleFormProps {
 function RoleForm({ allPermissions, initial, onClose }: RoleFormProps) {
   const [name, setName] = useState(initial?.name ?? '');
   const [description, setDescription] = useState(initial?.description ?? '');
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(
-    new Set(initial?.permissions.map((p) => p.id) ?? [])
-  );
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => {
+    if (initial?.permissions) {
+      return new Set(initial.permissions.map((p) => p.id));
+    }
+    // New role: default check essential read permissions (:read)
+    const defaults = allPermissions
+      .filter((p) => p.name.endsWith(':read'))
+      .map((p) => p.id);
+    return new Set(defaults);
+  });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -123,19 +127,23 @@ function RoleForm({ allPermissions, initial, onClose }: RoleFormProps) {
     try {
       const url = initial ? `/api/v1/rbac/roles/${initial.id}` : '/api/v1/rbac/roles';
       const method = initial ? 'PATCH' : 'POST';
-      const res = await fetch(url, {
+      await request(url, {
         method,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, description: description || null, permission_ids: Array.from(selectedIds) }),
+        body: JSON.stringify({ name: name.trim(), description: description || null, permission_ids: Array.from(selectedIds) }),
       });
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.detail ?? 'Save failed');
-      }
       await mutate('/api/v1/rbac/roles');
       onClose();
     } catch (e: any) {
-      setError(e.message);
+      let msg = e?.message || 'Save failed';
+      if (e?.body) {
+        try {
+          const parsed = JSON.parse(e.body);
+          if (parsed.detail) msg = parsed.detail;
+        } catch {
+          /* not json */
+        }
+      }
+      setError(msg);
     } finally {
       setSaving(false);
     }
@@ -151,13 +159,20 @@ function RoleForm({ allPermissions, initial, onClose }: RoleFormProps) {
         <div className="space-y-4 px-6 py-4">
           {error && <p className="rounded bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>}
           <div>
-            <label className="mb-1 block text-sm font-medium text-gray-700">Name</label>
+            <label className="mb-1 block text-sm font-medium text-gray-700">Role Name</label>
             <input
               value={name}
+              disabled={initial?.is_system}
+              readOnly={initial?.is_system}
               onChange={(e) => setName(e.target.value)}
-              className="w-full rounded-lg border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              className={`w-full rounded-lg border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 ${initial?.is_system ? 'bg-gray-100 text-gray-500 cursor-not-allowed' : ''}`}
               placeholder="e.g. threat-hunter"
             />
+            {initial?.is_system && (
+              <p className="mt-1 text-xs text-gray-500">
+                시스템 기본 역할 이름은 변경할 수 없으며, 아래 설명 및 세부 권한을 수정할 수 있습니다.
+              </p>
+            )}
           </div>
           <div>
             <label className="mb-1 block text-sm font-medium text-gray-700">Description</label>
@@ -252,6 +267,9 @@ const MOCK_ROLES: Role[] = [
 ];
 
 export function RBACView() {
+  const currentUser = authApi.currentUser();
+  const canWriteRoles = currentUser?.role === 'admin' || currentUser?.role === 'platform_admin' || currentUser?.role === 'tenant_admin' || currentUser?.role === 'soc_lead';
+
   const { data: roles, error: rolesError } = useSWR<Role[]>('/api/v1/rbac/roles', fetcher, {
     fallbackData: MOCK_ROLES,
   });
@@ -264,8 +282,12 @@ export function RBACView() {
 
   const handleDelete = async (role: Role) => {
     if (!confirm(`Delete role "${role.name}"?`)) return;
-    await fetch(`/api/v1/rbac/roles/${role.id}`, { method: 'DELETE' });
-    mutate('/api/v1/rbac/roles');
+    try {
+      await request(`/api/v1/rbac/roles/${role.id}`, { method: 'DELETE' });
+      mutate('/api/v1/rbac/roles');
+    } catch (e: any) {
+      alert(e?.message || 'Delete failed');
+    }
   };
 
   return (
@@ -275,12 +297,14 @@ export function RBACView() {
           <h2 className="text-xl font-bold text-gray-100">Roles & Permissions</h2>
           <p className="mt-0.5 text-sm text-gray-500">Manage access control for your organization.</p>
         </div>
-        <button
-          onClick={() => setShowCreate(true)}
-          className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700"
-        >
-          + New Role
-        </button>
+        {canWriteRoles && (
+          <button
+            onClick={() => setShowCreate(true)}
+            className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700"
+          >
+            + New Role
+          </button>
+        )}
       </div>
 
       {rolesError && (
