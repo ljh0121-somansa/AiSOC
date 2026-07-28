@@ -172,7 +172,9 @@ async def get_me(current_user: AuthUser, db: DBSession) -> UserMeResponse:
     user = result.scalar_one_or_none()
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-    return UserMeResponse.model_validate(user)
+    res_dict = UserMeResponse.model_validate(user).model_dump()
+    res_dict["tenant_id"] = str(current_user.tenant_id)
+    return UserMeResponse.model_validate(res_dict)
 
 
 @router.patch("/me", response_model=UserMeResponse)
