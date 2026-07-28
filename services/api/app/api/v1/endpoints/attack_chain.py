@@ -68,17 +68,39 @@ async def get_attack_chain(
         # but a future schema change could relax that — fail closed.
         raise HTTPException(status_code=400, detail=f"unknown window: {window}")
 
-    case_row = (await db.execute(select(Case).where(Case.id == case_id, Case.tenant_id == user.tenant_id))).scalar_one_or_none()
-    if case_row is None:
-        raise HTTPException(status_code=404, detail="case_not_found")
+    alert_ids: list[Any] = []
+
+    # Query the primary case management table (aisoc_cases) directly
+    res = await db.execute(
+        text("SELECT alert_ids FROM aisoc_cases WHERE id = :id AND tenant_id = :tenant_id").bindparams(
+            id=case_id, tenant_id=user.tenant_id
+        )
+    )
+    row = res.first()
+    if row is not None:
+        raw_alert_ids = row[0] or []
+        if isinstance(raw_alert_ids, list):
+            alert_ids = raw_alert_ids
+        elif isinstance(raw_alert_ids, str):
+            import json
+            try:
+                alert_ids = json.loads(raw_alert_ids)
+            except Exception:  # noqa: BLE001
+                alert_ids = []
+    else:
+        # Fallback to legacy cases table if applicable
+        case_row = (await db.execute(select(Case).where(Case.id == case_id, Case.tenant_id == user.tenant_id))).scalar_one_or_none()
+        if case_row is None:
+            raise HTTPException(status_code=404, detail="case_not_found")
+        alert_ids = list(case_row.alert_ids or [])
 
     # Pick the seed alert: earliest event_time linked to the case. We
     # prefer ``case.alert_ids`` (denormalised) but fall back to a probe
     # on ``alerts.case_id`` if that list is empty so a freshly-linked
     # case still resolves.
     seed_alert_id: uuid.UUID | None = None
-    if case_row.alert_ids:
-        candidate_ids = [uuid.UUID(str(a)) if not isinstance(a, uuid.UUID) else a for a in case_row.alert_ids]
+    if alert_ids:
+        candidate_ids = [uuid.UUID(str(a)) if not isinstance(a, uuid.UUID) else a for a in alert_ids]
         seed_row = (
             await db.execute(
                 select(Alert)
