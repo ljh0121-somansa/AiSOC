@@ -476,7 +476,7 @@ export function DashboardView() {
           <MetricCard
             label="Connected Sources"
             value={metrics.sources.filter(s => s.status === 'active').length}
-            sub="EDR, SIEM, Cloud, IAM, SaaS"
+            sub=""
             color="purple"
           />
         </div>
