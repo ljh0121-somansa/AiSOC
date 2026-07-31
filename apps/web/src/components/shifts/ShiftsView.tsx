@@ -25,28 +25,19 @@ const PRIORITY_CONFIG = {
   low: { label: 'Low', className: 'text-blue-400 bg-blue-500/10 border-blue-500/20' },
 };
 
-const MOCK_HANDOFF_ITEMS: HandoffItem[] = [
-  { id: 'ALR-4201', priority: 'critical', title: 'Ransomware beacon detected on FIN-WS-07', type: 'alert', status: 'Investigating', assignedTo: 'alice', notes: 'Host isolated, awaiting forensic image' },
-  { id: 'CASE-1042', priority: 'high', title: 'Lateral movement — domain admin credentials', type: 'case', status: 'In Progress', assignedTo: 'bob', notes: 'Credential rotation started, 3 hosts remain' },
-  { id: 'ALR-4198', priority: 'high', title: 'Exfil over DNS to suspicious TLD', type: 'alert', status: 'Triaged', assignedTo: 'alice', notes: 'DNS sinkhole active, reviewing PCAP' },
-  { id: 'ALR-4205', priority: 'medium', title: 'Brute-force against VPN gateway', type: 'alert', status: 'Monitoring', assignedTo: 'carol', notes: 'Rate limiting applied, source geo: RU' },
-  { id: 'CASE-1039', priority: 'medium', title: 'Phishing wave targeting engineering', type: 'case', status: 'Pending Response', assignedTo: 'bob', notes: 'Awaiting HR confirmation on affected users' },
-  { id: 'ALR-4210', priority: 'medium', title: 'Anomalous S3 bucket access pattern', type: 'alert', status: 'Triaged', assignedTo: 'carol', notes: 'Likely automated scanner, needs second look' },
-  { id: 'ALR-4212', priority: 'low', title: 'Failed MFA attempts — service account', type: 'alert', status: 'Open', assignedTo: 'unassigned', notes: 'May be misconfigured CI pipeline' },
-  { id: 'ALR-4215', priority: 'low', title: 'Certificate expiry warning — api.corp.io', type: 'alert', status: 'Open', assignedTo: 'unassigned', notes: 'Expires in 7 days, renewal ticket created' },
-];
+const DEFAULT_MOCK_HANDOFF_ITEMS: HandoffItem[] = [];
 
-const SHIFT_SUMMARY = {
-  alertsTriaged: 34,
-  casesOpened: 3,
-  escalations: 2,
-  autoResolved: 18,
+const DEFAULT_SHIFT_SUMMARY = {
+  alertsTriaged: 0,
+  casesOpened: 0,
+  escalations: 0,
+  autoResolved: 0,
 };
 
 type PriorityFilter = HandoffItem['priority'] | 'all';
 
 export function ShiftsView() {
-  const [items] = useState(MOCK_HANDOFF_ITEMS);
+  const [items] = useState(DEFAULT_MOCK_HANDOFF_ITEMS);
   const [priorityFilter, setPriorityFilter] = useState<PriorityFilter>('all');
 
   const filteredItems = priorityFilter === 'all'
@@ -85,19 +76,19 @@ export function ShiftsView() {
         <div className="grid grid-cols-4 gap-4">
           <div>
             <p className="text-xs text-gray-500">Analyst On Duty</p>
-            <p className="text-sm font-medium text-gray-200 mt-0.5">Alice Chen</p>
+            <p className="text-sm font-medium text-gray-200 mt-0.5">-</p>
           </div>
           <div>
             <p className="text-xs text-gray-500">Shift Start</p>
-            <p className="text-sm font-medium text-gray-200 mt-0.5">{new Date(SHIFT_START).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
+            <p className="text-sm font-medium text-gray-200 mt-0.5">-</p>{/* {new Date(SHIFT_START).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} */}
           </div>
           <div>
             <p className="text-xs text-gray-500">Shift End</p>
-            <p className="text-sm font-medium text-gray-200 mt-0.5">{new Date(SHIFT_END).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
+            <p className="text-sm font-medium text-gray-200 mt-0.5">-</p>{/* {new Date(SHIFT_END).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} */}
           </div>
           <div>
             <p className="text-xs text-gray-500">Hours Remaining</p>
-            <p className="text-sm font-medium text-amber-400 mt-0.5">4h 12m</p>
+            <p className="text-sm font-medium text-amber-400 mt-0.5">-</p>
           </div>
         </div>
       </div>
@@ -105,10 +96,10 @@ export function ShiftsView() {
       {/* Shift Summary */}
       <div className="grid grid-cols-4 gap-3">
         {[
-          { label: 'Alerts Triaged', value: SHIFT_SUMMARY.alertsTriaged, color: 'text-blue-400' },
-          { label: 'Cases Opened', value: SHIFT_SUMMARY.casesOpened, color: 'text-orange-400' },
-          { label: 'Escalations', value: SHIFT_SUMMARY.escalations, color: 'text-red-400' },
-          { label: 'Auto-Resolved', value: SHIFT_SUMMARY.autoResolved, color: 'text-green-400' },
+          { label: 'Alerts Triaged', value: DEFAULT_SHIFT_SUMMARY.alertsTriaged, color: 'text-blue-400' },
+          { label: 'Cases Opened', value: DEFAULT_SHIFT_SUMMARY.casesOpened, color: 'text-orange-400' },
+          { label: 'Escalations', value: DEFAULT_SHIFT_SUMMARY.escalations, color: 'text-red-400' },
+          { label: 'Auto-Resolved', value: DEFAULT_SHIFT_SUMMARY.autoResolved, color: 'text-green-400' },
         ].map((stat) => (
           <div key={stat.label} className="bg-gray-900/60 border border-gray-800/60 rounded-xl p-4">
             <p className={clsx('text-2xl font-bold', stat.color)}>{stat.value}</p>

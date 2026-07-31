@@ -13,6 +13,9 @@ from __future__ import annotations
 import asyncio
 import time
 from typing import Any
+import re
+import json
+import os
 
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -36,9 +39,9 @@ Your task is to analyse a security alert and:
 3. Hypothesise which threat-actor group(s) may be responsible, citing your evidence in Korean.
 4. Summarise the attack surface at risk in Korean.
 
-CRITICAL:                                                                                                                                                                                                             
-   - Write the value of "summary" and any descriptions strictly in Korean.                                                                                                                                      
-   - The JSON keys MUST remain in English.                                                                                                                                                                               
+CRITICAL:
+   - Write the value of "summary" and any descriptions strictly in Korean.
+   - The JSON keys MUST remain in English.
    - Threat actor group names or MITRE technique names should remain in English (e.g. "APT28", "T1566").
 
 Respond ONLY with a JSON object matching this schema:
@@ -50,16 +53,12 @@ Respond ONLY with a JSON object matching this schema:
   "summary": "One-paragraph reconnaissance summary in Korean."
 }
 """
-
-
 async def _llm_recon(state: InvestigatorState) -> dict[str, Any]:
     """Call LLM to perform structured reconnaissance.
 
     Records the LLM prompt and response into the audit ledger so the
     reasoning trace is replayable.
     """
-    import json
-    import os
 
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     llm = ChatOpenAI(model=model, temperature=0)
@@ -128,11 +127,10 @@ async def _llm_recon(state: InvestigatorState) -> dict[str, Any]:
             cost_usd=cost_usd,
         )
         # Extract JSON from the response
-        import re
-
         json_match = re.search(r"\{[\s\S]*\}", content)
         if json_match:
             return json.loads(json_match.group())
+        raise ValueError("LLM 응답에서 유효한 JSON 구조를 찾을 수 없습니다.")
     except Exception as exc:  # noqa: BLE001
         logger.warning("recon llm failed", error=str(exc))
         state.log(
@@ -140,24 +138,7 @@ async def _llm_recon(state: InvestigatorState) -> dict[str, Any]:
             "ReconAgent",
             f"LLM call failed, falling back to heuristics: {exc}",
         )
-
-    # Fallback: heuristic extraction
-    iocs = extract_iocs(state.alert_summary)
-    techniques = map_to_mitre(state.alert_summary)
-    state.log_decision(
-        agent="ReconAgent",
-        decision="use_heuristic_fallback",
-        reason="LLM unavailable or returned malformed JSON; relying on regex IOC extraction and keyword MITRE mapping",
-        confidence=0.4,
-        alternatives=["llm_extraction"],
-    )
-    return {
-        "iocs": iocs,
-        "mitre_techniques": techniques,
-        "threat_actors": [],
-        "attack_surface": {},
-        "summary": state.alert_summary[:200],
-    }
+        raise RuntimeError(f"[Recon Agent 오류] {str(exc)}") from exc
 
 
 async def run_recon(state_dict: dict[str, Any]) -> dict[str, Any]:

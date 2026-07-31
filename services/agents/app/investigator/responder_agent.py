@@ -36,11 +36,13 @@ _SYSTEM_PROMPT = """You are the ResponderAgent of an AI Security Operations Cent
 Based on the forensic findings, generate a concrete incident response plan.
 All actions are DRY-RUN only — do NOT perform any real actions.
 
-CRITICAL:                                                                                                                                                                                                             
-   - Return ONLY a valid JSON matching the schema below. No markdown wrappers around JSON, no explanations outside JSON.
+CRITICAL FORMATTING RULES:
+   - Output ONLY raw JSON text matching the schema below.
+   - Absolute Prohibition: Do NOT output <think> tags, thinking process, reasoning steps, or markdown wrappers (NEVER use ```json or ```).
+   - Your response MUST strictly start with '{' and end with '}'.
    - Value language: Write 'action', 'rationale', step lists, and 'summary' strictly in KOREAN.
    - Tech specs: You MUST separate the exact CLI command or script (e.g. PowerShell, Bash, netsh, iptables, AD cmdlets) into the 'command' field of recommended_actions. Do NOT embed CLI commands inside the 'action' field, keep them in 'command' field separately for better readability. For steps arrays, include the command in backticks (`...`) inside the Korean text description.
-   - The JSON keys MUST remain in English.                                                                                                                                                                               
+   - The JSON keys MUST remain in English.
    - The values for 'risk' and 'risk_level' MUST strictly be one of: "low", "medium", "high", "critical" (do NOT translate these system status keywords).
 Respond ONLY with a JSON object:
 {
@@ -61,7 +63,38 @@ Respond ONLY with a JSON object:
   "summary": "Two-sentence response summary in Korean."
 }
 """
+def safe_parse_agent_json(content: str) -> dict[str, Any]:
+    """
+    Qwen/DeepSeek 추론 모델 응답 처리:
+    <think> 태그 유무와 관계없이 </think> 닫는 태그 이전의 
+    모든 생각 과정(Thinking Process) 텍스트를 제거하고 순수 JSON만 파싱합니다.
+    """
+    cleaned = content
 
+    # 1. </think> 태그가 존재하는 경우: </think> 포함 앞부분 전체 제거
+    if "</think>" in cleaned:
+        cleaned = cleaned.split("</think>", 1)[1].strip()
+    else:
+        # 2. 혹시 <think> ... </think> 가 완벽하게 들어있는 경우 제거
+        cleaned = re.sub(r"<think>[\s\S]*?</think>", "", cleaned).strip()
+
+    # 3. 마크다운 펜스 제거 (```json ... ``` 또는 ``` ... ```)
+    cleaned = re.sub(r"```(?:json)?\s*", "", cleaned)
+    cleaned = re.sub(r"```\s*", "", cleaned).strip()
+
+    # 4. 가장 바깥쪽 { ... } 객체 파싱
+    json_match = re.search(r"\{[\s\S]*\}", cleaned)
+    if json_match:
+        json_str = json_match.group(0)
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            # 뒷부분에 다른 텍스트가 남은 경우 raw_decode로 첫 번째 JSON만 추출
+            decoder = json.JSONDecoder()
+            obj, _ = decoder.raw_decode(json_str)
+            return obj
+
+    return json.loads(cleaned)
 
 async def _llm_responder(state: InvestigatorState) -> dict[str, Any]:
     import os
@@ -140,9 +173,11 @@ async def _llm_responder(state: InvestigatorState) -> dict[str, Any]:
             latency_ms=latency_ms,
             cost_usd=cost_usd,
         )
-        json_match = re.search(r"\{[\s\S]*\}", content)
-        if json_match:
-            return json.loads(json_match.group())
+        # json_match = re.search(r"\{[\s\S]*\}", content)
+        # if json_match:
+        #     return json.loads(json_match.group())
+        return safe_parse_agent_json(content)
+        # raise ValueError("LLM 응답에서 유효한 JSON 구조를 찾을 수 없습니다.")
     except Exception as exc:  # noqa: BLE001
         logger.warning("responder llm failed", error=str(exc))
         state.log(
@@ -150,22 +185,7 @@ async def _llm_responder(state: InvestigatorState) -> dict[str, Any]:
             "ResponderAgent",
             f"LLM call failed: {exc}",
         )
-
-    state.log_decision(
-        agent="ResponderAgent",
-        decision="default_high_risk_plan",
-        reason="LLM unavailable; falling back to conservative high-risk containment template",
-        confidence=0.3,
-    )
-    return {
-        "recommended_actions": [],
-        "containment_steps": ["영향을 받는 시스템을 즉각 격리하십시오."],
-        "eradication_steps": ["확인된 악성 아티팩트 및 파일을 삭제/제거하십시오."],
-        "recovery_steps": ["검증된 최신 정상 백업으로부터 시스템을 복구하십시오."],
-        "estimated_effort_hours": 8.0,
-        "risk_level": "high",
-        "summary": "자동화 대응 계획 생성을 사용할 수 없어 보수적인 고위험 격리 템플릿으로 대체되었습니다.",
-    }
+        raise RuntimeError(f"[Responder Agent 오류] {exc}") from exc
 
 
 async def run_responder(state_dict: dict[str, Any]) -> dict[str, Any]:

@@ -346,7 +346,7 @@ def make_safe_chat_model(llm: Any) -> Any:
 # Raw OpenAI-compatible chat-completions HTTP wrapper
 # ---------------------------------------------------------------------------
 
-DEFAULT_OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
+DEFAULT_OPENAI_CHAT_COMPLETIONS_URL = os.getenv("OPENAI_BASE_URL","")
 
 
 async def safe_chat_completions_request(

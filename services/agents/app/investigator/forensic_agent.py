@@ -18,7 +18,6 @@ from typing import Any
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
-
 from app.core.cost_telemetry import record_llm_call
 from app.llm import safe_ainvoke
 from app.prompt_serialization import summarize_structure_for_llm
@@ -41,8 +40,8 @@ Given a security alert and its enrichment data, produce:
 4. An estimated blast radius (what systems/data were or could be affected, in Korean).
 5. A confidence score (0.0–1.0) for your analysis.
 
-CRITICAL:                                                                                                                                                                                                             
-   - Write the value of "root_cause_hypothesis", "blast_radius", "summary", and timeline "event" descriptions strictly in Korean.                                                                               
+CRITICAL:
+   - Write the value of "root_cause_hypothesis", "blast_radius", "summary", and timeline "event" descriptions strictly in Korean.
    - The JSON keys MUST remain in English.
 
 Respond ONLY with a JSON object:
@@ -55,7 +54,6 @@ Respond ONLY with a JSON object:
   "summary": "Two-sentence forensic summary in Korean."
 }
 """
-
 
 async def _llm_forensic(state: InvestigatorState) -> dict[str, Any]:
     import os
@@ -131,6 +129,7 @@ async def _llm_forensic(state: InvestigatorState) -> dict[str, Any]:
         json_match = re.search(r"\{[\s\S]*\}", content)
         if json_match:
             return json.loads(json_match.group())
+        raise ValueError("LLM 응답에서 유효한 JSON 구조를 찾을 수 없습니다.")
     except Exception as exc:  # noqa: BLE001
         logger.warning("forensic llm failed", error=str(exc))
         state.log(
@@ -138,23 +137,8 @@ async def _llm_forensic(state: InvestigatorState) -> dict[str, Any]:
             "ForensicAgent",
             f"LLM call failed: {exc}",
         )
-
-    # Fallback
-    state.log_decision(
-        agent="ForensicAgent",
-        decision="defer_to_manual",
-        reason="LLM unavailable or returned malformed output; cannot construct a confident forensic timeline",
-        confidence=0.1,
-        alternatives=["llm_extraction"],
-    )
-    return {
-        "timeline": [],
-        "artefacts": [],
-        "root_cause_hypothesis": "Unable to determine root cause automatically.",
-        "blast_radius": "Unknown — manual review required.",
-        "confidence": 0.1,
-        "summary": "Automated forensic analysis was not available.",
-    }
+        raise RuntimeError(f"[Forensic Agent 오류] {exc}") from exc
+    
 
 
 async def run_forensic(state_dict: dict[str, Any]) -> dict[str, Any]:

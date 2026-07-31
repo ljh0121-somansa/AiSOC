@@ -61,80 +61,6 @@ const CONFIDENCE_CONFIG: Record<ConfidenceLabel, { label: string; badge: string;
   },
 };
 
-// Mock alert for development
-const MOCK_ALERT: Alert = {
-  id: 'alert-1',
-  title: 'Suspicious PowerShell execution detected',
-  description: 'A PowerShell script was executed with obfuscated content and attempted to download a payload from an external domain. The process was spawned by a user with administrative privileges outside of business hours.',
-  severity: 'critical',
-  status: 'new',
-  source: 'CrowdStrike',
-  sourceRef: 'CS-2024-789012',
-  tenantId: 'tenant-1',
-  riskScore: 95,
-  mitreAttack: [
-    { tactic: 'Execution', technique: 'PowerShell', techniqueId: 'T1059.001' },
-    { tactic: 'Defense Evasion', technique: 'Obfuscated Files or Information', techniqueId: 'T1027' },
-    { tactic: 'Command and Control', technique: 'Application Layer Protocol', techniqueId: 'T1071' },
-  ],
-  iocs: [
-    { type: 'ip', value: '185.220.101.45', malicious: true },
-    { type: 'domain', value: 'payload-c2.xyz', malicious: true },
-    { type: 'hash', value: 'a1b2c3d4e5f6789012345678901234567890abcd', malicious: true },
-  ],
-  tags: ['powershell', 'c2-beacon', 'high-priority'],
-  assignee: 'analyst@example.com',
-  createdAt: '2026-05-06T11:00:00Z',
-  updatedAt: '2026-05-06T11:30:00Z',
-  confidenceLabel: 'high',
-  confidenceScore: 0.86,
-  confidenceRationale: [
-    {
-      factor: 'severity',
-      label: 'Critical severity from source',
-      value: 1.0,
-      contribution: 0.20,
-      weight: 0.20,
-    },
-    {
-      factor: 'mitre_coverage',
-      label: '3 MITRE techniques mapped (T1059.001, T1027, T1071)',
-      value: 1.0,
-      contribution: 0.18,
-      weight: 0.18,
-    },
-    {
-      factor: 'threat_intel',
-      label: 'IOC matched against known C2 infrastructure',
-      value: 1.0,
-      contribution: 0.20,
-      weight: 0.20,
-    },
-    {
-      factor: 'ml_score',
-      label: 'Anomaly score 0.94 (UEBA baseline deviation)',
-      value: 0.94,
-      contribution: 0.14,
-      weight: 0.15,
-    },
-    {
-      factor: 'upstream_risk',
-      label: 'Affected user is in elevated-risk cohort',
-      value: 0.78,
-      contribution: 0.08,
-      weight: 0.10,
-    },
-    {
-      factor: 'ioc_density',
-      label: '3 distinct malicious IOCs in single event',
-      value: 0.85,
-      contribution: 0.06,
-      weight: 0.07,
-    },
-  ],
-  ledgerRunId: 'run-mock-c2-beacon-investigation',
-};
-
 // ─── Sections ─────────────────────────────────────────────────────────────────
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
@@ -345,9 +271,10 @@ function LedgerEvidenceChain({ runId }: { runId: string }) {
 function AIInvestigation({ alertId, alert }: { alertId: string; alert?: Alert }) {
   const [investigation, setInvestigation] = useState<AgentInvestigation | null>(null);
   const [isRunning, setIsRunning] = useState(false);
-
+  const [error, setError] = useState<string | null>(null);
   const startInvestigation = async (reinvestigate = false) => {
     setIsRunning(true);
+    setError(null);
     try {
       const result = await agentsApi.investigate(
         alertId,
@@ -355,53 +282,13 @@ function AIInvestigation({ alertId, alert }: { alertId: string; alert?: Alert })
         alert as unknown as Record<string, unknown>,
       );
       setInvestigation(result);
-    } catch (err) {
-      // Show mock investigation for demo
-      setInvestigation({
-        id: 'inv-1',
-        alertId,
-        status: 'completed',
-        findings: `## AI 알럿 분석 요약
-
-**위협 분류:** 고위험 악성 행위 탐지 (Advanced Persistent Threat) - 높은 신뢰도
-
-### 개요
-PowerShell 실행 이벤트에 대한 자동 분석 결과, 외부 C2 통신 및 난독화된 다운로더 스크립트 실행 정황이 포착되었습니다.
-
-### 주요 발견 사항 (Key Findings)
-1. **최초 접근 (Initial Access)**: Tor 출구 노드 IP(185.220.101.45)로부터의 자격 증명 남용 시도
-2. **실행 행위 (Execution)**: 난독화된 PowerShell Base64 페이로드 실행
-3. **C2 통신 정황**: 생성된 지 3일 된 신규 도메인(payload-c2.xyz)으로 암호화 채널 형성 시도
-4. **측면 이동 위험 (Lateral Movement)**: 현재 계정의 12개 추가 시스템 관리자 권한 보유 확인
-
-### MITRE ATT&CK 맵핑
-- T1059.001 (PowerShell) → 활성
-- T1027 (Obfuscation) → 활성  
-- T1071 (Application Layer Protocol) → 활성
-
-### 추천 대응 조치
-1. 영향을 받는 단말(DESKTOP-ABC123) 즉시 네트워크 격리
-2. 경계 방화벽에서 IP 185.220.101.45 차단
-3. DNS 수준에서 도메인 payload-c2.xyz 차단
-4. 관련 사용자 계정 비밀번호 재설정`,
-        recommendations: [
-          '영향을 받는 단말 장비 DESKTOP-ABC123을 네트워크에서 즉시 격리하십시오.',
-          '방화벽에서 IP 185.220.101.45를 차단하십시오.',
-          'DNS 수준에서 도메인 payload-c2.xyz를 차단하십시오.',
-          '관련 사용자 계정 john.doe@company.com의 비밀번호를 즉시 재설정하십시오.',
-          '전사 시스템의 관리자 권한 보유 현황을 재검토하십시오.',
-        ],
-        actions: [
-          { type: 'isolate_endpoint', target: 'DESKTOP-ABC123', status: 'pending' },
-          { type: 'block_ip', target: '185.220.101.45', status: 'pending' },
-          { type: 'block_domain', target: 'payload-c2.xyz', status: 'pending' },
-        ],
-        startedAt: new Date().toISOString(),
-        completedAt: new Date().toISOString(),
-        cached: false,
-      });
+    } catch (err : any) {
+        if ((err as Error)?.name === 'AbortError') return;
+        const detail = err?.response?.data?.detail || err?.detail || err?.message || '요청 처리에 실패했습니다.';
+        toast.error(`조사 실행 실패: ${detail}`);
+    } finally {
+      setIsRunning(false);
     }
-    setIsRunning(false);
   };
 
   if (!investigation) {
@@ -848,7 +735,7 @@ export function AlertDetailView({ alertId }: { alertId: string }) {
   const { data: alert, isLoading, mutate } = useSWR(
     ['alert', alertId],
     () => alertsApi.get(alertId),
-    { fallbackData: { ...MOCK_ALERT, id: alertId, status } }
+    { fallbackData: undefined }
   );
 
   const handleStatusChange = async (newStatus: Alert['status']) => {

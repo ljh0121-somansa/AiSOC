@@ -279,4 +279,4 @@ async def change_password(
         pass
 
     await db.commit()
-    return {"message": "Password updated successfully / 비밀번호가 성공적으로 변경되었습니다."}
+    return {"message": "비밀번호가 성공적으로 변경되었습니다."}

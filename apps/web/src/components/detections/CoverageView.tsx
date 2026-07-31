@@ -60,7 +60,8 @@ const fetcher = (url: string) =>
 
 export function CoverageView() {
   const { data, error, isLoading } = useSWR<MarketplaceIndex>(
-    '/marketplace/index.json',
+    [],
+    //'/marketplace/index.json',
     fetcher,
     { revalidateOnFocus: false },
   );

@@ -196,20 +196,6 @@ async def get_current_user(
     demo user (see ``app.api.v1.dev_auth``). Production requires a bearer token.
     """
     if credentials is None:
-        if is_dev_mode():
-            tenant_header = request.headers.get("x-tenant-id")
-            resolved_tenant = DEMO_TENANT_ID
-            if tenant_header:
-                try:
-                    resolved_tenant = uuid.UUID(tenant_header)
-                except ValueError:
-                    pass
-            return CurrentUser(
-                user_id=DEMO_USER_ID,
-                tenant_id=resolved_tenant,
-                role=DEMO_USER_ROLE,
-                email=DEMO_USER_EMAIL,
-            )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated",

@@ -114,54 +114,29 @@ class DashboardErrorBoundary extends Component<{ children: ReactNode }, { hasErr
   }
 }
 
-// ─── Mock Data ────────────────────────────────────────────────────────────────
+// ─── DEFAULT Data ────────────────────────────────────────────────────────────────
 
-const MOCK_METRICS: DashboardMetrics = {
+const DEFAULT_METRICS: DashboardMetrics = {
   alerts: {
-    total: 1247,
-    new: 89,
-    critical: 12,
-    high: 43,
-    medium: 156,
-    low: 289,
-    resolvedToday: 67,
-    mttr: 42,
+    total: 0,
+    new: 0,
+    critical: 0,
+    high: 0,
+    medium: 0,
+    low: 0,
+    resolvedToday: 0,
+    mttr: 0,
   },
   cases: {
-    open: 23,
-    inProgress: 15,
-    resolvedThisWeek: 34,
+    open: 0,
+    inProgress: 0,
+    resolvedThisWeek: 0,
   },
-  sources: [
-    { name: 'CrowdStrike EDR', count: 412, status: 'active' },
-    { name: 'Microsoft Sentinel', count: 287, status: 'active' },
-    { name: 'AWS CloudTrail', count: 198, status: 'active' },
-    { name: 'Okta Identity', count: 163, status: 'active' },
-    { name: 'Google Workspace', count: 107, status: 'active' },
-    { name: 'GitHub Audit', count: 84, status: 'active' },
-  ],
-  topMitre: [
-    { tactic: 'Execution', count: 89 },
-    { tactic: 'Defense Evasion', count: 67 },
-    { tactic: 'Command & Control', count: 54 },
-    { tactic: 'Credential Access', count: 43 },
-    { tactic: 'Lateral Movement', count: 38 },
-    { tactic: 'Exfiltration', count: 21 },
-  ],
+  sources: [],
+  topMitre: [],
   // Deterministic timestamps — no Date.now()/Math.random() to avoid SSR hydration mismatches.
-  alertsTrend: Array.from({ length: 24 }, (_, i) => ({
-    timestamp: new Date(new Date('2026-05-06T12:00:00Z').getTime() - (23 - i) * 3600000).toISOString(),
-    count: ((i * 37 + 13) % 80) + 20,
-    severity: 'all',
-  })),
-  threatsBySource: [
-    { source: 'CrowdStrike EDR', count: 412 },
-    { source: 'Microsoft Sentinel', count: 287 },
-    { source: 'AWS CloudTrail', count: 198 },
-    { source: 'Okta Identity', count: 163 },
-    { source: 'Google Workspace', count: 107 },
-    { source: 'GitHub Audit', count: 84 },
-  ],
+  alertsTrend: [],
+  threatsBySource: [],
 };
 
 // ─── Metric Card ──────────────────────────────────────────────────────────────
@@ -377,7 +352,7 @@ export function DashboardView() {
     'dashboard-metrics',
     () => metricsApi.getDashboard(),
     {
-      fallbackData: MOCK_METRICS,
+      fallbackData: DEFAULT_METRICS,
       refreshInterval: 60000,
       revalidateOnMount: true,
       revalidateOnFocus: false,
@@ -402,37 +377,40 @@ export function DashboardView() {
   const metrics: DashboardMetrics = hasRealAlerts
     ? {
         alerts: apiData!.alerts as DashboardMetrics['alerts'],
-        cases: apiData!.cases ?? MOCK_METRICS.cases,
+        cases: apiData!.cases ?? DEFAULT_METRICS.cases,
         sources:
           Array.isArray(apiData!.sources) && apiData!.sources!.length
             ? apiData!.sources!
-            : MOCK_METRICS.sources,
+            : DEFAULT_METRICS.sources,
         topMitre:
           Array.isArray(apiData!.topMitre) && apiData!.topMitre!.length
             ? apiData!.topMitre!
-            : MOCK_METRICS.topMitre,
+            : DEFAULT_METRICS.topMitre,
         alertsTrend:
           Array.isArray(apiData!.alertsTrend) && apiData!.alertsTrend!.length
             ? apiData!.alertsTrend!
-            : MOCK_METRICS.alertsTrend,
+            : DEFAULT_METRICS.alertsTrend,
         threatsBySource:
           Array.isArray(apiData!.threatsBySource) && apiData!.threatsBySource!.length
             ? apiData!.threatsBySource!
-            : MOCK_METRICS.threatsBySource,
+            : DEFAULT_METRICS.threatsBySource,
       }
-    : MOCK_METRICS;
+    : DEFAULT_METRICS;
 
   const trendData = metrics.alertsTrend.map((d) => ({
     time: format(new Date(d.timestamp), 'HH:mm'),
     count: d.count,
   }));
 
+  const toPieVal = (v: number | string | undefined): number =>                                                                                                       
+       typeof v === 'number' ? v : 0;
+
   const SEVERITY_CHART_DATA = [
-    { name: 'Critical', value: metrics.alerts.critical, color: '#ef4444' },
-    { name: 'High', value: metrics.alerts.high, color: '#f97316' },
-    { name: 'Medium', value: metrics.alerts.medium, color: '#eab308' },
-    { name: 'Low', value: metrics.alerts.low, color: '#3b82f6' },
-    { name: 'Info', value: metrics.alerts.info ?? 0, color: '#64748b' },
+    { name: 'Critical', value: toPieVal(metrics.alerts.critical), color: '#ef4444' },
+    { name: 'High', value: toPieVal(metrics.alerts.high), color: '#f97316' },
+    { name: 'Medium', value: toPieVal(metrics.alerts.medium), color: '#eab308' },
+    { name: 'Low', value: toPieVal(metrics.alerts.low), color: '#3b82f6' },
+    { name: 'Info', value: toPieVal(metrics.alerts.info) ?? 0, color: '#64748b' },
   ];
 
   // WS-F3: drag-and-drop widget reordering
@@ -473,14 +451,14 @@ export function DashboardView() {
             value={metrics.alerts.total}
             sub={`${metrics.alerts.new} new today`}
             color="blue"
-            trend={{ value: 12, label: 'vs yesterday' }}
+            trend={{ value: 0, label: 'vs yesterday' }}
           />
           <MetricCard
             label="Critical"
             value={metrics.alerts.critical}
             sub="Require immediate action"
             color="red"
-            trend={{ value: -3, label: 'vs yesterday' }}
+            trend={{ value: 0, label: 'vs yesterday' }}
           />
           <MetricCard
             label="Open Cases"
@@ -493,7 +471,7 @@ export function DashboardView() {
             value={`${metrics.alerts.mttr}m`}
             sub="Mean time to resolve"
             color="green"
-            trend={{ value: -8, label: 'vs last week' }}
+            trend={{ value: 0, label: 'vs last week' }}
           />
           <MetricCard
             label="Connected Sources"

