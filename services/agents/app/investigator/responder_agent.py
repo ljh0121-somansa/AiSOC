@@ -9,8 +9,6 @@ Responsibilities:
 
 from __future__ import annotations
 
-import json
-import re
 import time
 from typing import Any
 
@@ -21,6 +19,7 @@ from langchain_openai import ChatOpenAI
 from app.core.cost_telemetry import record_llm_call
 from app.llm import safe_ainvoke
 from app.prompt_serialization import summarize_structure_for_llm
+from app.investigator.utils import safe_parse_agent_json
 
 from .bundle_prompt import format_bundle_prompt_append
 from .prompt_sanitizer import (
@@ -63,38 +62,6 @@ Respond ONLY with a JSON object:
   "summary": "Two-sentence response summary in Korean."
 }
 """
-def safe_parse_agent_json(content: str) -> dict[str, Any]:
-    """
-    Qwen/DeepSeek 추론 모델 응답 처리:
-    <think> 태그 유무와 관계없이 </think> 닫는 태그 이전의 
-    모든 생각 과정(Thinking Process) 텍스트를 제거하고 순수 JSON만 파싱합니다.
-    """
-    cleaned = content
-
-    # 1. </think> 태그가 존재하는 경우: </think> 포함 앞부분 전체 제거
-    if "</think>" in cleaned:
-        cleaned = cleaned.split("</think>", 1)[1].strip()
-    else:
-        # 2. 혹시 <think> ... </think> 가 완벽하게 들어있는 경우 제거
-        cleaned = re.sub(r"<think>[\s\S]*?</think>", "", cleaned).strip()
-
-    # 3. 마크다운 펜스 제거 (```json ... ``` 또는 ``` ... ```)
-    cleaned = re.sub(r"```(?:json)?\s*", "", cleaned)
-    cleaned = re.sub(r"```\s*", "", cleaned).strip()
-
-    # 4. 가장 바깥쪽 { ... } 객체 파싱
-    json_match = re.search(r"\{[\s\S]*\}", cleaned)
-    if json_match:
-        json_str = json_match.group(0)
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError:
-            # 뒷부분에 다른 텍스트가 남은 경우 raw_decode로 첫 번째 JSON만 추출
-            decoder = json.JSONDecoder()
-            obj, _ = decoder.raw_decode(json_str)
-            return obj
-
-    return json.loads(cleaned)
 
 async def _llm_responder(state: InvestigatorState) -> dict[str, Any]:
     import os

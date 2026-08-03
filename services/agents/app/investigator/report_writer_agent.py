@@ -194,7 +194,9 @@ async def run_report_writer(state_dict: dict[str, Any]) -> dict[str, Any]:
     t_llm = time.monotonic()
     try:
         response = await safe_ainvoke(llm, messages)
-        state.report_md = response.content
+        raw_content = response.content
+        cleaned_content = raw_content.split("</think>")[-1].strip()
+        state.report_md = cleaned_content
         latency_ms = int((time.monotonic() - t_llm) * 1000)
         tokens = 0
         if hasattr(response, "response_metadata"):

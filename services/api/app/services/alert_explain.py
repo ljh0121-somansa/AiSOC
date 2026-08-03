@@ -799,11 +799,11 @@ async def _call_llm_for_summary(
         )
 
     try:
-        async with httpx.AsyncClient(timeout=20, verify=False) as client:
+        async with httpx.AsyncClient(timeout=50, verify=False) as client:
             resp = await client.post(
                 url,
                 headers={"Authorization": f"Bearer {llm_config.api_key}"},
-                json={"model": llm_config.model, "messages": messages, "max_tokens": 360},
+                json={"model": llm_config.model, "messages": messages, "max_tokens": 5000},
             )
             resp.raise_for_status()
             payload = resp.json()
@@ -818,6 +818,7 @@ async def _call_llm_for_summary(
         )
 
     try:
+        
         raw_text = (payload["choices"][0]["message"]["content"] or "").strip()
         
         # 🟢 1. Qwen / DeepSeek 모델의 <think>...</think> 추론 태그 정제

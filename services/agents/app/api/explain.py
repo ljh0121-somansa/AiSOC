@@ -603,7 +603,9 @@ async def _llm_summary(
                 json={"model": model, "messages": messages, "max_tokens": 320},
             )
             resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"].strip()
+            raw_content = resp.json()["choices"][0]["message"]["content"].strip()
+            clean_content = raw_content.split("</think>", 1)[-1]
+            return clean_content
 
     except Exception as exc:
         logger.warning("explain.llm_error", error=str(exc))

@@ -21,6 +21,7 @@ from langchain_openai import ChatOpenAI
 from app.core.cost_telemetry import record_llm_call
 from app.llm import safe_ainvoke
 from app.prompt_serialization import summarize_structure_for_llm
+from app.investigator.utils import safe_parse_agent_json
 
 from .bundle_prompt import format_bundle_prompt_append
 from .prompt_sanitizer import (
@@ -126,10 +127,11 @@ async def _llm_forensic(state: InvestigatorState) -> dict[str, Any]:
             latency_ms=latency_ms,
             cost_usd=cost_usd,
         )
-        json_match = re.search(r"\{[\s\S]*\}", content)
-        if json_match:
-            return json.loads(json_match.group())
-        raise ValueError("LLM 응답에서 유효한 JSON 구조를 찾을 수 없습니다.")
+        return safe_parse_agent_json(content)
+        # json_match = re.search(r"\{[\s\S]*\}", content)
+        # if json_match:
+        #     return json.loads(json_match.group())
+        # raise ValueError("LLM 응답에서 유효한 JSON 구조를 찾을 수 없습니다.")
     except Exception as exc:  # noqa: BLE001
         logger.warning("forensic llm failed", error=str(exc))
         state.log(

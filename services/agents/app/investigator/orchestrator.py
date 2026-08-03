@@ -44,7 +44,6 @@ except Exception:
 # Error-wrapper: catches exceptions in any node and marks state as failed
 # ---------------------------------------------------------------------------
 
-
 def _safe_node(fn):
     """Wrap an async node so exceptions are captured in state instead of crashing the graph.
     Also emits an OpenTelemetry span per node execution."""

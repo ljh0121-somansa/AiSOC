@@ -42,7 +42,7 @@ from typing import Any, Literal
 from urllib.parse import quote
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query, Response, status
+from fastapi import APIRouter, HTTPException, Query, Response, status, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text
@@ -1338,9 +1338,12 @@ async def case_investigation_report_md(
     case_id: str,
     run_id: str,
     user: AuthUser,
+    request: Request,
 ) -> PlainTextResponse:
     safe_run_id = quote(run_id, safe="")
-    resp = await _agents_proxy("GET", f"/api/v1/investigations/{safe_run_id}/report.md")
+    auth_header = request.headers.get("Authorization")
+    headers = {"Authorization": auth_header} if auth_header else {}
+    resp = await _agents_proxy("GET", f"/api/v1/investigations/{safe_run_id}/report.md",headers=headers)
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return PlainTextResponse(content=resp.text)
