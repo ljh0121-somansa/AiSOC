@@ -165,8 +165,45 @@ function severityClass(s?: AlertSeverity) {
 }
 
 function copyToClipboard(text: string) {
-  if (typeof navigator === 'undefined' || !navigator.clipboard) return;
-  void navigator.clipboard.writeText(text).then(() => toast.success('Copied'));
+  if (typeof navigator !== 'undefined' && navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard
+      .writeText(text)
+      .then(() => toast.success('Copied'))
+      .catch((err) => {
+        console.error('Clipboard copy failed:', err);
+        fallbackCopyToClipboard(text);
+      });
+    return;
+  }
+  fallbackCopyToClipboard(text);
+}
+
+// HTTP 환경 지원을 위한 Fallback 함수
+function fallbackCopyToClipboard(text: string) {
+  try {
+    const textArea = document.createElement('textarea');
+    textArea.value = text;
+    // 화면에 보이지 않도록 위치 조정
+    textArea.style.position = 'fixed';
+    textArea.style.top = '0';
+    textArea.style.left = '0';
+    textArea.style.opacity = '0';
+    document.body.appendChild(textArea);
+    textArea.focus();
+    textArea.select();
+
+    const successful = document.execCommand('copy');
+    document.body.removeChild(textArea);
+
+    if (successful) {
+      toast.success('Copied');
+    } else {
+      toast.error('Failed to copy');
+    }
+  } catch (err) {
+    console.error('Fallback copy failed:', err);
+    toast.error('Failed to copy');
+  }
 }
 
 // ─── NL hero block ───────────────────────────────────────────────────────────
@@ -565,14 +602,14 @@ function ResultRow({ result }: { result: HuntResult }) {
           </div>
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <button
-              onClick={() => copyToClipboard(JSON.stringify(result.fields, null, 2))}
+              onClick={() => copyToClipboard(JSON.stringify(result.raw, null, 2))}
               className="rounded border border-slate-700/70 bg-slate-800/40 px-2 py-1 text-[11px] text-slate-300 transition-colors hover:border-slate-600 hover:bg-slate-700/40"
             >
               Copy JSON
             </button>
             <button
               onClick={() => {
-                const host = result.fields?.host;
+                const host = result.raw?.host;
                 const url = host ? `/graph?entity=${encodeURIComponent(String(host))}` : '/graph';
                 window.location.href = url;
               }}

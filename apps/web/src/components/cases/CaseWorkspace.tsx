@@ -380,6 +380,7 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
         return;
       }
       const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      const authToken = typeof window !== 'undefined' ? localStorage.getItem('aisoc.responder.accessToken') : '';
       // The Next.js dev server proxies /ws → realtime service on :8086.
       // In production, nginx handles the proxy.
       const wsUrl = `${wsProto}://${window.location.host}/ws/agents?token=${encodeURIComponent(token)}`;
@@ -422,7 +423,11 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
               setInvestigating(false);
               toast.success('Investigation complete — report ready');
               // Fetch the Markdown report
-              fetch(`/api/v1/cases/${caseId}/investigations/${runId}/report.md`)
+              fetch(`/api/v1/cases/${caseId}/investigations/${runId}/report.md`, {
+                headers: {
+                  'Authorization': `Bearer ${authToken}`,
+                },
+              })
                 .then((r) => r && r.ok ? r.text() : '')
                 .then((md) => { if (md && typeof md === 'string') setReportMd(md); })
                 .catch((e) => { console.warn('Failed to fetch report.md:', e); });
@@ -479,7 +484,12 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
             if (inv.status === 'completed') {
               toast.success('Investigation complete — report ready');
               try {
-                const resp = await fetch(`/api/v1/cases/${caseId}/investigations/${result.run_id}/report.md`);
+                const token = typeof window !== 'undefined' ? localStorage.getItem('aisoc.responder.accessToken') : '';
+                const resp = await fetch(`/api/v1/cases/${caseId}/investigations/${result.run_id}/report.md`, {
+                  headers: {
+                    Authorization: `Bearer ${token}`,
+                  },
+                });
                 if (resp && resp.ok) {
                   const text = await resp.text();
                   if (text && typeof text === 'string') {
