@@ -395,9 +395,10 @@ async def safe_chat_completions_request(
     body: dict[str, Any] = {"model": model, "messages": materialised}
     body.update(extra_body)
 
+    url = f"{url}/chat/completions" if url.endswith("/v1") else f"{url}/v1/chat/completions"
     logger.info("safe_chat_completions_request debug", url=url, headers={k: (v[:15] + "...") if k == "Authorization" else v for k, v in headers.items()}, body=body)
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
         resp = await client.post(url, headers=headers, json=body)
         resp.raise_for_status()
         return resp.json()

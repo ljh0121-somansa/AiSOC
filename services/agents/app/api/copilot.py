@@ -122,9 +122,11 @@ async def _get_openai_reply(
             api_key=api_key,
             model=os.getenv("OPENAI_MODEL_NAME",""),
             messages=messages,
-            max_tokens=512,
+            max_tokens=4000,
         )
-        return body["choices"][0]["message"]["content"]
+        raw_content = body["choices"][0]["message"]["content"]
+        clean_content = raw_content.split("</think>", 1)[-1]
+        return clean_content
     except Exception as exc:
         logger.warning("copilot.openai_error", error=str(exc))
         return f"⚠️ [LLM 호출 실패] {str(exc)}"
