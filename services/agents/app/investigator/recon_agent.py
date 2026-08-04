@@ -125,6 +125,9 @@ async def _llm_recon(state: InvestigatorState) -> dict[str, Any]:
             latency_ms=latency_ms,
             cost_usd=cost_usd,
         )
+        # logger.info("------------------")
+        # logger.info(content)
+        # logger.info("------------------")
         return safe_parse_agent_json(content)
         # Extract JSON from the response
         # json_match = re.search(r"\{[\s\S]*\}", content)
