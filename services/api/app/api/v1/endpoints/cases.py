@@ -1425,3 +1425,196 @@ async def list_related_cases(
             )
 
     return {"related": related}
+
+class AutoCreateCaseRequest(BaseModel):                                                                    
+    tenant_id: str | None = None                                                                           
+    title: str                                                                                             
+    description: str | None = None                                                                         
+    severity: str = "high"                                                                                 
+    status: str = "investigating"                                                                          
+    alert_ids: list[str] = []                                                                              
+    mitre_techniques: list[str] = []                                                                       
+    tags: list[str] = [] 
+
+@router.post("/auto-create", response_model=CaseResponse, status_code=status.HTTP_201_CREATED, summary="Auto create case for internal agents/playbooks")                                                    
+async def auto_create_case(body: AutoCreateCaseRequest, request: Request, db: DBSession) -> CaseResponse:  
+    import json as _json                                                                                   
+                                                                                                            
+    tenant_header = request.headers.get("X-Tenant-ID") or body.tenant_id or "00000000-0000-0000-0000-000000000001"                                                                       
+    try:                                                                                                   
+        tenant_uuid = uuid.UUID(str(tenant_header))                                                        
+    except (ValueError, TypeError):                                                                        
+        tenant_uuid = uuid.UUID("00000000-0000-0000-0000-000000000001")                                    
+                                                                                                            
+    # If alert_ids provided, fetch original alert row from DB to mirror 100% of its fields                 
+    alert_row = None                                                                                       
+    if body.alert_ids:                                                                                     
+        try:                                                                                               
+            aid = uuid.UUID(str(body.alert_ids[0]))                                                        
+            alert_row = (await db.execute(                                                                 
+                text("SELECT * FROM alerts WHERE id = :id").bindparams(id=aid)                             
+            )).fetchone()                                                                                  
+        except Exception:                                                                                  
+            pass                                                                                           
+                                                                                                            
+    def _clean_str(val: Any) -> str:
+        if not val:
+            return ""
+        s = str(val).strip()
+        while (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")) or (s.startswith('\\"') and s.endswith('\\"')) or (s.startswith('\\') or s.endswith('\\')):
+            s = s.strip(' \t\r\n"\'\\')
+        return s
+
+    if alert_row:                                                                                          
+        tenant_uuid = alert_row.tenant_id                                                                  
+        title = _clean_str(alert_row.title)                                                                           
+        description = _clean_str(alert_row.description or getattr(alert_row, "narrative", None) or alert_row.title)
+        severity = alert_row.severity                                                                      
+        mitre_tech = alert_row.mitre_techniques or body.mitre_techniques or []                             
+        alert_ids = [str(alert_row.id)]                                                                    
+        tags = alert_row.tags if getattr(alert_row, "tags", None) else (body.tags or ["auto-created"])
+
+        # Check if an open case already exists for this alert/tenant
+        existing_open_case = (await db.execute(
+            text("""
+                SELECT * FROM aisoc_cases
+                WHERE tenant_id = :tenant_id
+                  AND status IN ('open', 'investigating', 'in_progress', 'pending')
+                  AND (:aid = ANY(alert_ids) OR alert_ids ?| :aids)
+                ORDER BY created_at DESC LIMIT 1
+            """).bindparams(tenant_id=tenant_uuid, aid=uuid.UUID(alert_ids[0]), aids=alert_ids)
+        )).fetchone()
+        if existing_open_case:
+            cid = existing_open_case.id
+            curr_aids = [str(x) for x in (existing_open_case.alert_ids or [])]
+            if alert_ids[0] not in curr_aids:
+                curr_aids.append(alert_ids[0])
+            
+            # Link alert row to existing case
+            await db.execute(text("UPDATE alerts SET case_id = :case_id WHERE id = :id").bindparams(case_id=cid, id=uuid.UUID(alert_ids[0])))
+            
+            # Merge observable graph and evidence chain
+            curr_obs = existing_open_case.observable_graph if isinstance(existing_open_case.observable_graph, dict) else {"nodes": [], "edges": []}
+            curr_nodes = curr_obs.get("nodes", []) if isinstance(curr_obs.get("nodes"), list) else []
+            node_ids = {n.get("id") for n in curr_nodes if isinstance(n, dict)}
+            
+            for h in (getattr(alert_row, "affected_hosts", None) or []):
+                if h and f"host:{h}" not in node_ids:
+                    curr_nodes.append({"id": f"host:{h}", "type": "host", "label": str(h)})
+            for u in (getattr(alert_row, "affected_users", None) or []):
+                if u and f"user:{u}" not in node_ids:
+                    curr_nodes.append({"id": f"user:{u}", "type": "user", "label": str(u)})
+            for ip in (getattr(alert_row, "affected_ips", None) or []):
+                if ip and f"ip:{ip}" not in node_ids:
+                    curr_nodes.append({"id": f"ip:{ip}", "type": "ip", "label": str(ip)})
+
+            curr_ev = existing_open_case.evidence_chain if isinstance(existing_open_case.evidence_chain, list) else []
+            ev_ids = {e.get("id") for e in curr_ev if isinstance(e, dict)}
+            if str(alert_row.id) not in ev_ids:
+                curr_ev.append({
+                    "id": str(alert_row.id),
+                    "type": "alert",
+                    "title": alert_row.title,
+                    "severity": alert_row.severity,
+                    "timestamp": alert_row.created_at.isoformat() if hasattr(alert_row.created_at, "isoformat") else str(alert_row.created_at),
+                    "source": getattr(alert_row, "connector_type", None) or "splunk"
+                })
+
+            upd_q = text("""
+                UPDATE aisoc_cases
+                SET alert_ids = CAST(:aids AS UUID[]),
+                    observable_graph = CAST(:obs AS JSONB),
+                    evidence_chain = CAST(:ev AS JSONB),
+                    updated_at = :now
+                WHERE id = :id RETURNING *
+            """).bindparams(
+                aids=curr_aids,
+                obs=_json.dumps({"nodes": curr_nodes, "edges": curr_obs.get("edges", [])}),
+                ev=_json.dumps(curr_ev),
+                now=datetime.now(UTC),
+                id=cid
+            )
+            upd_row = (await db.execute(upd_q)).fetchone()
+            await db.commit()
+            return _row_to_case(upd_row or existing_open_case)     
+                                                                                                            
+        # Build observable graph & evidence chain dynamically from the alert row                           
+        obs_nodes = []                                                                                     
+        if getattr(alert_row, "affected_hosts", None):                                                     
+            for h in alert_row.affected_hosts:                                                             
+                if h: obs_nodes.append({"id": f"host:{h}", "type": "host", "label": str(h)})               
+        if getattr(alert_row, "affected_users", None):                                                     
+            for u in alert_row.affected_users:                                                             
+                if u: obs_nodes.append({"id": f"user:{u}", "type": "user", "label": str(u)})               
+        if getattr(alert_row, "affected_ips", None):                                                       
+            for ip in alert_row.affected_ips:                                                              
+                if ip: obs_nodes.append({"id": f"ip:{ip}", "type": "ip", "label": str(ip)})                
+                                                                                                            
+        observable_graph = {"nodes": obs_nodes, "edges": []}                                               
+        evidence_chain = [{                                                                                
+            "id": str(alert_row.id),                                                                       
+            "type": "alert",                                                                               
+            "title": alert_row.title,                                                                      
+            "severity": alert_row.severity,                                                                
+            "timestamp": alert_row.created_at.isoformat() if hasattr(alert_row.created_at, "isoformat") else str(alert_row.created_at),                                                                              
+            "source": getattr(alert_row, "connector_type", None) or "splunk"                               
+        }]                                                                                                 
+    else:                                                                                                  
+        title = body.title                                                                                 
+        description = body.description or body.title                                                       
+        severity = body.severity                                                                           
+        mitre_tech = body.mitre_techniques or []                                                           
+        alert_ids = list(map(str, body.alert_ids)) or []                                                   
+        tags = body.tags or ["auto-created"]                                                               
+        observable_graph = {"nodes": [], "edges": []}                                                      
+        evidence_chain = []                                                                                
+                                                                                                            
+    case_id = uuid.uuid4()                                                                                 
+    case_num = f"INC-{str(case_id)[:8].upper()}"                                                           
+    now = datetime.now(UTC)                                                                                
+    q = text("""                                                                                           
+        INSERT INTO aisoc_cases (                                                                          
+            id, tenant_id, title, description, severity, status, assignee,                                 
+            mitre_techniques, alert_ids, observable_graph, evidence_chain,                                 
+            compliance_frameworks, tags, case_number, opened_at, created_at, updated_at, created_by        
+        ) VALUES (                                                                                         
+            :id, :tenant_id, :title, :description, :severity, 'investigating', 'playbook-agent',           
+            CAST(:mitre AS JSONB), CAST(:alert_ids AS UUID[]),                                             
+            CAST(:obs_graph AS JSONB), CAST(:evidence AS JSONB),                                           
+            CAST(:frameworks AS TEXT[]), CAST(:tags AS JSONB),                                             
+            :case_num, :now, :now, :now, 'playbook-agent'                                                  
+        ) RETURNING *                                                                                      
+    """).bindparams(                                                                                       
+        id=case_id,                                                                                        
+        tenant_id=tenant_uuid,                                                                             
+        title=title[:500],                                                                                 
+        description=description,                                                                           
+        severity=severity if severity in ("critical", "high", "medium", "low", "info") else "high",        
+        mitre=_json.dumps(mitre_tech),                                                                     
+        alert_ids=alert_ids,                                                                               
+        obs_graph=_json.dumps(observable_graph),                                                           
+        evidence=_json.dumps(evidence_chain),                                                              
+        frameworks=[],                                                                                     
+        tags=_json.dumps(tags),                                                                            
+        case_num=case_num,                                                                                 
+        now=now,                                                                                           
+    )                                                                                                      
+    try:                                                                                                   
+        row = (await db.execute(q)).fetchone()                                                             
+        if row is None:                                                                                    
+            raise HTTPException(status_code=503, detail="Database error: INSERT returned no row")          
+                                                                                                            
+        # Link alert back to case                                                                          
+        if alert_ids:                                                                                      
+            try:                                                                                           
+                aid = uuid.UUID(alert_ids[0])                                                              
+                await db.execute(text("UPDATE alerts SET case_id = :case_id WHERE id = :id").bindparams(case_id=case_id, id=aid))                                                                   
+            except Exception:                                                                              
+                pass                                                                                       
+                                                                                                            
+        await db.commit()                                                                                  
+        return _row_to_case(row)                                                                           
+    except Exception as exc:                                                                               
+        await db.rollback()                                                                                
+        logger.exception("Database error in auto_create_case endpoint")                                    
+        raise HTTPException(status_code=503, detail="Database error") from exc

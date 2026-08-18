@@ -99,21 +99,30 @@ async def get_attack_chain(
     # on ``alerts.case_id`` if that list is empty so a freshly-linked
     # case still resolves.
     seed_alert_id: uuid.UUID | None = None
+    candidate_ids: list[uuid.UUID] = []
     if alert_ids:
-        candidate_ids = [uuid.UUID(str(a)) if not isinstance(a, uuid.UUID) else a for a in alert_ids]
-        seed_row = (
-            await db.execute(
-                select(Alert)
-                .where(
-                    Alert.id.in_(candidate_ids),
-                    Alert.tenant_id == user.tenant_id,
+        for a in alert_ids:
+            if isinstance(a, uuid.UUID):
+                candidate_ids.append(a)
+            elif isinstance(a, str):
+                try:
+                    candidate_ids.append(uuid.UUID(a.strip()))
+                except (ValueError, TypeError):
+                    pass
+        if candidate_ids:
+            seed_row = (
+                await db.execute(
+                    select(Alert)
+                    .where(
+                        Alert.id.in_(candidate_ids),
+                        Alert.tenant_id == user.tenant_id,
+                    )
+                    .order_by(Alert.event_time.asc())
+                    .limit(1)
                 )
-                .order_by(Alert.event_time.asc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if seed_row is not None:
-            seed_alert_id = seed_row.id
+            ).scalar_one_or_none()
+            if seed_row is not None:
+                seed_alert_id = seed_row.id
 
     if seed_alert_id is None:
         seed_row = (

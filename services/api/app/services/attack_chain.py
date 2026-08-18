@@ -129,6 +129,10 @@ class CandidateAlert:
     title: str
     severity: str
     event_time: datetime
+    hostname: str | None = None
+    username: str | None = None
+    src_ip: str | None = None
+    dst_ip: str | None = None
     mitre_techniques: tuple[str, ...] = ()
     affected_users: tuple[str, ...] = ()
     affected_hosts: tuple[str, ...] = ()
@@ -140,9 +144,17 @@ class CandidateAlert:
     def entities(self) -> set[tuple[str, str]]:
         """Return the set of (kind, value) entity tuples for this alert."""
         out: set[tuple[str, str]] = set()
+        if self.username:
+            out.add(("Identity", str(self.username)))
         for v in self.affected_users:
             if v:
                 out.add(("Identity", str(v)))
+        if self.hostname:
+            out.add(("Endpoint", str(self.hostname)))
+        if self.src_ip:
+            out.add(("Endpoint", str(self.src_ip)))
+        if self.dst_ip:
+            out.add(("Endpoint", str(self.dst_ip)))
         for v in self.affected_hosts:
             if v:
                 out.add(("Endpoint", str(v)))
@@ -248,11 +260,21 @@ class AttackChainLoader(Protocol):
 # ---------------------------------------------------------------------------
 
 
+def _ensure_utc(dt: datetime | None) -> datetime:
+    if dt is None:
+        return datetime.now(UTC)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
 def _temporal_score(seed_time: datetime, candidate_time: datetime, window: timedelta) -> tuple[float, float]:
     """Return (score, |Δt| in seconds). Score is in [0, 1] — closer in
     time → higher score. ``|Δt|`` is exposed in the response so the UI
     can render the absolute time delta beside the chain link."""
-    dt = abs((candidate_time - seed_time).total_seconds())
+    st = _ensure_utc(seed_time)
+    ct = _ensure_utc(candidate_time)
+    dt = abs((ct - st).total_seconds())
     win_s = window.total_seconds()
     if win_s <= 0:
         return (0.0, dt)
@@ -481,6 +503,8 @@ async def compute_attack_chain(
             continue
         score, dt_s = score_candidate(seed, cand, distance, window)
         shared = _shared_entities(seed_entities, cand.entities())
+        if not shared:                                                                                     
+            shared = [{"kind": k, "value": v} for k, v in sorted(cand.entities()) if k in ("Endpoint", "Identity")] 
         chain.append(
             ChainLink(
                 alert_id=cand.id,
@@ -502,6 +526,24 @@ async def compute_attack_chain(
     # to the cap.
     chain.sort(key=lambda link: (-link.score, link.event_time))
     chain = chain[:max_length]
+
+    # Include seed alert as root link (distance=0)
+    chain.insert(
+        0,
+        ChainLink(
+            alert_id=seed.id,
+            title=seed.title,
+            severity=seed.severity,
+            event_time=seed.event_time,
+            score=1.0,
+            distance=0,
+            dt_seconds=0.0,
+            shared_entities=[{"kind": k, "value": v} for k, v in sorted(seed.entities()) if k in ("Endpoint", "Identity")],
+            mitre_techniques=list(_normalize_tech_ids(seed.mitre_techniques)),
+            connector_type=seed.connector_type,
+            source_event_ids=list(seed.source_event_ids),
+        ),
+    )
 
     # Confidence: highest score, normalised to [0, 1] (score weights
     # already sum to 1 so no extra division needed). When the chain is
@@ -574,16 +616,24 @@ class PostgresAttackChainLoader:
         # candidate list — single index lookup, no UNNEST.
         clauses = []
         if users:
-            clauses.append(text("alerts.affected_users ?| :u").bindparams(u=users))
+            u_params = {f"u_{i}": u for i, u in enumerate(users)}
+            u_arr = ", ".join(f":u_{i}" for i in range(len(users)))
+            clauses.append(
+                text(f"alerts.affected_users::jsonb ?| ARRAY[{u_arr}]").bindparams(**u_params)
+            )
         if hosts:
+            h_params = {f"h_{i}": h for i, h in enumerate(hosts)}
+            h_arr = ", ".join(f":h_{i}" for i in range(len(hosts)))
             clauses.append(
                 or_(
-                    text("alerts.affected_hosts ?| :h").bindparams(h=hosts),
-                    text("alerts.affected_ips ?| :h2").bindparams(h2=hosts),
+                    text(f"alerts.affected_hosts::jsonb ?| ARRAY[{h_arr}]").bindparams(**h_params),
+                    text(f"alerts.affected_ips::jsonb ?| ARRAY[{h_arr}]").bindparams(**h_params),
                 )
             )
         if assets:
-            clauses.append(text("alerts.affected_assets ?| :a").bindparams(a=assets))
+            a_params = {f"a_{i}": a for i, a in enumerate(assets)}
+            a_arr = ", ".join(f":a_{i}" for i in range(len(assets)))
+            clauses.append(text(f"alerts.affected_assets::jsonb ?| ARRAY[{a_arr}]").bindparams(**a_params))
 
         if not clauses:
             return []
@@ -603,23 +653,34 @@ class PostgresAttackChainLoader:
         if exclude_ids:
             stmt = stmt.where(Alert.id.notin_(list(exclude_ids)))
 
-        result = await self._db.execute(stmt)
-        rows = result.scalars().all()
-        return [_row_to_candidate(row) for row in rows]
+        try:
+            result = await self._db.execute(stmt)
+            rows = result.scalars().all()
+            return [_row_to_candidate(row) for row in rows]
+        except Exception as exc:
+            logger.warning("load_candidates_for_entities query failed: %s", exc)
+            return []
 
 
 def _row_to_candidate(row: Any) -> CandidateAlert:
+    raw_time = getattr(row, "event_time", None) or getattr(row, "created_at", None)
+
+    aff_hosts = tuple(getattr(row, "affected_hosts", ()) or ())
+    aff_ips = tuple(getattr(row, "affected_ips", ()) or ())
+    aff_users = tuple(getattr(row, "affected_users", ()) or ())
+    aff_assets = tuple(getattr(row, "affected_assets", ()) or ())
+
     return CandidateAlert(
         id=row.id,
         tenant_id=row.tenant_id,
-        title=row.title,
+        title=row.title or "Untitled alert",
         severity=row.severity or "info",
-        event_time=row.event_time,
+        event_time=_ensure_utc(raw_time),
         mitre_techniques=tuple(row.mitre_techniques or ()),
-        affected_users=tuple(row.affected_users or ()),
-        affected_hosts=tuple(row.affected_hosts or ()),
-        affected_ips=tuple(row.affected_ips or ()),
-        affected_assets=tuple(row.affected_assets or ()),
-        connector_type=row.connector_type,
-        source_event_ids=tuple(row.source_event_ids or ()),
+        affected_users=aff_users,
+        affected_hosts=aff_hosts,
+        affected_ips=aff_ips,
+        affected_assets=aff_assets,
+        connector_type=getattr(row, "connector_type", None),
+        source_event_ids=tuple(getattr(row, "source_event_ids", ()) or ()),
     )
