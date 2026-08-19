@@ -9,6 +9,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \                                                                                                                                                        
         libffi-dev \                                                                                                                                                                          
         libssl-dev \
+        libcairo2 \
+        libpango-1.0-0 \
+        libpangocairo-1.0-0 \
+        libgdk-pixbuf-2.0-0 \
+        shared-mime-info \
+        fonts-nanum \
+        fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir poetry==1.7.1 \
@@ -45,6 +52,7 @@ RUN set -eux; \
             "aiokafka>=0.10,<0.11" \
             "qdrant-client[fastembed]>=1.9,<2" \
             "markdown>=3.5,<4" \
+            "weasyprint" \
             "opentelemetry-sdk>=1.24,<2" \
             "opentelemetry-instrumentation-fastapi>=0.45b0" \
             "opentelemetry-instrumentation-httpx>=0.45b0" \
@@ -59,7 +67,7 @@ RUN set -eux; \
 # Also assert that the langgraph version on disk exposes the ``START``
 # sentinel — langgraph 0.0.x silently lacked it, which previously crashed the
 # agents service at boot with ``ImportError: cannot import name 'START'``.
-RUN python -c "import opentelemetry, langgraph, fastapi, sqlalchemy, asyncpg, redis, httpx, structlog, apscheduler, yaml, cryptography, cffi; from langgraph.graph import END, START, StateGraph"
+RUN python -c "import opentelemetry, langgraph, fastapi, sqlalchemy, asyncpg, redis, httpx, structlog, apscheduler, yaml, cryptography, cffi, weasyprint; from langgraph.graph import END, START, StateGraph"
 
 COPY app/ ./app/
 

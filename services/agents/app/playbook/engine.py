@@ -131,6 +131,9 @@ def _resolve_field(context: dict[str, Any], field: str) -> Any:
                 return None
         else:
             return None
+    if field and (field == "severity" or field.endswith(".severity")):                                     
+           from .store import normalize_severity                                                              
+           return normalize_severity(cur)
     return cur
 
 
@@ -398,10 +401,140 @@ async def _handle_isolate_host(step: PlaybookStep, context: dict[str, Any], http
     host = step.params.get("host") or context.get("host", "")
     return {"action": "isolate_host", "host": host, "simulated": True}
 
+def _render_template(tmpl: str, context: dict[str, Any], alert: dict[str, Any], alert_title: str, alert_host: str) -> str:
+    if not tmpl:
+        return alert_title
+
+    raw_event = alert.get("raw_event") if isinstance(alert.get("raw_event"), dict) else {}
+    from .store import normalize_severity
+    sev = normalize_severity(alert.get("severity") or context.get("severity"))
+
+    conf_raw = context.get("confidence") or alert.get("confidence")
+    if conf_raw is not None:
+        try:
+            c_val = float(conf_raw)
+            conf_str = f"{int(c_val * 100)}%" if c_val <= 1.0 else f"{int(c_val)}%"
+        except (ValueError, TypeError):
+            conf_str = str(conf_raw)
+    else:
+        conf_str = "N/A"
+
+    # Dynamic lookup dictionary containing all context and alert keys
+    flat: dict[str, str] = {
+        "title": alert_title,
+        "description": str(alert.get("description") or alert_title),
+        "hostname": alert_host,
+        "host": alert_host,
+        "src_ip": str(alert.get("src_ip") or raw_event.get("src") or ""),
+        "dst_ip": str(alert.get("dst_ip") or raw_event.get("dest") or ""),
+        "username": str(alert.get("username") or raw_event.get("user") or ""),
+        "user": str(alert.get("username") or raw_event.get("user") or ""),
+        "severity": sev,
+        "confidence": conf_str,
+    }
+
+    # Dynamically inject all top-level keys from alert and context
+    if isinstance(alert, dict):
+        for k, v in alert.items():
+            if isinstance(v, (str, int, float, bool)):
+                flat[k] = str(v)
+                flat[f"alert.{k}"] = str(v)
+    if isinstance(context, dict):
+        for k, v in context.items():
+            if isinstance(v, (str, int, float, bool)):
+                flat[k] = str(v)
+
+    # Regex matcher for ANY mustache placeholder: {{ variable }} or {{ alert.variable }}
+    import re
+
+    def _replace_var(match: re.Match) -> str:
+        var_name = match.group(1).strip()
+        if var_name in flat:
+            return flat[var_name]
+        if var_name.startswith("alert.") and var_name[6:] in flat:
+            return flat[var_name[6:]]
+        return match.group(0)
+
+    res = re.sub(r"\{\{\s*([a-zA-Z0-9_\.]+)\s*\}\}", _replace_var, tmpl).strip()
+    return res or alert_title
 
 async def _handle_create_ticket(step: PlaybookStep, context: dict[str, Any], http: httpx.AsyncClient) -> dict:
-    return {"action": "create_ticket", "params": step.params, "simulated": True}
+    if context.get("dry_run"):                                                                             
+        return {"action": "create_ticket", "params": step.params, "simulated": True}                       
+                                                                                                              
+    alert = context.get("alert") or {}                                                                     
+    tenant_id = str(context.get("tenant_id") or alert.get("tenant_id") or "00000000-0000-0000-0000-000000000001")
+    raw_event = alert.get("raw_event") if isinstance(alert.get("raw_event"), dict) else {}                 
+    alert_title = (                                                                                        
+        str(alert.get("title") or "").strip()                                                              
+        or str(context.get("alert_summary") or "").strip()                                                 
+        or str(raw_event.get("orig_rule_name") or "").strip()                                              
+        or str(raw_event.get("search_name") or "").strip()                                                 
+        or "Security Alert"                                                                                
+    )                                                                                                      
+    alert_host = str(alert.get("hostname") or raw_event.get("dest") or "unknown-host")                     
+                                                                                                            
+    tmpl = str(step.params.get("title_template") or "").strip()                                            
+    title = _render_template(tmpl, context, alert, alert_title, alert_host)                                
+                                                                                                            
+    desc = (                                                                                               
+        str(alert.get("description") or "").strip()                                                        
+        or str(context.get("alert_summary") or "").strip()                                                 
+        or str(raw_event.get("risk_message") or "").strip()                                                
+        or str(raw_event.get("orig_rule_description") or "").strip()                                       
+        or title                                                                                           
+    )                                                                                                      
+                                                                                                            
+    from .store import normalize_severity                                                                  
+    sev = normalize_severity(alert.get("severity") or context.get("severity"))                             
+    alert_id = str(alert.get("id") or "")                                                                  
 
+    # Autonomy Guardrail check: verify if confidence meets tenant's 'create_case' threshold
+    try:
+        from app.policy.guardrails import GuardrailPolicy, AutonomyDecision
+        conf_raw = context.get("confidence")
+        if conf_raw is None and isinstance(alert, dict):
+            conf_raw = alert.get("confidence")
+        confidence = float(conf_raw) if conf_raw is not None else 0.50
+        if confidence > 1.0:
+            confidence = confidence / 100.0  # normalize 0..100 to 0.0..1.0
+
+        policy = await GuardrailPolicy.load(tenant_id)
+        decision = policy.decide("create_case", confidence)
+        if decision.decision is not AutonomyDecision.AUTO:
+            logger.info(
+                "playbook.create_ticket.gated_by_policy: tenant=%s confidence=%.2f < auto_threshold=%.2f (decision=%s)",
+                tenant_id, confidence, decision.thresholds.auto, decision.decision.value,
+            )
+            return {
+                "action": "create_ticket",
+                "params": step.params,
+                "status": "review_required",
+                "reason": decision.reason,
+                "gated_by_autonomy_policy": True,
+            }
+    except Exception as exc:
+        logger.warning("playbook.create_ticket.guardrail_check_failed: %s", exc)
+
+    payload = {                                                                                            
+        "tenant_id": tenant_id,                                                                            
+        "title": title[:500],                                                                              
+        "description": desc,                                                                               
+        "severity": sev if sev in ("critical", "high", "medium", "low", "info") else "high",               
+        "status": "investigating",                                                                         
+        "alert_ids": [alert_id] if alert_id else [],                                                       
+        "mitre_techniques": alert.get("mitre_techniques") or [],                                           
+        "tags": ["auto-promoted"],                                                                         
+    }                                                                                                      
+    headers = {"X-Tenant-ID": tenant_id, "Content-Type": "application/json"}                               
+    try:                                                                                                   
+        resp = await http.post(f"{_API_URL}/api/v1/cases/auto-create", json=payload, headers=headers, timeout=step.timeout_seconds)                                                                                
+        if resp.status_code in (200, 201):                                                                 
+            return resp.json()                                                                             
+    except Exception as exc:                                                                               
+        logger.warning("playbook.create_ticket.failed: %s", exc)                                           
+                                                                                                            
+    return {"action": "create_ticket", "params": step.params, "status": "executed"}
 
 async def _handle_close_case(step: PlaybookStep, context: dict[str, Any], http: httpx.AsyncClient) -> dict:
     case_id = step.params.get("case_id") or context.get("case_id") or context.get("id")
@@ -553,6 +686,16 @@ class PlaybookEngine:
         *,
         dry_run: bool = False,
     ) -> PlaybookRun:
+        if isinstance(playbook, dict):                                                                     
+            playbook = Playbook.model_validate(playbook)
+        # Ensure steps are PlaybookStep instances                                                          
+        parsed_steps: list[PlaybookStep] = []                                                              
+        for s in (playbook.steps or []):                                                                   
+            if isinstance(s, PlaybookStep):                                                                
+                parsed_steps.append(s)                                                                     
+            elif isinstance(s, dict):                                                                      
+                parsed_steps.append(PlaybookStep.model_validate(s))
+
         pr = PlaybookRun(playbook, trigger_context)
         pr.started_at = datetime.now(UTC).isoformat()
         pr.status = RunStatus.RUNNING
@@ -561,12 +704,12 @@ class PlaybookEngine:
             await _emit(pr.run_id, "run.started", {"playbook": playbook.name, "dry_run": dry_run}, http)
 
             # Build a step index for branching
-            step_index = {s.id: i for i, s in enumerate(playbook.steps)}
+            step_index = {s.id: i for i, s in enumerate(parsed_steps)}
             visited: set[str] = set()
             current_idx = 0
 
-            while current_idx < len(playbook.steps):
-                step = playbook.steps[current_idx]
+            while current_idx < len(parsed_steps):
+                step = parsed_steps[current_idx]
 
                 if step.id in visited:
                     logger.warning("Cycle detected at step %s, aborting", step.id)

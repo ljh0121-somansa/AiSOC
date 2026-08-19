@@ -402,10 +402,25 @@ async def _stream_llm(system: str, user: str, model: str) -> AsyncIterator[str]:
         return
 
     llm = ChatOpenAI(model=model, temperature=0.2, streaming=True)
+    found_think_end = False
+    buffer = ""
     async for chunk in safe_astream(llm, [SystemMessage(content=system), HumanMessage(content=user)]):
-        if hasattr(chunk, "content") and chunk.content:
-            yield chunk.content if isinstance(chunk.content, str) else str(chunk.content)
+        if not hasattr(chunk, "content") or not chunk.content:
+            continue
 
+        text = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
+
+        if found_think_end:
+            yield text
+        else:
+            buffer += text
+
+            if "</think>" in buffer:
+                found_think_end = True
+                after_think = buffer.split("</think>", 1)[1].lstrip()
+                if after_think:
+                    yield after_think
+                buffer = ""
 
 def _fallback_response(system: str, user: str) -> str:
     """Deterministic offline response so the contextual UI works without an LLM."""

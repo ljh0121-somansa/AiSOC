@@ -1665,8 +1665,20 @@ export const casesApi = {
 
   /** Trigger a browser download of the PDF report. */
   downloadReportPdf: async (caseId: string, runId: string): Promise<void> => {
+    const token = typeof window !== 'undefined' 
+      ? localStorage.getItem('aisoc.responder.accessToken') 
+      : null;
+    if (!token) {
+      console.warn('인증 토큰이 없습니다. 다시 로그인해 주세요.');
+      return;
+    }
+
     const resp = await fetch(`${API_BASE}/api/v1/cases/${caseId}/investigations/${runId}/report.pdf`, {
-      headers: { 'X-Tenant-Id': TENANT_ID },
+      method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'X-Tenant-Id': TENANT_ID
+        },
     });
     if (!resp.ok) {
       const err = await resp.text().catch(() => resp.statusText);
@@ -3054,7 +3066,7 @@ export interface HuntResult {
   timestamp: string;
   source: string;
   severity?: AlertSeverity;
-  fields: Record<string, unknown>;
+  raw: Record<string, unknown>;
   highlight?: string;
 }
 

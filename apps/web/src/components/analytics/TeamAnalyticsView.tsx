@@ -93,7 +93,6 @@ export function TeamAnalyticsView() {
 
   const demoActive = isDemoMode();
   const analystsList = demoActive ? ANALYSTS : [];
-  const achievementsList = demoActive ? ACHIEVEMENTS : [];
 
   const totalCases = analystsList.reduce((s, a) => s + a.casesClosed, 0);
   const avgResolution = analystsList.length > 0 ? Math.round(analystsList.reduce((s, a) => s + a.avgResolutionMin, 0) / analystsList.length) : 0;

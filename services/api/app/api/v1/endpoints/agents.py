@@ -39,6 +39,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from fastapi import HTTPException
 
 from app.api.v1.deps import AuthUser, DBSession, require_permission
 from app.api.v1.endpoints.connectors import _fetch_catalog, _safe_log_val
@@ -240,22 +241,16 @@ async def agent_alert_investigate(
             if resp.status_code == 200:
                 return resp.json()
             logger.warning("agents.proxy.investigate_failed status=%s", resp.status_code)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("agents.proxy.investigate_error err=%s", exc)
-
-    # Fallback if agents service is down/unreachable
-    alert_id = str(request.get("alertId") or request.get("alert_id") or "ALT-UNKNOWN")
-    return {
-        "id": "inv-fallback",
-        "alertId": alert_id,
-        "status": "completed",
-        "findings": f"## AI 알럿 분석 요약 ({alert_id})\n\n[agents 서비스 연동 대기 중] 기본 분석 완료.",
-        "recommendations": ["영향을 받는 단말 장비를 네트워크에서 즉시 격리하십시오."],
-        "actions": [{"type": "isolate_endpoint", "target": "DESKTOP-ABC123", "status": "pending"}],
-        "startedAt": "",
-        "completedAt": "",
-        "cached": False,
-    }
+            raise HTTPException(
+                status_code=resp.status_code, 
+                detail="AI 에이전트 조사 서비스 응답에 실패했습니다."
+            )
+    except Exception as exc:  # [상황 3] 통신 자체가 실패한 경우 (try 블록 내부에서 예외 발생)
+        logger.error("agents.proxy.investigate_error err=%s", exc)
+        raise HTTPException(
+            status_code=503, 
+            detail="AI 에이전트 서비스에 연결할 수 없습니다."
+        )
 
 
 # -------------------------------------------------------------------- endpoints

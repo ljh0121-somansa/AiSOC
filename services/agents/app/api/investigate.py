@@ -24,6 +24,7 @@ import structlog
 from fastapi import APIRouter, BackgroundTasks, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
+from fastapi import status
 
 from app.investigator import InvestigatorOrchestrator
 from app.orchestrator.router import RouterOrchestrator
@@ -227,12 +228,22 @@ async def _run_and_store(run_id: str, case_id: str, req: InvestigateRequest) -> 
                 # Broadcast to realtime → WebSocket clients
                 await _emit_event(run_id, req.tenant_id, event)
 
-            elif event.get("type") == "done":
+            elif event.get("type") in ("done", "error"):
                 state_data = event.get("state", {})
+                has_error = any(item.get("kind") == "error" for item in audit_log)
+    
+                if has_error or state_data.get("status") == "failed" or event.get("type") == "error":
+                    final_status = "failed"
+                    # audit_log에서 실패 원인 요약 문구 추출
+                    last_error_log = next((item.get("summary") for item in reversed(audit_log) if item.get("kind") == "error"), "Investigation failed")
+                    final_error = state_data.get("error") or last_error_log
+                else:
+                    final_status = "completed"
+                    final_error = None
                 await _update_run(
                     run_id,
                     {
-                        "status": "completed",
+                        "status": final_status,
                         "report_md": state_data.get("report_md", ""),
                         "report_html": state_data.get("report_html", ""),
                         "audit_log": audit_log,
@@ -240,34 +251,19 @@ async def _run_and_store(run_id: str, case_id: str, req: InvestigateRequest) -> 
                         "forensic": state_data.get("forensic", {}),
                         "responder": state_data.get("responder", {}),
                         "completed_at": datetime.utcnow().isoformat(),
-                        "error": None,
+                        "error": final_error,
                     }
                 )
                 await _emit_event(
                     run_id,
                     req.tenant_id,
                     {
-                        "kind": "completed",
+                        "kind": "completed" if final_status == "completed" else "error",
                         "agent": "orchestrator",
-                        "summary": "Investigation completed",
-                        "data": {"status": "completed"},
+                        "summary": final_error if final_status == "failed" else "Investigation completed",
+                        "data": {"status": final_status, "error": final_error},
                     },
                 )
-
-            elif event.get("type") == "error":
-                err_msg = event.get("error", "Unknown error")
-                await _update_run(run_id, {"status": "failed", "error": err_msg})
-                await _emit_event(
-                    run_id,
-                    req.tenant_id,
-                    {
-                        "kind": "error",
-                        "agent": "orchestrator",
-                        "summary": err_msg,
-                        "data": {"status": "failed"},
-                    },
-                )
-
     except Exception as exc:  # noqa: BLE001
         logger.error("investigation_bg_task failed", run_id=run_id, error=str(exc))
         await _update_run(run_id, {"status": "failed", "error": str(exc)})
@@ -306,48 +302,10 @@ class AgentAlertInvestigateRequest(BaseModel):
 
 
 def _alert_investigate_fallback(alert_id: str, alert_data: dict[str, Any] | None = None) -> dict[str, Any]:
-    title = alert_data.get("title") if alert_data else f"알럿 ({alert_id})"
-    return {
-        "id": f"inv-{uuid4().hex[:8]}",
-        "alertId": alert_id,
-        "status": "completed",
-        "findings": f"""## AI 알럿 분석 요약
-
-**위협 분류:** 고위험 이상 행위 탐지 (Advanced Threat Activity) - 높은 신뢰도
-
-### 개요
-알럿({alert_id}: {title})에 대한 1차 수사 결과, 인가되지 않은 권한 남용 및 의심스러운 스크립트 실행 정황이 포착되었습니다.
-
-### 주요 발견 사항 (Key Findings)
-1. **최초 접근 경로**: 식별된 비정상 IP/계정으로부터의 자격 증명 남용 시도
-2. **실행 행위**: 난독화된 명령어/PowerShell 스크립트 실행 및 추가 페이로드 다운로드 시도
-3. **C2 통신 정황**: 외부 주소로 암호화된 C2 채널 형성 시도
-4. **측면 이동 위험**: 해당 계정의 네트워크 내 추가 시스템 접근 권한 확인
-
-### MITRE ATT&CK 맵핑
-- T1059.001 (Command and Scripting Interpreter: PowerShell) → 활성
-- T1027 (Obfuscated Files or Information) → 활성
-- T1071 (Application Layer Protocol) → 활성
-
-### 추천 대응 조치
-1. 영향을 받는 단말(Endpoint) 즉시 네트워크 격리
-2. 경계 방화벽에서 의심 외부 IP/도메인 차단
-3. 관련 계정 패스워드 재설정 및 세션 강제 종료""",
-        "recommendations": [
-            "영향을 받는 단말 장비를 네트워크에서 즉시 격리하십시오.",
-            "경계 방화벽 및 DNS 수준에서 의심 C2 IP/도메인을 차단하십시오.",
-            "관련 사용자 계정의 비밀번호를 즉시 재설정하십시오.",
-            "전사 시스템을 대상으로 유사한 스크립트 실행 패턴을 추가 조사하십시오.",
-        ],
-        "actions": [
-            {"type": "isolate_endpoint", "target": "DESKTOP-ABC123", "status": "pending"},
-            {"type": "block_ip", "target": "185.220.101.45", "status": "pending"},
-            {"type": "block_domain", "target": "payload-c2.xyz", "status": "pending"},
-        ],
-        "startedAt": datetime.now(UTC).isoformat(),
-        "completedAt": datetime.now(UTC).isoformat(),
-        "cached": False,
-    }
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="LLM 서비스를 이용할 수 없습니다. (Fallback 요약 생성이 비활성화됨)"
+    )
 
 
 @router.post("/agents/investigate", summary="Run single-alert AI investigation with ResponseCache")
@@ -390,9 +348,26 @@ async def agent_alert_investigate(body: AgentAlertInvestigateRequest) -> dict[st
             response = await safe_ainvoke(llm, messages)
             text = response.content if isinstance(response.content, str) else str(response.content)
 
-            match = re.search(r"\{[\s\S]*\}", text)
-            clean_json = match.group(0) if match else text
-            parsed = json.loads(clean_json)
+            cleaned_text = text.strip()
+            if "</think>" in cleaned_text:
+                cleaned_text = cleaned_text.split("</think>", 1)[1].strip()
+            else:
+                cleaned_text = re.sub(r"<think>[\s\S]*?</think>", "", cleaned_text).strip()
+
+            # 마크다운 ```json ... ``` 펜스 제거
+            cleaned_text = re.sub(r"^```(?:json)?\s*", "", cleaned_text, flags=re.IGNORECASE)
+            cleaned_text = re.sub(r"\s*```$", "", cleaned_text).strip()
+
+            # 완벽한 JSON 객체만 추출
+            match = re.search(r"\{[\s\S]*\}", cleaned_text)
+            json_target = match.group(0) if match else cleaned_text
+
+            try:
+                parsed = json.loads(json_target)
+            except json.JSONDecodeError:
+                # Extra data가 뒤에 남아있을 경우 첫 번째 유효한 JSON만 추출
+                decoder = json.JSONDecoder()
+                parsed, _ = decoder.raw_decode(json_target)
 
             res_payload = {
                 "id": f"inv-{uuid4().hex[:8]}",

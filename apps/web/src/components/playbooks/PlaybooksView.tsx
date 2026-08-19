@@ -380,34 +380,7 @@ function CommunityPlaybookCard({ playbook }: { playbook: CommunityPlaybook }) {
   );
 }
 
-/* ─────────────────────────── Mock Data ─────────────────────────── */
-
-const MOCK_PLAYBOOKS: Playbook[] = [
-  {
-    id: 'pb-001', name: 'Phishing Triage', description: 'Automated triage for phishing alerts — extracts IOCs, checks reputation, and escalates confirmed threats.',
-    version: '1.3', tags: ['phishing', 'email', 'triage'], author: 'soc-team',
-    trigger: { on: 'alert', severity: ['high', 'critical'], tags: ['phishing'] },
-    steps: [], enabled: true, created_at: '2026-04-15T10:00:00Z', updated_at: '2026-05-01T08:30:00Z',
-  },
-  {
-    id: 'pb-002', name: 'Endpoint Isolation', description: 'Isolates a compromised endpoint via EDR API, creates a case, and notifies the IR channel.',
-    version: '2.0', tags: ['edr', 'isolation', 'response'], author: 'ir-lead',
-    trigger: { on: 'manual' },
-    steps: [], enabled: true, created_at: '2026-03-20T14:00:00Z', updated_at: '2026-04-28T16:00:00Z',
-  },
-  {
-    id: 'pb-003', name: 'Identity Compromise', description: 'Responds to suspicious identity events — resets credentials, revokes sessions, and enriches with threat intel.',
-    version: '1.1', tags: ['identity', 'iam', 'credential-reset'], author: 'soc-team',
-    trigger: { on: 'alert', severity: ['critical'], tags: ['identity'] },
-    steps: [], enabled: true, created_at: '2026-04-01T09:00:00Z', updated_at: '2026-05-04T12:00:00Z',
-  },
-  {
-    id: 'pb-004', name: 'Cloud IAM Audit', description: 'Periodic audit of IAM roles and policies across AWS, GCP, and Azure — flags over-privileged accounts.',
-    version: '1.0', tags: ['cloud', 'iam', 'audit'], author: 'cloud-sec',
-    trigger: { on: 'schedule', cron: '0 6 * * 1' },
-    steps: [], enabled: false, created_at: '2026-02-10T11:00:00Z', updated_at: '2026-04-20T15:00:00Z',
-  },
-];
+const DEFAULT_PLAYBOOKS: Playbook[] = [];
 
 /* ─────────────────────────── Main ─────────────────────────── */
 
@@ -415,7 +388,7 @@ export function PlaybooksView() {
   const [tab, setTab] = useState<'playbooks' | 'runs' | 'community'>('playbooks');
   const { data, isLoading, error } = useSWR<Playbook[]>('/api/v1/playbooks', fetcher, {
     refreshInterval: 30000,
-    fallbackData: MOCK_PLAYBOOKS,
+    fallbackData: DEFAULT_PLAYBOOKS,
   });
 
   // WS-F3: track the active filter snapshot so SavedViewsBar can capture it,
@@ -506,7 +479,7 @@ export function PlaybooksView() {
 
           {error && (
             <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-4 py-2 text-xs text-amber-200">
-              Agents API unreachable — showing demo playbooks so you can explore the workflow.
+              Agents API unreachable
             </div>
           )}
 

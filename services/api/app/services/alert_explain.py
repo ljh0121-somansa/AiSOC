@@ -54,6 +54,8 @@ from typing import Any
 import httpx
 from sqlalchemy import and_, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import HTTPException
+from fastapi import status
 
 from app.core.airgap import AirgapViolation, enforce_airgap_for_url
 from app.models.alert import Alert
@@ -706,7 +708,6 @@ class _LlmCallResult:
     latency_ms: float
     error: str | None
 
-
 async def _call_llm_for_summary(
     *,
     alert: Alert,
@@ -798,11 +799,11 @@ async def _call_llm_for_summary(
         )
 
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=50, verify=False) as client:
             resp = await client.post(
                 url,
                 headers={"Authorization": f"Bearer {llm_config.api_key}"},
-                json={"model": llm_config.model, "messages": messages, "max_tokens": 360},
+                json={"model": llm_config.model, "messages": messages, "max_tokens": 5000},
             )
             resp.raise_for_status()
             payload = resp.json()
@@ -816,9 +817,22 @@ async def _call_llm_for_summary(
             error=str(exc),
         )
 
-    text = ""
     try:
-        text = (payload["choices"][0]["message"]["content"] or "").strip()
+        
+        raw_text = (payload["choices"][0]["message"]["content"] or "").strip()
+        
+        # 🟢 1. Qwen / DeepSeek 모델의 <think>...</think> 추론 태그 정제
+        if "</think>" in raw_text:
+            cleaned_text = raw_text.split("</think>", 1)[1].strip()
+        else:
+            cleaned_text = re.sub(r"<think>[\s\S]*?</think>", "", raw_text).strip()
+
+        # 🟢 2. 마크다운 펜스(```json ... ``` 또는 ``` ... ```) 제거
+        cleaned_text = re.sub(r"^```(?:json)?\s*", "", cleaned_text, flags=re.IGNORECASE)
+        cleaned_text = re.sub(r"\s*```$", "", cleaned_text).strip()
+
+        text = cleaned_text
+
     except (KeyError, IndexError, TypeError):
         text = ""
 
@@ -978,7 +992,10 @@ async def generate_alert_explanation(
             summary = call.text
             llm_used = True
         else:
-            llm_reason = call.error or "llm_returned_empty_response"
+            raise HTTPException(                                                                                                                                       
+                 status_code=status.HTTP_502_BAD_GATEWAY,                                                                                                               
+                 detail=f"LLM Generation Failed: {call.error or 'empty response'}"                                                                                      
+             )
         # Always attempt to book the cost — _record_llm_cost no-ops on
         # failed calls so we don't pollute the cost table with zero
         # rows.

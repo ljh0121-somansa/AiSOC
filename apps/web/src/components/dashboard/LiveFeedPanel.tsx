@@ -68,65 +68,7 @@ const SEVERITY_COLORS: Record<Severity, string> = {
 
 // Deterministic base — no Date.now() to avoid SSR hydration mismatches.
 // The live-updating clock inside the component handles "X seconds ago" rendering.
-const DEMO_BASE = new Date('2026-05-06T12:00:00Z').getTime();
-const DEMO_EVENTS: LiveEvent[] = [
-  {
-    id: 'demo-1',
-    severity: 'critical',
-    text: 'Ransomware indicators detected on DESKTOP-7892',
-    source: 'CrowdStrike',
-    receivedAt: DEMO_BASE - 2_000,
-    isDemo: true,
-  },
-  {
-    id: 'demo-2',
-    severity: 'high',
-    text: 'Impossible travel: admin login from US then RU within 4 min',
-    source: 'Okta',
-    receivedAt: DEMO_BASE - 14_000,
-    isDemo: true,
-  },
-  {
-    id: 'demo-3',
-    severity: 'high',
-    text: 'IAM role assumed from untrusted account 319…847',
-    source: 'AWS CloudTrail',
-    receivedAt: DEMO_BASE - 28_000,
-    isDemo: true,
-  },
-  {
-    id: 'demo-4',
-    severity: 'medium',
-    text: 'OAuth app granted Mail.ReadWrite across 37 mailboxes',
-    source: 'Microsoft 365',
-    receivedAt: DEMO_BASE - 42_000,
-    isDemo: true,
-  },
-  {
-    id: 'demo-5',
-    severity: 'medium',
-    text: 'Anomalous GCS bucket policy change in prod project',
-    source: 'GCP SCC',
-    receivedAt: DEMO_BASE - 58_000,
-    isDemo: true,
-  },
-  {
-    id: 'demo-6',
-    severity: 'low',
-    text: 'New deploy key added to private repo infra-terraform',
-    source: 'GitHub Audit',
-    receivedAt: DEMO_BASE - 76_000,
-    isDemo: true,
-  },
-  {
-    id: 'demo-7',
-    severity: 'low',
-    text: 'SPL federated search matched 12 indicators across Splunk',
-    source: 'Sentinel',
-    receivedAt: DEMO_BASE - 95_000,
-    isDemo: true,
-  },
-];
+const DEFAULT_EVENTS: LiveEvent[] = [];
 
 const MAX_VISIBLE = 12;
 
@@ -226,7 +168,7 @@ export function LiveFeedPanel() {
     if (hasReal) return events;
     // Refresh demo timestamps so they don't drift to "5h ago" while the dev
     // sits on the page with no realtime backend running.
-    return DEMO_EVENTS.map((e, i) => ({
+    return DEFAULT_EVENTS.map((e, i) => ({
       ...e,
       receivedAt: now - (i + 1) * 8_000,
     }));
@@ -257,7 +199,7 @@ export function LiveFeedPanel() {
           )}
           title={
             pill.tone === 'demo'
-              ? 'Realtime service unreachable or no events received yet — showing demo data'
+              ? 'Realtime service unreachable or no events received yet'
               : `WebSocket: ${status}`
           }
         >

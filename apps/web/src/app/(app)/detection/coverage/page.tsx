@@ -1,4 +1,4 @@
-import { CoverageView } from '@/components/detections/CoverageView';
+import { MitreRuleHeatmap } from '@/components/detections/MitreRuleHeatmap';
 
 export const metadata = {
   title: 'MITRE ATT&CK Coverage',
@@ -7,5 +7,5 @@ export const metadata = {
 };
 
 export default function CoveragePage() {
-  return <CoverageView />;
+  return <MitreRuleHeatmap />
 }

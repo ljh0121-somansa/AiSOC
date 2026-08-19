@@ -228,53 +228,15 @@ function RoleForm({ allPermissions, initial, onClose }: RoleFormProps) {
   );
 }
 
-const MOCK_PERMISSIONS: Permission[] = [
-  { id: 'p1', name: 'alerts.read', description: 'View alerts', category: 'alerts' },
-  { id: 'p2', name: 'alerts.write', description: 'Update alert status', category: 'alerts' },
-  { id: 'p3', name: 'cases.read', description: 'View cases', category: 'cases' },
-  { id: 'p4', name: 'cases.write', description: 'Create and edit cases', category: 'cases' },
-  { id: 'p5', name: 'playbooks.read', description: 'View playbooks', category: 'playbooks' },
-  { id: 'p6', name: 'playbooks.execute', description: 'Run playbooks', category: 'playbooks' },
-  { id: 'p7', name: 'detections.read', description: 'View detection rules', category: 'detections' },
-  { id: 'p8', name: 'detections.write', description: 'Manage detection rules', category: 'detections' },
-  { id: 'p9', name: 'connectors.read', description: 'View connectors', category: 'connectors' },
-  { id: 'p10', name: 'connectors.write', description: 'Manage connectors', category: 'connectors' },
-  { id: 'p11', name: 'admin.settings', description: 'Manage settings', category: 'admin' },
-  { id: 'p12', name: 'audit.read', description: 'View audit logs', category: 'audit' },
-];
-
-const MOCK_ROLES: Role[] = [
-  {
-    id: 'role-1', tenant_id: 'default', name: 'SOC Analyst', description: 'Front-line analyst with read access to alerts, cases, and playbooks',
-    is_system: true,
-    permissions: MOCK_PERMISSIONS.filter((p) => ['p1', 'p3', 'p5', 'p7', 'p9', 'p12'].includes(p.id)),
-  },
-  {
-    id: 'role-2', tenant_id: 'default', name: 'SOC Lead', description: 'Senior analyst with write access and playbook execution',
-    is_system: true,
-    permissions: MOCK_PERMISSIONS.filter((p) => ['p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7', 'p9', 'p12'].includes(p.id)),
-  },
-  {
-    id: 'role-3', tenant_id: 'default', name: 'Admin', description: 'Full access to all features and settings',
-    is_system: true,
-    permissions: MOCK_PERMISSIONS,
-  },
-  {
-    id: 'role-4', tenant_id: 'default', name: 'Detection Engineer', description: 'Manages detection rules and connector integrations',
-    is_system: false,
-    permissions: MOCK_PERMISSIONS.filter((p) => ['p1', 'p7', 'p8', 'p9', 'p10'].includes(p.id)),
-  },
-];
-
 export function RBACView() {
   const currentUser = authApi.currentUser();
   const canWriteRoles = currentUser?.role === 'admin' || currentUser?.role === 'platform_admin' || currentUser?.role === 'tenant_admin' || currentUser?.role === 'soc_lead';
 
   const { data: roles, error: rolesError } = useSWR<Role[]>('/api/v1/rbac/roles', fetcher, {
-    fallbackData: MOCK_ROLES,
+    fallbackData: undefined,
   });
   const { data: permissions } = useSWR<Permission[]>('/api/v1/rbac/permissions', fetcher, {
-    fallbackData: MOCK_PERMISSIONS,
+    fallbackData: undefined,
   });
 
   const [showCreate, setShowCreate] = useState(false);
@@ -309,7 +271,7 @@ export function RBACView() {
 
       {rolesError && (
         <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-4 py-2 text-xs text-amber-200">
-          RBAC API unreachable — showing demo roles so you can explore access control.
+          RBAC API unreachable
         </div>
       )}
 

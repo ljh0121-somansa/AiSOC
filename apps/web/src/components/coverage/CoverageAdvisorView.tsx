@@ -17,23 +17,7 @@ interface Technique {
   recommendation: string;
 }
 
-const TECHNIQUES: Technique[] = [
-  { id: 'T1059',   name: 'Command and Scripting Interpreter', tactic: 'Execution',           status: 'covered', priority: 'low',    recommendation: 'Existing PowerShell & Bash rules active' },
-  { id: 'T1059.001', name: 'PowerShell',                     tactic: 'Execution',           status: 'covered', priority: 'low',    recommendation: 'ScriptBlock logging rule deployed' },
-  { id: 'T1071',   name: 'Application Layer Protocol',       tactic: 'Command & Control',   status: 'partial', priority: 'medium', recommendation: 'Add DNS-over-HTTPS detection rule' },
-  { id: 'T1053',   name: 'Scheduled Task/Job',               tactic: 'Persistence',         status: 'gap',     priority: 'high',   recommendation: 'Deploy schtasks / cron anomaly detection' },
-  { id: 'T1078',   name: 'Valid Accounts',                   tactic: 'Initial Access',      status: 'partial', priority: 'high',   recommendation: 'Correlate impossible-travel with auth logs' },
-  { id: 'T1021',   name: 'Remote Services',                  tactic: 'Lateral Movement',    status: 'gap',     priority: 'high',   recommendation: 'Monitor RDP/SSH lateral pivots' },
-  { id: 'T1486',   name: 'Data Encrypted for Impact',        tactic: 'Impact',              status: 'covered', priority: 'low',    recommendation: 'Ransomware canary files active' },
-  { id: 'T1027',   name: 'Obfuscated Files or Information',  tactic: 'Defense Evasion',     status: 'gap',     priority: 'high',   recommendation: 'Add entropy-based payload analysis' },
-  { id: 'T1562',   name: 'Impair Defenses',                  tactic: 'Defense Evasion',     status: 'partial', priority: 'medium', recommendation: 'Detect tamper of EDR services' },
-  { id: 'T1110',   name: 'Brute Force',                      tactic: 'Credential Access',   status: 'covered', priority: 'low',    recommendation: 'Rate-limit rules deployed across tenants' },
-  { id: 'T1048',   name: 'Exfiltration Over Alternative Protocol', tactic: 'Exfiltration',  status: 'gap',     priority: 'high',   recommendation: 'Monitor DNS/ICMP tunneling patterns' },
-  { id: 'T1087',   name: 'Account Discovery',                tactic: 'Discovery',           status: 'partial', priority: 'medium', recommendation: 'Alert on bulk LDAP enumeration' },
-  { id: 'T1547',   name: 'Boot or Logon Autostart Execution',tactic: 'Persistence',         status: 'gap',     priority: 'medium', recommendation: 'Registry run-key change monitoring' },
-  { id: 'T1569',   name: 'System Services',                  tactic: 'Execution',           status: 'covered', priority: 'low',    recommendation: 'Service creation audit rule active' },
-  { id: 'T1190',   name: 'Exploit Public-Facing Application',tactic: 'Initial Access',      status: 'partial', priority: 'high',   recommendation: 'WAF log correlation with CVE feeds' },
-];
+const TECHNIQUES: Technique[] = [];
 
 const STATUS_STYLES: Record<CoverageStatus, { bg: string; text: string; label: string }> = {
   covered: { bg: 'bg-green-500/20', text: 'text-green-400', label: 'Covered' },
@@ -55,16 +39,16 @@ export default function CoverageAdvisorView() {
     ? techniques
     : techniques.filter((t) => t.status === statusFilter);
 
-  const covered = techniques.filter((t) => t.status === 'covered').length;
-  const partial = techniques.filter((t) => t.status === 'partial').length;
-  const gaps = techniques.filter((t) => t.status === 'gap').length;
-  const coveragePct = Math.round(((covered + partial * 0.5) / techniques.length) * 100);
+  //const covered = techniques.filter((t) => t.status === 'covered').length;
+  //const partial = techniques.filter((t) => t.status === 'partial').length;
+  //const gaps = techniques.filter((t) => t.status === 'gap').length;
+  //const coveragePct = Math.round(((covered + partial * 0.5) / techniques.length) * 100);
 
   const summaryCards = [
-    { label: 'Techniques Covered',     value: covered },
-    { label: 'Coverage %',             value: `${coveragePct}%` },
-    { label: 'Critical Gaps',          value: gaps },
-    { label: 'Recommended Detections', value: techniques.filter((t) => t.status !== 'covered').length },
+    { label: 'Techniques Covered',     value: 0 },
+    { label: 'Coverage %',             value: `${0}%` },
+    { label: 'Critical Gaps',          value: 0 },
+    { label: 'Recommended Detections', value: 0 }, // techniques.filter((t) => t.status !== 'covered').length
   ];
 
   return (
