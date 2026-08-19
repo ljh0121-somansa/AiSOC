@@ -31,20 +31,20 @@ logger = structlog.get_logger()
 
 _INSERT_SQL = """
 INSERT INTO alerts (
-    tenant_id, title, description, severity, status,
+    id, tenant_id, title, description, severity, status,
     mitre_tactics, mitre_techniques, iocs, entities, raw_event,
     dedup_hash, confidence, confidence_label, confidence_rationale,
     narrative, anomaly_score, event_time,
     affected_hosts, affected_ips, affected_users
 )
 SELECT
-    $1, $2, $3, $4, 'new',
-    $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb, $9::jsonb,
-    $10::text, $11, $12, $13::jsonb,
-    $14, $15, COALESCE($16, NOW()),
-    $17::jsonb, $18::jsonb, $19::jsonb
+    $1::uuid, $2, $3, $4, $5, 'new',
+    $6::jsonb, $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb,
+    $11::text, $12, $13, $14::jsonb,
+    $15, $16, COALESCE($17, NOW()),
+    $18::jsonb, $19::jsonb, $20::jsonb
 WHERE NOT EXISTS (
-    SELECT 1 FROM alerts WHERE tenant_id = $1 AND dedup_hash = $10::text
+    SELECT 1 FROM alerts WHERE tenant_id = $2 AND dedup_hash = $11::text
 )
 RETURNING id
 """
@@ -136,6 +136,7 @@ class AlertSink:
             async with pool.acquire() as conn:
                 row = await conn.fetchrow(
                     _INSERT_SQL,
+                    str(alert.id),
                     alert.tenant_id,
                     alert.title[:500],
                     alert.description or None,
