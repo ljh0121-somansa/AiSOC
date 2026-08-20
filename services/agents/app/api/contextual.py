@@ -259,7 +259,7 @@ _SYSTEM_PROMPTS: dict[tuple[str, str], str] = {
     ("alerts", "false_positive"): (
         "You are an expert SOC analyst. Decide whether an alert is most likely "
         "a true positive, a false positive, or unknown. Output Markdown with: "
-        "## Verdict (one of: True positive, Likely false positive, Unknown) / "
+        "## Verdict (one of: 진짜 위협(True positive), 오탐 가능성 높음(Likely false positive), 알 수 없음(Unknown)) / "
         "## Confidence (0-100%) / ## Signals supporting TP / "
         "## Signals supporting FP / ## Recommended action."
     ),
@@ -279,7 +279,7 @@ _SYSTEM_PROMPTS: dict[tuple[str, str], str] = {
         "You are an incident commander writing for the C-suite. Produce a one-"
         "paragraph executive summary covering impact, current status, ETA to "
         "resolution, and the single ask of the executive (if any). Plain prose, "
-        "no bullets unless absolutely necessary. Markdown."
+        "no bullets unless absolutely necessary. Markdown. Output in Korean"
     ),
     ("cases", "post_mortem"): (
         "You are a senior SRE writing a blameless post-mortem. Output Markdown "
@@ -301,7 +301,7 @@ _SYSTEM_PROMPTS: dict[tuple[str, str], str] = {
     ),
     ("playbooks", "explain"): (
         "You are a SOC automation engineer. Walk through the given playbook "
-        "step-by-step in plain English. Output Markdown with: ## What it does / "
+        "step-by-step in plain Korean. Output Markdown with: ## What it does / "
         "## Step-by-step / ## Approval gates / ## Rollback path."
     ),
     ("playbooks", "improve"): (
@@ -333,7 +333,13 @@ def _build_messages(req: ContextualActionRequest) -> tuple[str, str]:
             detail=f"Unknown contextual action: page={req.page!r} action={req.action!r}",
         )
 
-    system = _SYSTEM_PROMPTS[key]
+    system = (
+        _SYSTEM_PROMPTS[key] + 
+        "CRITICAL RULE: Keep section headers strictly in English, but ALL explanation prose, body text, "
+        + "and bullet points under each header MUST be written strictly in clear, professional KOREAN."
+        + "\n- LANGUAGE RULE: You MUST write the response in natural, professional Korean for the security analyst UI."
+        + '\nRespond ONLY with a valid JSON object matching this schema: {"response": "Your detailed Markdown analysis in Korean here..."}'
+    )
     entity_blob = _serialize_entity(req.entity, req.entity_id)
 
     user_lines = [
@@ -372,10 +378,16 @@ async def _call_llm(system: str, user: str, model: str) -> tuple[str, int]:
     except ImportError as exc:
         logger.warning("contextual.llm.import_failed", error=str(exc))
         return _fallback_response(system, user), 0
-
-    llm = ChatOpenAI(model=model, temperature=0.2)
+    max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "2048")) 
+    llm = ChatOpenAI(model=model, temperature=0.2, max_tokens=max_tokens, response_format={"type": "json_object"})
     response = await safe_ainvoke(llm, [SystemMessage(content=system), HumanMessage(content=user)])
     text = response.content if isinstance(response.content, str) else str(response.content)
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and "response" in data:
+            text = str(data["response"])
+    except Exception:
+        pass
     tokens = 0
     if hasattr(response, "response_metadata"):
         tokens = response.response_metadata.get("token_usage", {}).get("total_tokens", 0) or 0
@@ -400,12 +412,27 @@ async def _stream_llm(system: str, user: str, model: str) -> AsyncIterator[str]:
         for i in range(0, len(text), 8):
             yield text[i : i + 8]
         return
-
-    llm = ChatOpenAI(model=model, temperature=0.2, streaming=True)
+    max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "2048")) 
+    llm = ChatOpenAI(model=model, temperature=0.2, max_tokens=max_tokens, streaming=True, response_format={"type": "json_object"})
+    buffer = ""
     async for chunk in safe_astream(llm, [SystemMessage(content=system), HumanMessage(content=user)]):
-        if hasattr(chunk, "content") and chunk.content:
-            yield chunk.content if isinstance(chunk.content, str) else str(chunk.content)
+        if not hasattr(chunk, "content") or not chunk.content:
+            continue
 
+        text = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
+        buffer += text
+
+    # Parse complete JSON response and extract markdown from "response" key
+    try:
+        data = json.loads(buffer)
+        if isinstance(data, dict) and "response" in data:
+            final_text = str(data["response"])
+            yield final_text
+            return
+    except Exception:
+        pass
+
+    yield buffer
 
 def _fallback_response(system: str, user: str) -> str:
     """Deterministic offline response so the contextual UI works without an LLM."""

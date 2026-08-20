@@ -47,52 +47,10 @@ class HandoffNotes(BaseModel):
     pending_items: list[str] = Field(default_factory=list)
 
 
-_MOCK_ANALYSTS = {
-    "a1": ShiftAnalyst(id="a1", name="Jordan Lee", role="shift_lead"),
-    "a2": ShiftAnalyst(id="a2", name="Morgan Chen", role="soc_analyst"),
-    "a3": ShiftAnalyst(id="a3", name="Taylor Kim", role="soc_analyst"),
-    "a4": ShiftAnalyst(id="a4", name="Alex Rivera", role="senior_analyst"),
-}
+_DEFAULT_ANALYSTS = {}
 
 _now = datetime.now(UTC)
-_MOCK_SHIFTS: list[dict] = [
-    {
-        "id": "shift-001",
-        "name": "Day Shift – 2026-05-07",
-        "started_at": (_now - timedelta(hours=6)).isoformat(),
-        "ended_at": None,
-        "status": "active",
-        "lead": _MOCK_ANALYSTS["a1"],
-        "analyst_count": 3,
-        "alerts_handled": 47,
-        "escalations": 2,
-        "handoff_notes": None,
-    },
-    {
-        "id": "shift-002",
-        "name": "Night Shift – 2026-05-06",
-        "started_at": (_now - timedelta(hours=18)).isoformat(),
-        "ended_at": (_now - timedelta(hours=6)).isoformat(),
-        "status": "completed",
-        "lead": _MOCK_ANALYSTS["a4"],
-        "analyst_count": 2,
-        "alerts_handled": 31,
-        "escalations": 1,
-        "handoff_notes": "3 open P2 investigations carried over. SentinelOne connector flapping – ops ticket INFRA-412 filed.",
-    },
-    {
-        "id": "shift-003",
-        "name": "Day Shift – 2026-05-06",
-        "started_at": (_now - timedelta(hours=30)).isoformat(),
-        "ended_at": (_now - timedelta(hours=18)).isoformat(),
-        "status": "completed",
-        "lead": _MOCK_ANALYSTS["a1"],
-        "analyst_count": 3,
-        "alerts_handled": 62,
-        "escalations": 4,
-        "handoff_notes": "Major phishing campaign resolved (INC-1042). New Sigma rule deployed for O365 impossible-travel.",
-    },
-]
+_DEFAULT_SHIFTS: list[dict] = []
 
 
 @router.get("", response_model=list[ShiftSummary])
@@ -102,7 +60,7 @@ async def list_shifts(
     limit: int = Query(20, ge=1, le=100),
 ):
     """Return shift summaries, newest first."""
-    shifts = _MOCK_SHIFTS
+    shifts = _DEFAULT_SHIFTS
     if status_filter:
         shifts = [s for s in shifts if s["status"] == status_filter]
     return [ShiftSummary(**s) for s in shifts[:limit]]
@@ -111,7 +69,7 @@ async def list_shifts(
 @router.get("/current", response_model=ShiftSummary)
 async def get_current_shift(current_user: AuthUser):
     """Return the currently active shift."""
-    for s in _MOCK_SHIFTS:
+    for s in _DEFAULT_SHIFTS:
         if s["status"] == "active":
             return ShiftSummary(**s)
     raise HTTPException(status_code=404, detail="No active shift")
@@ -129,13 +87,13 @@ async def create_shift(
         "started_at": datetime.now(UTC).isoformat(),
         "ended_at": None,
         "status": "active",
-        "lead": _MOCK_ANALYSTS.get(body.lead_id or "a1", _MOCK_ANALYSTS["a1"]),
+        "lead": _DEFAULT_ANALYSTS.get(body.lead_id or "a1", _DEFAULT_ANALYSTS["a1"]),
         "analyst_count": max(len(body.analysts), 1),
         "alerts_handled": 0,
         "escalations": 0,
         "handoff_notes": None,
     }
-    _MOCK_SHIFTS.insert(0, new_shift)
+    _DEFAULT_SHIFTS.insert(0, new_shift)
     return ShiftSummary(**new_shift)
 
 
@@ -146,7 +104,7 @@ async def add_handoff_notes(
     current_user: AuthUser,
 ):
     """Attach handoff notes to a shift and mark it completed."""
-    for s in _MOCK_SHIFTS:
+    for s in _DEFAULT_SHIFTS:
         if s["id"] == shift_id:
             s["handoff_notes"] = body.notes
             s["status"] = "completed"

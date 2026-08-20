@@ -55,8 +55,9 @@ You MUST respond with a JSON object and nothing else:
   "risk_category": "storage_exposure" | "security_group_misconfig" |
                    "iam_anomaly" | "unusual_api" | "infra_drift" | "unknown",
   "cloud_provider": "aws" | "azure" | "gcp" | "other",
-  "rationale": "<2-4 sentence explanation>"
+  "rationale": "<2-4 sentence explanation in Korean>"
 }
+- LANGUAGE RULE: To optimize token usage, perform all internal reasoning and JSON keys in English, but you MUST write the "rationale" value in natural, professional Korean for the security analyst UI.
 """
 
 
@@ -201,7 +202,8 @@ async def run_cloud(
     prompt_context = base_context + (("\n" + "\n".join(bundle_lines)) if bundle_lines else "")
 
     model_name = os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or os.getenv("AISOC_LLM_MODEL", "gpt-4o-mini")
-    llm = ChatOpenAI(model=model_name, temperature=0.0, max_tokens=768)
+    llm = ChatOpenAI(model=model_name, temperature=0.0, max_tokens=768, response_format={"type":           
+ "json_object"})
 
     t0 = time.monotonic()
     try:

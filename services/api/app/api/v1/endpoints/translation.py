@@ -249,7 +249,10 @@ async def translate_rule(body: TranslateRequest) -> TranslateResponse:
             detail={"error": "airgap_violation", "message": str(exc)},
         ) from exc
     if not payload:
-        payload = _fallback_templates(body)
+        raise HTTPException(
+            status_code=503, 
+            detail="AI 에이전트 서비스에 연결할 수 없습니다."
+        )
 
     results = [
         TranslationResult(

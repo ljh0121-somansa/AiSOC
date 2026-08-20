@@ -154,7 +154,7 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, options: FetchOptions = {}): Promise<T> {
+export async function request<T>(path: string, options: FetchOptions = {}): Promise<T> {
   const { params, baseUrl, ...fetchOptions } = options;
 
   let url = `${baseUrl ?? API_BASE}${path}`;
@@ -177,16 +177,17 @@ async function request<T>(path: string, options: FetchOptions = {}): Promise<T> 
     ...fetchOptions.headers,
   };
 
-  // Mobile responder PWA auth: if a passkey-issued JWT is present in
-  // localStorage, attach it as a Bearer token. The desktop console relies on
-  // cookies set by the API gateway, so this is purely additive.
+  // Attach JWT Bearer token if present in localStorage. Checks both
+  // 'aisoc_access_token' (desktop console) and 'aisoc.responder.accessToken' (PWA).
   if (typeof window !== 'undefined') {
     try {
       const existing =
         (headers as Record<string, string>).Authorization ??
         (headers as Record<string, string>).authorization;
       if (!existing) {
-        const token = window.localStorage.getItem('aisoc.responder.accessToken');
+        const token =
+          window.localStorage.getItem('aisoc_access_token') ||
+          window.localStorage.getItem(AUTH_TOKEN_KEY);
         if (token) {
           (headers as Record<string, string>).Authorization = `Bearer ${token}`;
         }
@@ -213,6 +214,25 @@ async function request<T>(path: string, options: FetchOptions = {}): Promise<T> 
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => '');
+
+    // Handle 401 Unauthorized globally: if a token has expired or is invalid
+    // ('Could not validate credentials'), clear localStorage and redirect to /login
+    if (
+      response.status === 401 &&
+      typeof window !== 'undefined' &&
+      !window.location.pathname.startsWith('/login')
+    ) {
+      try {
+        window.localStorage.removeItem('aisoc_access_token');
+        window.localStorage.removeItem(AUTH_TOKEN_KEY);
+        window.localStorage.removeItem(AUTH_REFRESH_KEY);
+        window.localStorage.removeItem(AUTH_USER_KEY);
+      } catch {
+        /* ignore */
+      }
+      window.location.href = `/login?next=${encodeURIComponent(window.location.pathname)}`;
+    }
+
     throw new ApiError(
       `API ${response.status} ${response.statusText} — ${path}`,
       response.status,
@@ -261,6 +281,9 @@ function persistAuth(tokens: TokenResponse, user: AuthUser): void {
       window.localStorage.setItem(AUTH_REFRESH_KEY, tokens.refresh_token);
     }
     window.localStorage.setItem(AUTH_USER_KEY, JSON.stringify(user));
+    if (user.tenant_id) {
+      window.localStorage.setItem(ACTIVE_TENANT_KEY, user.tenant_id);
+    }
   } catch {
     /* localStorage unavailable; ignore */
   }
@@ -278,6 +301,7 @@ export const authApi = {
    * + mobile.
    */
   async login(email: string, password: string): Promise<LoginResult> {
+    setActiveTenantId(null);
     const tokens = await request<TokenResponse>('/api/v1/auth/login', {
       method: 'POST',
       body: JSON.stringify({ email, password }),
@@ -293,6 +317,9 @@ export const authApi = {
     }
     const user = await request<AuthUser>('/api/v1/auth/me');
     persistAuth(tokens, user);
+    if (user.tenant_id) {
+      setActiveTenantId(user.tenant_id);
+    }
     return { ...tokens, user };
   },
 
@@ -302,9 +329,20 @@ export const authApi = {
       window.localStorage.removeItem(AUTH_TOKEN_KEY);
       window.localStorage.removeItem(AUTH_REFRESH_KEY);
       window.localStorage.removeItem(AUTH_USER_KEY);
+      window.localStorage.removeItem(ACTIVE_TENANT_KEY);
     } catch {
       /* ignore */
     }
+  },
+
+  async changePassword(currentPassword: string, newPassword: string): Promise<void> {
+    await request<{ message: string }>('/api/v1/auth/me/change-password', {
+      method: 'POST',
+      body: JSON.stringify({
+        current_password: currentPassword,
+        new_password: newPassword,
+      }),
+    });
   },
 
   currentUser(): AuthUser | null {
@@ -320,7 +358,10 @@ export const authApi = {
   isAuthenticated(): boolean {
     if (typeof window === 'undefined') return false;
     try {
-      return Boolean(window.localStorage.getItem(AUTH_TOKEN_KEY));
+      return Boolean(
+        window.localStorage.getItem('aisoc_access_token') ||
+        window.localStorage.getItem(AUTH_TOKEN_KEY)
+      );
     } catch {
       return false;
     }
@@ -377,6 +418,37 @@ export interface ChildTenant {
   created_at?: string;
 }
 
+export interface FullTenant {
+  id: string;
+  name: string;
+  slug: string;
+  plan: string;
+  is_active: boolean;
+  settings?: Record<string, any>;
+  limits?: Record<string, any>;
+  mssp_role?: 'parent' | 'child' | null;
+  parent_tenant_id?: string | null;
+  created_at?: string;
+}
+
+export interface TenantUser {
+  id: string;
+  tenant_id: string;
+  email: string;
+  username: string;
+  role: string;
+  is_active: boolean;
+  last_login?: string | null;
+  created_at?: string;
+}
+
+export interface CreateTenantUserPayload {
+  email: string;
+  username: string;
+  password?: string;
+  role?: string;
+}
+
 export const tenantsApi = {
   /**
    * Lightweight tenant identity for the SOC console TopBar.
@@ -388,6 +460,58 @@ export const tenantsApi = {
    */
   async me(): Promise<MyTenant> {
     return request<MyTenant>('/api/v1/tenants/me/identity');
+  },
+
+  async getMeFull(): Promise<FullTenant> {
+    return request<FullTenant>('/api/v1/tenants/me');
+  },
+
+  async updateTenantSettings(payload: { name?: string; settings?: Record<string, any> }): Promise<FullTenant> {
+    return request<FullTenant>('/api/v1/tenants/me/settings', {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async listUsers(): Promise<TenantUser[]> {
+    return request<TenantUser[]>('/api/v1/tenants/me/users');
+  },
+
+  async createUser(payload: CreateTenantUserPayload): Promise<TenantUser> {
+    return request<TenantUser>('/api/v1/tenants/me/users', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async updateUser(userId: string, payload: { username?: string; role?: string; is_active?: boolean; password?: string }): Promise<TenantUser> {
+    return request<TenantUser>(`/api/v1/tenants/me/users/${userId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async deleteUser(userId: string): Promise<void> {
+    return request<void>(`/api/v1/tenants/me/users/${userId}`, {
+      method: 'DELETE',
+    });
+  },
+
+  async createTenant(payload: { name: string; slug?: string; plan?: string }): Promise<FullTenant> {
+    return request<FullTenant>('/api/v1/tenants', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async deleteTenant(tenantId: string): Promise<void> {
+    return request<void>(`/api/v1/tenants/${tenantId}`, {
+      method: 'DELETE',
+    });
+  },
+
+  async listMyTenants(): Promise<MyTenant[]> {
+    return request<MyTenant[]>('/api/v1/tenants/my-tenants');
   },
 };
 
@@ -1541,8 +1665,20 @@ export const casesApi = {
 
   /** Trigger a browser download of the PDF report. */
   downloadReportPdf: async (caseId: string, runId: string): Promise<void> => {
+    const token = typeof window !== 'undefined' 
+      ? localStorage.getItem('aisoc.responder.accessToken') 
+      : null;
+    if (!token) {
+      console.warn('인증 토큰이 없습니다. 다시 로그인해 주세요.');
+      return;
+    }
+
     const resp = await fetch(`${API_BASE}/api/v1/cases/${caseId}/investigations/${runId}/report.pdf`, {
-      headers: { 'X-Tenant-Id': TENANT_ID },
+      method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'X-Tenant-Id': TENANT_ID
+        },
     });
     if (!resp.ok) {
       const err = await resp.text().catch(() => resp.statusText);
@@ -2694,13 +2830,14 @@ export interface AgentInvestigation {
   actions?: Array<{ type: string; target: string; status: string }>;
   startedAt: string;
   completedAt?: string;
+  cached?: boolean;
 }
 
 export const agentsApi = {
-  investigate: (alertId: string) =>
+  investigate: (alertId: string, reinvestigate = false, alertPayload?: Record<string, unknown>) =>
     request<AgentInvestigation>('/api/v1/agents/investigate', {
       method: 'POST',
-      body: JSON.stringify({ alertId }),
+      body: JSON.stringify({ alertId, reinvestigate, alert: alertPayload }),
     }),
 
   getInvestigation: (id: string) =>
@@ -2929,7 +3066,7 @@ export interface HuntResult {
   timestamp: string;
   source: string;
   severity?: AlertSeverity;
-  fields: Record<string, unknown>;
+  raw: Record<string, unknown>;
   highlight?: string;
 }
 

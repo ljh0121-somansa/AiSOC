@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -24,6 +24,7 @@ import structlog
 from fastapi import APIRouter, BackgroundTasks, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
+from fastapi import status
 
 from app.investigator import InvestigatorOrchestrator
 from app.orchestrator.router import RouterOrchestrator
@@ -227,12 +228,22 @@ async def _run_and_store(run_id: str, case_id: str, req: InvestigateRequest) -> 
                 # Broadcast to realtime → WebSocket clients
                 await _emit_event(run_id, req.tenant_id, event)
 
-            elif event.get("type") == "done":
+            elif event.get("type") in ("done", "error"):
                 state_data = event.get("state", {})
+                has_error = any(item.get("kind") == "error" for item in audit_log)
+    
+                if has_error or state_data.get("status") == "failed" or event.get("type") == "error":
+                    final_status = "failed"
+                    # audit_log에서 실패 원인 요약 문구 추출
+                    last_error_log = next((item.get("summary") for item in reversed(audit_log) if item.get("kind") == "error"), "Investigation failed")
+                    final_error = state_data.get("error") or last_error_log
+                else:
+                    final_status = "completed"
+                    final_error = None
                 await _update_run(
                     run_id,
                     {
-                        "status": "completed",
+                        "status": final_status,
                         "report_md": state_data.get("report_md", ""),
                         "report_html": state_data.get("report_html", ""),
                         "audit_log": audit_log,
@@ -240,37 +251,159 @@ async def _run_and_store(run_id: str, case_id: str, req: InvestigateRequest) -> 
                         "forensic": state_data.get("forensic", {}),
                         "responder": state_data.get("responder", {}),
                         "completed_at": datetime.utcnow().isoformat(),
-                        "error": None,
+                        "error": final_error,
                     }
                 )
                 await _emit_event(
                     run_id,
                     req.tenant_id,
                     {
-                        "kind": "completed",
+                        "kind": "completed" if final_status == "completed" else "error",
                         "agent": "orchestrator",
-                        "summary": "Investigation completed",
-                        "data": {"status": "completed"},
+                        "summary": final_error if final_status == "failed" else "Investigation completed",
+                        "data": {"status": final_status, "error": final_error},
                     },
                 )
-
-            elif event.get("type") == "error":
-                err_msg = event.get("error", "Unknown error")
-                await _update_run(run_id, {"status": "failed", "error": err_msg})
-                await _emit_event(
-                    run_id,
-                    req.tenant_id,
-                    {
-                        "kind": "error",
-                        "agent": "orchestrator",
-                        "summary": err_msg,
-                        "data": {"status": "failed"},
-                    },
-                )
-
     except Exception as exc:  # noqa: BLE001
         logger.error("investigation_bg_task failed", run_id=run_id, error=str(exc))
         await _update_run(run_id, {"status": "failed", "error": str(exc)})
+
+
+# ---------------------------------------------------------------------------
+# Single-Alert AI Investigation with ResponseCache (English prompt, Korean output)
+# ---------------------------------------------------------------------------
+
+from app.llm import safe_ainvoke
+from app.llm.response_cache import ResponseCache
+
+_ALERT_RESPONSE_CACHE = ResponseCache()
+
+_ALERT_INVESTIGATE_SYSTEM_PROMPT = """You are an expert AI Security Operations Centre (SOC) analyst.
+Your task is to analyse the provided security alert and generate a concise, structured investigation report.
+
+CRITICAL REQUIREMENTS:
+1. Output language: All content inside 'findings' (Markdown) and 'recommendations' MUST be written strictly in clear, professional KOREAN.
+2. Format: Respond ONLY with a valid JSON object matching the exact schema below. Do NOT wrap in markdown fences or prose outside JSON.
+{
+  "findings": "Markdown string written in Korean with sections: ## AI 알럿 분석 요약, ### 주요 발견 사항, ### MITRE ATT&CK 맵핑, ### 추천 대응 조치",
+  "recommendations": ["Korean recommendation 1", "Korean recommendation 2"],
+  "actions": [
+    {"type": "isolate_endpoint|block_ip|block_domain|reset_password", "target": "target_identifier", "status": "pending"}
+  ]
+}
+3. The JSON keys ('findings', 'recommendations', 'actions', 'type', 'target', 'status') MUST remain in English.
+4. OUTPUT WRAPPER RULE: Your entire output MUST be a valid JSON object matching the schema above. Do NOT   
+ include any thinking, reasoning, or preamble text outside the JSON object.
+"""
+
+
+class AgentAlertInvestigateRequest(BaseModel):
+    alertId: str
+    reinvestigate: bool = False
+    alert: dict[str, Any] | None = None
+
+
+def _alert_investigate_fallback(alert_id: str, alert_data: dict[str, Any] | None = None) -> dict[str, Any]:
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="LLM 서비스를 이용할 수 없습니다. (Fallback 요약 생성이 비활성화됨)"
+    )
+
+
+@router.post("/agents/investigate", summary="Run single-alert AI investigation with ResponseCache")
+async def agent_alert_investigate(body: AgentAlertInvestigateRequest) -> dict[str, Any]:
+    import re
+    alert_id = body.alertId
+    alert_payload = body.alert or {}
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    user_input_data = {"alertId": alert_id, "alert": alert_payload}
+    user_input_str = json.dumps(user_input_data, sort_keys=True, default=str)
+
+    # 1. ResponseCache lookup (unless reinvestigate is True)
+    if not body.reinvestigate:
+        cached_text = _ALERT_RESPONSE_CACHE.lookup(
+            model=model,
+            prompt=_ALERT_INVESTIGATE_SYSTEM_PROMPT,
+            user_input=user_input_str,
+        )
+        if cached_text:
+            try:
+                data = json.loads(cached_text)
+                data["cached"] = True
+                logger.info("agents.alert_investigate.cache_hit", alert_id=alert_id)
+                return data
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("agents.alert_investigate.cache_parse_error", error=str(exc))
+
+    # 2. Invoke LLM if OPENAI_API_KEY is available
+    if os.getenv("OPENAI_API_KEY"):
+        try:
+            from langchain_core.messages import HumanMessage, SystemMessage
+            from langchain_openai import ChatOpenAI
+            max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "2048")) 
+            llm = ChatOpenAI(model=model, temperature=0.0, max_tokens=max_tokens, response_format={"type":           
+ "json_object"})
+            messages = [
+                SystemMessage(content=_ALERT_INVESTIGATE_SYSTEM_PROMPT),
+                HumanMessage(content=f"Analyse this alert and produce the Korean investigation JSON:\n{user_input_str}"),
+            ]
+            response = await safe_ainvoke(llm, messages)
+            text = response.content if isinstance(response.content, str) else str(response.content)
+
+            cleaned_text = text.strip()
+            if "</think>" in cleaned_text:
+                cleaned_text = cleaned_text.split("</think>", 1)[1].strip()
+            else:
+                cleaned_text = re.sub(r"<think>[\s\S]*?</think>", "", cleaned_text).strip()
+
+            # 마크다운 ```json ... ``` 펜스 제거
+            cleaned_text = re.sub(r"^```(?:json)?\s*", "", cleaned_text, flags=re.IGNORECASE)
+            cleaned_text = re.sub(r"\s*```$", "", cleaned_text).strip()
+
+            # 완벽한 JSON 객체만 추출
+            match = re.search(r"\{[\s\S]*\}", cleaned_text)
+            json_target = match.group(0) if match else cleaned_text
+
+            try:
+                parsed = json.loads(json_target)
+            except json.JSONDecodeError:
+                # Extra data가 뒤에 남아있을 경우 첫 번째 유효한 JSON만 추출
+                decoder = json.JSONDecoder()
+                parsed, _ = decoder.raw_decode(json_target)
+
+            res_payload = {
+                "id": f"inv-{uuid4().hex[:8]}",
+                "alertId": alert_id,
+                "status": "completed",
+                "findings": parsed.get("findings", ""),
+                "recommendations": parsed.get("recommendations", []),
+                "actions": parsed.get("actions", []),
+                "startedAt": datetime.now(UTC).isoformat(),
+                "completedAt": datetime.now(UTC).isoformat(),
+                "cached": False,
+            }
+
+            # Cache the response for future identical requests
+            _ALERT_RESPONSE_CACHE.store(
+                model=model,
+                prompt=_ALERT_INVESTIGATE_SYSTEM_PROMPT,
+                user_input=user_input_str,
+                response=json.dumps(res_payload, ensure_ascii=False),
+            )
+            return res_payload
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("agents.alert_investigate.llm_failed", error=str(exc))
+
+    # 3. Fallback if LLM is unconfigured / fails
+    fallback_payload = _alert_investigate_fallback(alert_id, alert_payload)
+    _ALERT_RESPONSE_CACHE.store(
+        model=model,
+        prompt=_ALERT_INVESTIGATE_SYSTEM_PROMPT,
+        user_input=user_input_str,
+        response=json.dumps(fallback_payload, ensure_ascii=False),
+    )
+    return fallback_payload
 
 
 # ---------------------------------------------------------------------------

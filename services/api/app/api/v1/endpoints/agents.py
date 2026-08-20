@@ -39,6 +39,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from fastapi import HTTPException
 
 from app.api.v1.deps import AuthUser, DBSession, require_permission
 from app.api.v1.endpoints.connectors import _fetch_catalog, _safe_log_val
@@ -216,6 +217,40 @@ def _default_description(capability: str) -> str:
     """
     pretty = capability.replace("_", " ")
     return f"Invoke '{pretty}' on this connector instance."
+
+
+import os
+import httpx
+
+_AGENTS_URL = (os.getenv("AGENTS_SERVICE_URL") or os.getenv("AGENTS_API_URL") or "http://agents:8084").rstrip("/")
+
+
+@router.post("/investigate", summary="Launch AI investigation for a single alert")
+async def agent_alert_investigate(
+    request: dict[str, Any],
+    current_user: Annotated[AuthUser, Depends(require_permission("alerts:read"))],
+) -> dict[str, Any]:
+    """Proxy single-alert investigation request to services/agents."""
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{_AGENTS_URL}/api/v1/agents/investigate",
+                json=request,
+                headers={"X-Tenant-ID": str(current_user.tenant_id)},
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            logger.warning("agents.proxy.investigate_failed status=%s", resp.status_code)
+            raise HTTPException(
+                status_code=resp.status_code, 
+                detail="AI 에이전트 조사 서비스 응답에 실패했습니다."
+            )
+    except Exception as exc:  # [상황 3] 통신 자체가 실패한 경우 (try 블록 내부에서 예외 발생)
+        logger.error("agents.proxy.investigate_error err=%s", exc)
+        raise HTTPException(
+            status_code=503, 
+            detail="AI 에이전트 서비스에 연결할 수 없습니다."
+        )
 
 
 # -------------------------------------------------------------------- endpoints

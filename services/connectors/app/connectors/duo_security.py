@@ -105,7 +105,7 @@ class DuoSecurityConnector(BaseConnector):
             severity = "high"
         elif result == "FAILURE":
             severity = "medium"
-        elif raw.get("access_device", {}).get("is_encryption_enabled") == "false":
+        elif raw.get("access_device", {}).get("is_encryption_enabled") in (False, "false"):
             severity = "low"
         elif result == "SUCCESS" and "new" in reason:
             severity = "low"

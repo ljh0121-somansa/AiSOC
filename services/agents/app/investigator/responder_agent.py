@@ -9,8 +9,7 @@ Responsibilities:
 
 from __future__ import annotations
 
-import json
-import re
+import os
 import time
 from typing import Any
 
@@ -21,6 +20,7 @@ from langchain_openai import ChatOpenAI
 from app.core.cost_telemetry import record_llm_call
 from app.llm import safe_ainvoke
 from app.prompt_serialization import summarize_structure_for_llm
+from app.investigator.utils import safe_parse_agent_json
 
 from .bundle_prompt import format_bundle_prompt_append
 from .prompt_sanitizer import (
@@ -36,26 +36,39 @@ _SYSTEM_PROMPT = """You are the ResponderAgent of an AI Security Operations Cent
 Based on the forensic findings, generate a concrete incident response plan.
 All actions are DRY-RUN only — do NOT perform any real actions.
 
+CRITICAL FORMATTING RULES:
+   - Output ONLY raw JSON text matching the schema below.
+   - Absolute Prohibition: Do NOT output <think> tags, thinking process, reasoning steps, or markdown wrappers (NEVER use ```json or ```).
+   - Your response MUST strictly start with '{' and end with '}'.
+   - Value language: Write 'action', 'rationale', step lists, and 'summary' strictly in KOREAN.
+   - Tech specs: You MUST separate the exact CLI command or script (e.g. PowerShell, Bash, netsh, iptables, AD cmdlets) into the 'command' field of recommended_actions. Do NOT embed CLI commands inside the 'action' field, keep them in 'command' field separately for better readability. For steps arrays, include the command in backticks (`...`) inside the Korean text description.
+   - The JSON keys MUST remain in English.
+   - The values for 'risk' and 'risk_level' MUST strictly be one of: "low", "medium", "high", "critical" (do NOT translate these system status keywords).
 Respond ONLY with a JSON object:
 {
   "recommended_actions": [
-    {"priority": 1, "action": "...", "rationale": "...", "risk": "low|medium|high"}
+    {
+      "priority": 1,
+      "action": "Korean action description explaining what to do",
+      "command": "Exact CLI command or script to execute (e.g., netsh interface ipv4 set subinterface ...)",
+      "rationale": "Korean rationale",
+      "risk": "low|medium|high"
+    }
   ],
-  "containment_steps": ["Step 1: ...", "Step 2: ..."],
-  "eradication_steps": ["..."],
-  "recovery_steps": ["..."],
+  "containment_steps": ["Step 1: ...", "Step 2: ..." all steps in Korean text with `CLI command`],
+  "eradication_steps": ["Korean text with `CLI command`"],
+  "recovery_steps": ["Korean text with `CLI command`"],
   "estimated_effort_hours": 4.0,
   "risk_level": "low|medium|high|critical",
-  "summary": "Two-sentence response summary."
+  "summary": "Two-sentence response summary in Korean."
 }
 """
 
-
 async def _llm_responder(state: InvestigatorState) -> dict[str, Any]:
-    import os
-
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    llm = ChatOpenAI(model=model, temperature=0)
+    max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "2048"))                                                    
+    llm = ChatOpenAI(model=model, temperature=0, max_tokens=max_tokens, response_format={"type":           
+ "json_object"})
 
     # Defence-in-depth: every field surfaced here originated in attacker-
     # influenced data (alert payloads, banners, dark-web excerpts, LLM
@@ -128,9 +141,11 @@ async def _llm_responder(state: InvestigatorState) -> dict[str, Any]:
             latency_ms=latency_ms,
             cost_usd=cost_usd,
         )
-        json_match = re.search(r"\{[\s\S]*\}", content)
-        if json_match:
-            return json.loads(json_match.group())
+        # json_match = re.search(r"\{[\s\S]*\}", content)
+        # if json_match:
+        #     return json.loads(json_match.group())
+        return safe_parse_agent_json(content)
+        # raise ValueError("LLM 응답에서 유효한 JSON 구조를 찾을 수 없습니다.")
     except Exception as exc:  # noqa: BLE001
         logger.warning("responder llm failed", error=str(exc))
         state.log(
@@ -138,22 +153,7 @@ async def _llm_responder(state: InvestigatorState) -> dict[str, Any]:
             "ResponderAgent",
             f"LLM call failed: {exc}",
         )
-
-    state.log_decision(
-        agent="ResponderAgent",
-        decision="default_high_risk_plan",
-        reason="LLM unavailable; falling back to conservative high-risk containment template",
-        confidence=0.3,
-    )
-    return {
-        "recommended_actions": [],
-        "containment_steps": ["Isolate affected systems immediately."],
-        "eradication_steps": ["Remove identified malicious artefacts."],
-        "recovery_steps": ["Restore from last known good backup."],
-        "estimated_effort_hours": 8.0,
-        "risk_level": "high",
-        "summary": "Automated response plan generation was not available.",
-    }
+        raise RuntimeError(f"[Responder Agent 오류] {exc}") from exc
 
 
 async def run_responder(state_dict: dict[str, Any]) -> dict[str, Any]:

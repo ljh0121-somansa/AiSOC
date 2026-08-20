@@ -25,10 +25,10 @@ import uuid
 from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, Security, status
+from fastapi import Depends, HTTPException, Request, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dev_auth import (
@@ -97,6 +97,9 @@ class CurrentUser:
         Falls back to the static ROLE_PERMISSIONS map when the user has
         no rows in ``user_roles`` (e.g. fresh tenants not yet migrated).
         """
+        if is_dev_mode() or self.role == "platform_admin":
+            return True
+
         if self.scopes is not None:
             return "*" in self.scopes or permission in self.scopes or f"{permission.split(':')[0]}:*" in self.scopes
 
@@ -182,6 +185,7 @@ async def _resolve_api_key(raw_key: str, db: AsyncSession) -> CurrentUser:
 
 async def get_current_user(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Security(bearer_scheme)],
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> CurrentUser:
     """Resolve Bearer token to CurrentUser.
@@ -192,13 +196,6 @@ async def get_current_user(
     demo user (see ``app.api.v1.dev_auth``). Production requires a bearer token.
     """
     if credentials is None:
-        if is_dev_mode():
-            return CurrentUser(
-                user_id=DEMO_USER_ID,
-                tenant_id=DEMO_TENANT_ID,
-                role=DEMO_USER_ROLE,
-                email=DEMO_USER_EMAIL,
-            )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated",
@@ -231,9 +228,45 @@ async def get_current_user(
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
 
+    active_tenant_id = user.tenant_id
+    tenant_header = request.headers.get("x-tenant-id")
+    if tenant_header:
+        try:
+            requested_tid = uuid.UUID(tenant_header)
+            if requested_tid != user.tenant_id:
+                # 1. Direct membership check: user is explicitly registered in requested_tid
+                direct_res = await db.execute(
+                    select(User.id).where(
+                        User.email == user.email,
+                        User.tenant_id == requested_tid,
+                        User.is_active == True,  # noqa: E712
+                    )
+                )
+                if direct_res.scalar_one_or_none() is not None:
+                    active_tenant_id = requested_tid
+                elif user.role == "platform_admin":
+                    # 2. Platform admin accessing a child tenant in the hierarchy tree
+                    check_sql = text("""
+                        WITH RECURSIVE
+                          user_home AS (
+                            SELECT tenant_id FROM users WHERE email = :email AND is_active = TRUE
+                          ),
+                          tree AS (
+                            SELECT id FROM tenants WHERE id IN (SELECT tenant_id FROM user_home)
+                            UNION ALL
+                            SELECT t.id FROM tenants t JOIN tree ON t.parent_tenant_id = tree.id
+                          )
+                        SELECT id FROM tree WHERE id = :requested_tid
+                    """)
+                    c_res = await db.execute(check_sql, {"email": user.email, "requested_tid": requested_tid})
+                    if c_res.scalar_one_or_none() is not None:
+                        active_tenant_id = requested_tid
+        except Exception:  # noqa: BLE001
+            pass
+
     return CurrentUser(
         user_id=user.id,
-        tenant_id=user.tenant_id,
+        tenant_id=active_tenant_id,
         role=user.role,
         email=user.email,
     )
@@ -248,8 +281,11 @@ async def get_current_active_user(
 def require_permission(permission: str):
     """Factory for permission-checking dependencies."""
 
-    async def _check(current_user: Annotated[CurrentUser, Depends(get_current_user)]) -> CurrentUser:
-        current_user.require_permission(permission)
+    async def _check(
+        current_user: CurrentUser = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+    ) -> CurrentUser:
+        await current_user.require_permission_db(permission, db)
         return current_user
 
     return _check

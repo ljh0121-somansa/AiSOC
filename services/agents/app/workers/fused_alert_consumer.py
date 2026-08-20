@@ -37,6 +37,7 @@ import uuid
 from typing import Any
 
 import structlog
+import asyncio
 
 from app.agents.auto_triage_agent import run_auto_triage
 from app.agents.triage_agent import run_triage
@@ -83,6 +84,8 @@ def build_state(message: dict[str, Any]) -> InvestigationState | None:
         summary = f"{summary} — {message['narrative']}"[:1000] if summary else str(message["narrative"])[:1000]
     raw_alert = {
         "id": str(message.get("id") or alert.get("id") or ""),
+        "title": str(alert.get("title") or message.get("title") or summary or ""),
+        "description": str(alert.get("description") or message.get("description") or summary or ""),
         "severity": alert.get("severity"),
         "src_ip": alert.get("src_ip"),
         "dst_ip": alert.get("dst_ip"),
@@ -210,7 +213,29 @@ class FusedAlertTriageWorker:
 
         _METRICS["triaged"] += 1
         await self._record(state, tier=tier, verdict=verdict, confidence=confidence)
+        # Trigger enabled playbooks matching trigger on="alert"                                            
+        try:                                                                                               
+            from app.playbook.store import PlaybookStore, normalize_severity                               
+            from app.playbook.engine import PlaybookEngine                                                 
+            store = PlaybookStore.default()                                                                
+            conf_val = state.confidence
+            if not conf_val:
+                conf_val = float(state.raw_alert.get("confidence") or state.raw_alert.get("risk_score") or 0.80)
+            if conf_val > 1.0:
+                conf_val = conf_val / 100.0
 
+            ctx = {                                                                                        
+                "alert": state.raw_alert,                                                                  
+                "severity": normalize_severity(state.raw_alert.get("severity")),                           
+                "confidence": conf_val,                                                                  
+            }                                                                                              
+            matching_playbooks = store.find_matching("alert", ctx)                                         
+            engine = PlaybookEngine()                                                                      
+            for pb in matching_playbooks:                                                                  
+                logger.info("auto_triage_worker.running_playbook", playbook_id=pb.id, playbook_name=pb.name)                                                                                       
+                asyncio.create_task(engine.run(pb, ctx, dry_run=False))                                    
+        except Exception as exc:                                                                           
+            logger.warning("auto_triage_worker.playbook_trigger_failed", error=str(exc))
         return {
             "run_id": str(state.run_id),
             "incident_id": str(state.incident_id),

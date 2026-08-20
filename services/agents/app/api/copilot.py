@@ -70,29 +70,7 @@ _CONVERSATIONS: dict[str, dict[str, Any]] = {}
 
 _SYNTHETIC_REPLIES = [
     (
-        "I've analysed the alert context. The activity matches T1078 (Valid Accounts) combined"
-        " with T1021.002 (SMB/Windows Admin Shares) lateral movement. Recommend isolating the"
-        " host and reviewing recent authentication logs."
-    ),
-    (
-        "Based on the indicators, this looks like credential-access activity. The parent process"
-        " chain suggests a LOLBin pattern. Consider adding a detection rule for this specific"
-        " chain."
-    ),
-    (
-        "The entity risk score is elevated due to multiple failed authentications followed by a"
-        " successful login from an unusual geolocation. I recommend triggering a step-up MFA"
-        " challenge."
-    ),
-    (
-        "Correlation across the last 24 hours shows this IP was seen in 3 other alerts. The MITRE"
-        " mapping points to T1110 (Brute Force). Blocking the IP at the perimeter is the fastest"
-        " remediation."
-    ),
-    (
-        "I've reviewed the case timeline. The attacker dwell time appears short (< 2 hours),"
-        " suggesting this may be an automated credential-stuffing campaign rather than a targeted"
-        " intrusion."
+        "LLM을 불러오는데에 문제가 있었습니다. 다시 시도해주세요."
     ),
 ]
 
@@ -118,7 +96,7 @@ async def _get_openai_reply(
 ) -> str:
     api_key = os.getenv("OPENAI_API_KEY", "")
     if not api_key:
-        return _synthetic_reply(user_message)
+        return "⚠️ [오류] OPENAI_API_KEY가 설정되지 않았습니다."
 
     try:
         from app.llm.contract import safe_chat_completions_request
@@ -131,6 +109,8 @@ async def _get_openai_reply(
                     "Help analysts investigate alerts, correlate events, and respond to threats. "
                     "Be concise, technical, and actionable. Reference MITRE ATT&CK techniques "
                     "when relevant. Format recommendations as numbered steps when appropriate."
+                    "Always respond in Korean, but keep technical terms (e.g., MITRE ATT&CK, "
+                    "log names, security tools, commands) in English where natural for SOC analysts."
                 ),
             }
         ]
@@ -140,14 +120,16 @@ async def _get_openai_reply(
 
         body = await safe_chat_completions_request(
             api_key=api_key,
-            model="gpt-4o-mini",
+            model=os.getenv("OPENAI_MODEL_NAME",""),
             messages=messages,
-            max_tokens=512,
+            max_tokens=4000,
         )
-        return body["choices"][0]["message"]["content"]
+        raw_content = body["choices"][0]["message"]["content"]
+        clean_content = raw_content.split("</think>", 1)[-1]
+        return clean_content
     except Exception as exc:
         logger.warning("copilot.openai_error", error=str(exc))
-        return _synthetic_reply(user_message)
+        return f"⚠️ [LLM 호출 실패] {str(exc)}"
 
 
 # ---------------------------------------------------------------------------

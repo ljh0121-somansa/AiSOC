@@ -11,6 +11,7 @@ Responsibilities:
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from typing import Any
@@ -18,10 +19,10 @@ from typing import Any
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
-
 from app.core.cost_telemetry import record_llm_call
 from app.llm import safe_ainvoke
 from app.prompt_serialization import summarize_structure_for_llm
+from app.investigator.utils import safe_parse_agent_json
 
 from .bundle_prompt import format_bundle_prompt_append
 from .prompt_sanitizer import (
@@ -35,11 +36,15 @@ logger = structlog.get_logger()
 
 _SYSTEM_PROMPT = """You are the ForensicAgent of an AI Security Operations Centre.
 Given a security alert and its enrichment data, produce:
-1. A chronological timeline of events (at most 15 entries).
+1. A chronological timeline of events (at most 15 entries) - write event descriptions in Korean.
 2. A list of forensic artefacts (file paths, registry keys, network indicators).
-3. A root-cause hypothesis (one sentence).
-4. An estimated blast radius (what systems/data were or could be affected).
+3. A root-cause hypothesis (one sentence in Korean).
+4. An estimated blast radius (what systems/data were or could be affected, in Korean).
 5. A confidence score (0.0–1.0) for your analysis.
+
+CRITICAL:
+   - Write the value of "root_cause_hypothesis", "blast_radius", "summary", and timeline "event" descriptions strictly in Korean.
+   - The JSON keys MUST remain in English.
 
 Respond ONLY with a JSON object:
 {
@@ -48,16 +53,15 @@ Respond ONLY with a JSON object:
   "root_cause_hypothesis": "...",
   "blast_radius": "...",
   "confidence": 0.75,
-  "summary": "Two-sentence forensic summary."
+  "summary": "Two-sentence forensic summary in Korean."
 }
 """
 
-
 async def _llm_forensic(state: InvestigatorState) -> dict[str, Any]:
-    import os
-
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    llm = ChatOpenAI(model=model, temperature=0)
+    max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "2048"))                                                    
+    llm = ChatOpenAI(model=model, temperature=0, max_tokens=max_tokens, response_format={"type":           
+ "json_object"})
 
     # Defence-in-depth: alert_summary, recon.summary, and the enrichment cache
     # can all carry attacker-controlled strings (banners, dark-web excerpts,
@@ -124,9 +128,11 @@ async def _llm_forensic(state: InvestigatorState) -> dict[str, Any]:
             latency_ms=latency_ms,
             cost_usd=cost_usd,
         )
-        json_match = re.search(r"\{[\s\S]*\}", content)
-        if json_match:
-            return json.loads(json_match.group())
+        return safe_parse_agent_json(content)
+        # json_match = re.search(r"\{[\s\S]*\}", content)
+        # if json_match:
+        #     return json.loads(json_match.group())
+        # raise ValueError("LLM 응답에서 유효한 JSON 구조를 찾을 수 없습니다.")
     except Exception as exc:  # noqa: BLE001
         logger.warning("forensic llm failed", error=str(exc))
         state.log(
@@ -134,23 +140,8 @@ async def _llm_forensic(state: InvestigatorState) -> dict[str, Any]:
             "ForensicAgent",
             f"LLM call failed: {exc}",
         )
-
-    # Fallback
-    state.log_decision(
-        agent="ForensicAgent",
-        decision="defer_to_manual",
-        reason="LLM unavailable or returned malformed output; cannot construct a confident forensic timeline",
-        confidence=0.1,
-        alternatives=["llm_extraction"],
-    )
-    return {
-        "timeline": [],
-        "artefacts": [],
-        "root_cause_hypothesis": "Unable to determine root cause automatically.",
-        "blast_radius": "Unknown — manual review required.",
-        "confidence": 0.1,
-        "summary": "Automated forensic analysis was not available.",
-    }
+        raise RuntimeError(f"[Forensic Agent 오류] {exc}") from exc
+    
 
 
 async def run_forensic(state_dict: dict[str, Any]) -> dict[str, Any]:

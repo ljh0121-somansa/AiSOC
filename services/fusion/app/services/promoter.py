@@ -135,17 +135,32 @@ def should_promote(ocsf: dict[str, Any]) -> bool:
 
 
 def _extract_splunk_kv(raw_data: str, key: str) -> str | None:
-    """Extract a key="value" or key=value from a Splunk _raw string."""
+    """Extract a key="value", key=value, or "key": value from a Splunk raw_data string/JSON."""
     if not isinstance(raw_data, str) or not raw_data:
         return None
-    # Match key="value"
-    match = re.search(re.escape(key) + r'\s*=\s*"([^"\\]*(?:\\.[^"\\]*)*)"', raw_data)
-    if match:
-        return match.group(1).replace('\\"', '"')
-    # Match key=value (with potential spaces, up to next key= or end of string)
-    match = re.search(re.escape(key) + r'\s*=\s*(.*?)(?=\s+[a-zA-Z0-9_]+=|$)', raw_data)
-    if match:
-        val = match.group(1).strip()
+    # 1. JSON string pattern: "key": "value"
+    pattern1 = r'\"' + re.escape(key) + r'\"\s*:\s*\"([^\"]*)\"'
+    m = re.search(pattern1, raw_data)
+    if m:
+        return m.group(1)
+
+    # 2. JSON number pattern: "key": 123.4
+    pattern2 = r'\"' + re.escape(key) + r'\"\s*:\s*([0-9\.]+)'
+    m = re.search(pattern2, raw_data)
+    if m:
+        return m.group(1)
+
+    # 3. KV pattern: key="value"
+    pattern3 = re.escape(key) + r'\s*=\s*\"([^\"]*)\"'
+    m = re.search(pattern3, raw_data)
+    if m:
+        return m.group(1).replace('\\"', '"')
+
+    # 4. KV pattern: key=value
+    pattern4 = re.escape(key) + r'\s*=\s*(.*?)(?=\s+[a-zA-Z0-9_\.]+\s*=|\s*,\s*[a-zA-Z0-9_\.]+\s*=|[\r\n]|$)'
+    m = re.search(pattern4, raw_data)
+    if m:
+        val = m.group(1).strip()
         if val.endswith(","):
             val = val[:-1].strip()
         return val
@@ -159,6 +174,15 @@ def _extract_splunk_mitre(raw_data: str) -> list[str]:
     # Match T followed by 4 digits, optionally .001
     matches = re.findall(r'T\d{4}(?:\.\d{3})?', val)
     return list(set(matches))
+
+
+def _clean_str(val: Any) -> str:
+    if not val:
+        return ""
+    s = str(val).strip()
+    while (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")) or (s.startswith('\\"') and s.endswith('\\"')) or (s.startswith('\\') or s.endswith('\\')):
+        s = s.strip(' \t\r\n"\'\\')
+    return s
 
 
 def promote_normalized_event(message: dict[str, Any]) -> RawAlert | None:
@@ -207,27 +231,81 @@ def promote_normalized_event(message: dict[str, Any]) -> RawAlert | None:
         if not techniques:
             techniques = _extract_splunk_mitre(raw_data_str)
             
-    src_ip = _get_nested(ocsf, "src_endpoint", "ip") or _extract_splunk_kv(raw_data_str, "src_ip") or _extract_splunk_kv(raw_data_str, "src")
-    hostname = _get_nested(ocsf, "device", "name") or _extract_splunk_kv(raw_data_str, "orig_host") or _extract_splunk_kv(raw_data_str, "entity")
-    username = _get_nested(ocsf, "actor", "user", "name") or _extract_splunk_kv(raw_data_str, "USER") or _extract_splunk_kv(raw_data_str, "user")
+    src_ip = (
+        _get_nested(ocsf, "src_endpoint", "ip")
+        or _extract_splunk_kv(raw_data_str, "src_ip")
+        or _extract_splunk_kv(raw_data_str, "srcip")
+        or _extract_splunk_kv(raw_data_str, "src")
+    )
+    dst_ip = (
+        _get_nested(ocsf, "dst_endpoint", "ip")
+        or _extract_splunk_kv(raw_data_str, "dst_ip")
+        or _extract_splunk_kv(raw_data_str, "dstip")
+        or _extract_splunk_kv(raw_data_str, "dst")
+    )
+
+    # Extract host (host_key / orig_host / entity / risk_object / dest)
+    host_key = _extract_splunk_kv(raw_data_str, "host_key")
+    dest = _extract_splunk_kv(raw_data_str, "dest")
+    entity = _extract_splunk_kv(raw_data_str, "entity")
+    risk_obj = _extract_splunk_kv(raw_data_str, "risk_object")
+    orig_host = _extract_splunk_kv(raw_data_str, "orig_host")
+
+    hostname = None
+    for cand in (host_key, orig_host, entity, risk_obj, dest):
+        if cand and cand.lower() not in ("none", "null"):
+            hostname = cand
+            break
+
+    username = _get_nested(ocsf, "actor", "user", "name") or _extract_splunk_kv(raw_data_str, "username") or _extract_splunk_kv(raw_data_str, "user") or _extract_splunk_kv(raw_data_str, "USER")
+    file_hash = _first_file_hash(ocsf) or _extract_splunk_kv(raw_data_str, "file_hash") or _extract_splunk_kv(raw_data_str, "hash") or _extract_splunk_kv(raw_data_str, "sha256")
+    domain = _extract_splunk_kv(raw_data_str, "domain")
     
+    raw_risk = (
+        _extract_splunk_kv(raw_data_str, "risk_score")
+        or _extract_splunk_kv(raw_data_str, "crscore")
+        or _extract_splunk_kv(raw_data_str, "score")
+    )
+    risk_score = 0.0
+    if raw_risk:
+        try:
+            val = float(raw_risk)
+            risk_score = min(val / 100.0 if val > 1.0 else val, 1.0)
+        except (ValueError, TypeError):
+            risk_score = 0.0
+
     desc = raw_data_str
     if _extract_splunk_kv(raw_data_str, "risk_message"):
         desc = _extract_splunk_kv(raw_data_str, "risk_message")
     elif _extract_splunk_kv(raw_data_str, "orig_rule_description"):
         desc = _extract_splunk_kv(raw_data_str, "orig_rule_description")
 
+    # Title extraction: prefer orig_rule_title / orig_rule_name over generic OCSF message
+    splunk_title = (
+        _extract_splunk_kv(raw_data_str, "orig_rule_title")
+        or _extract_splunk_kv(raw_data_str, "orig_rule_name")
+        or _extract_splunk_kv(raw_data_str, "rule_name")
+        or _extract_splunk_kv(raw_data_str, "search_name")
+        or _extract_splunk_kv(raw_data_str, "title")
+    )
+    title = _clean_str(splunk_title if (splunk_title and splunk_title.lower() != "splunk") else _title(ocsf))
+    hostname = _clean_str(hostname)
+    username = _clean_str(username)
+    desc = _clean_str(desc)
+
     return RawAlert(
         tenant_id=tenant_id,
         source=_source(ocsf),
-        title=_title(ocsf),
+        title=title[:500],
         description=desc[:2000],
         severity=severity,
         src_ip=src_ip,
-        dst_ip=_get_nested(ocsf, "dst_endpoint", "ip"),
+        dst_ip=dst_ip,
         hostname=hostname,
         username=username,
-        file_hash=_first_file_hash(ocsf),
+        file_hash=file_hash,
+        domain=domain,
+        risk_score=risk_score,
         mitre_tactics=tactics,
         mitre_techniques=techniques,
         raw_event=ocsf,

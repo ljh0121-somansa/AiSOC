@@ -54,8 +54,9 @@ You MUST respond with a JSON object and nothing else:
   "identity_indicators": ["<indicator1>", "<indicator2>", ...],
   "attack_type": "impossible_travel" | "credential_stuffing" | "brute_force" |
                  "privilege_escalation" | "session_anomaly" | "unknown",
-  "rationale": "<2-4 sentence explanation>"
+  "rationale": "<2-4 sentence explanation in Korean>"
 }
+- LANGUAGE RULE: To optimize token usage, perform all internal reasoning and JSON keys in English, but you MUST write the "rationale" value in natural, professional Korean for the security analyst UI.
 """
 
 
@@ -196,7 +197,8 @@ async def run_identity(
     prompt_context = base_context + (("\n" + "\n".join(bundle_lines)) if bundle_lines else "")
 
     model_name = os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or os.getenv("AISOC_LLM_MODEL", "gpt-4o-mini")
-    llm = ChatOpenAI(model=model_name, temperature=0.0, max_tokens=768)
+    llm = ChatOpenAI(model=model_name, temperature=0.0, max_tokens=768, response_format={"type":           
+ "json_object"})
 
     t0 = time.monotonic()
     try:

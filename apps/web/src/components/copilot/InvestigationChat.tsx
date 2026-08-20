@@ -49,7 +49,7 @@ const MOCK_RESPONSES: Record<string, string> = {
     '- Associated campaigns: APT-42, Operation ShadowGate\n' +
     '- Recommendation: block at perimeter immediately',
 };
-
+// mock 데이터 제거 후 기능 구현필요
 function getMockResponse(input: string): string {
   const lower = input.toLowerCase();
   for (const [key, response] of Object.entries(MOCK_RESPONSES)) {

@@ -72,14 +72,22 @@ def _severity_chip(severity: str) -> str:
 
 
 def _kpi(label: str, value: str, *, hint: str | None = None) -> str:
-    hint_html = f'<div style="font-size:11px;color:#64748b;margin-top:2px;">{_esc(hint)}</div>' if hint else ""
+    hint_html = f'<div style="font-size:10px;color:#64748b;margin-top:2px;">{_esc(hint)}</div>' if hint else ""
     return (
-        '<div style="flex:1 1 140px;background:#f8fafc;border:1px solid #e2e8f0;'
-        'border-radius:8px;padding:12px 14px;min-width:140px;">'
-        f'<div style="font-size:11px;color:#64748b;text-transform:uppercase;'
-        f'letter-spacing:0.06em;">{_esc(label)}</div>'
-        f'<div style="font-size:22px;font-weight:600;color:#0f172a;'
-        f'margin-top:4px;">{_esc(value)}</div>'
+        '<div style="'
+        'display: inline-block; '
+        'vertical-align: top; '
+        'box-sizing: border-box; '
+        'width: 23%; '            
+        'margin: 0 1% 10px 0; '   
+        'background: #f8fafc; '
+        'border: 1px solid #e2e8f0; '
+        'border-radius: 6px; '
+        'padding: 10px 12px; '
+        'word-break: keep-all;'
+        '">'
+        f'<div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.05em;line-height:1.2;">{_esc(label)}</div>'
+        f'<div style="font-size:18px;font-weight:600;color:#0f172a;margin-top:4px;">{_esc(value)}</div>'
         f"{hint_html}</div>"
     )
 
@@ -197,45 +205,103 @@ def render_digest_html(digest: ExecutiveDigest) -> str:
     period = digest.period
 
     return f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="ko">
 <head>
 <meta charset="utf-8">
 <title>AiSOC Executive Digest — {_esc(period.label)}</title>
 <style>
-  @page {{ margin: 18mm; }}
+  @page {{
+    size: A4;
+    margin: 18mm 15mm;
+  }}
+  * {{
+    box-sizing: border-box;
+  }}
   body {{
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-family: 'Noto Sans CJK KR', 'NanumGothic', 'Malgun Gothic', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     color: #0f172a;
     background: #ffffff;
     margin: 0;
-    padding: 24px 32px;
-    line-height: 1.45;
+    padding: 0;
+    line-height: 1.5;
+    font-size: 10pt;
+    word-break: keep-all;
+    word-wrap: break-word;
   }}
-  h1, h2, h3 {{ color: #0f172a; margin-top: 0; }}
-  h1 {{ font-size: 22px; margin-bottom: 4px; }}
-  h2 {{ font-size: 15px; text-transform: uppercase; letter-spacing: 0.08em;
-       color: #475569; margin: 20px 0 10px; border-top: 1px solid #e2e8f0; padding-top: 14px; }}
-  table th, table td {{ border-bottom: 1px solid #f1f5f9; }}
+  
+  header {{
+    margin-bottom: 20px;
+    border-bottom: 2px solid #0f172a;
+    padding-bottom: 12px;
+  }}
+  
+  h1, h2, h3 {{ color: #0f172a; margin-top: 0; word-break: keep-all; }}
+  h1 {{ font-size: 20pt; margin-bottom: 4px; font-weight: bold; }}
+  h2 {{ 
+    font-size: 12pt; 
+    text-transform: uppercase; 
+    letter-spacing: 0.05em;
+    color: #334155; 
+    margin: 20px 0 10px; 
+    border-top: 1px solid #cbd5e1; 
+    padding-top: 12px; 
+  }}
+  
+  .kpi-container {{
+    margin-bottom: 15px;
+  }}
+  .kpi-card {{
+    display: inline-block;
+    vertical-align: top;
+    width: 23%;
+    margin-right: 1.5%;
+    margin-bottom: 10px;
+    padding: 8px 10px;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 4px;
+  }}
+  
+  table {{
+    width: 100%;
+    border-collapse: collapse;
+    margin: 10px 0 18px 0;
+    page-break-inside: avoid;
+  }}
+  table th, table td {{
+    border: 1px solid #e2e8f0;
+    padding: 7px 10px;
+    font-size: 9pt;
+    text-align: left;
+    vertical-align: top;
+  }}
+  table th {{
+    background-color: #f1f5f9;
+    font-weight: bold;
+    color: #1e293b;
+  }}
+  
   @media print {{
     body {{ padding: 0; }}
     h2 {{ page-break-after: avoid; }}
+    tr {{ page-break-inside: avoid; }}
   }}
 </style>
 </head>
 <body>
   <header>
-    <div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:0.08em;">
+    <div style="font-size:9pt;color:#64748b;text-transform:uppercase;letter-spacing:0.08em;font-weight:bold;">
       AiSOC weekly executive digest
     </div>
     <h1>{_esc(period.label)}</h1>
-    <div style="color:#334155;font-size:14px;margin-top:6px;">{headline}</div>
-    <div style="color:#94a3b8;font-size:11px;margin-top:6px;">
+    <div style="color:#334155;font-size:11pt;margin-top:6px;">{headline}</div>
+    <div style="color:#94a3b8;font-size:9pt;margin-top:6px;">
       Tenant {_esc(digest.tenant_id)} · generated {_fmt_datetime(datetime.now(UTC))}
     </div>
   </header>
 
   <h2>Headline metrics</h2>
-  <div style="display:flex;flex-wrap:wrap;gap:12px;">
+  <div class="kpi-container">
     {_kpi("Alerts (total seen)", str(digest.alerts.total))}
     {_kpi("New this period", str(digest.alerts.new))}
     {_kpi("Resolved", str(digest.alerts.resolved))}
@@ -266,12 +332,8 @@ def render_digest_html(digest: ExecutiveDigest) -> str:
   <h2>Recommendations</h2>
   {_recommendation_cards(digest.recommendations)}
 
-  <footer style="margin-top:32px;color:#94a3b8;font-size:11px;text-align:center;">
+  <footer style="margin-top:32px;color:#94a3b8;font-size:9pt;text-align:center;">
     AiSOC — open-source AI Security Operations Center.
-    Print this page (Ctrl/Cmd-P → Save as PDF) for board-ready archival.
   </footer>
 </body>
 </html>"""
-
-
-__all__ = ["render_digest_html"]
