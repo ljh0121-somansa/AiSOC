@@ -292,6 +292,8 @@ CRITICAL REQUIREMENTS:
   ]
 }
 3. The JSON keys ('findings', 'recommendations', 'actions', 'type', 'target', 'status') MUST remain in English.
+4. OUTPUT WRAPPER RULE: Your entire output MUST be a valid JSON object matching the schema above. Do NOT   
+ include any thinking, reasoning, or preamble text outside the JSON object.
 """
 
 
@@ -339,8 +341,9 @@ async def agent_alert_investigate(body: AgentAlertInvestigateRequest) -> dict[st
         try:
             from langchain_core.messages import HumanMessage, SystemMessage
             from langchain_openai import ChatOpenAI
-
-            llm = ChatOpenAI(model=model, temperature=0.0)
+            max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "2048")) 
+            llm = ChatOpenAI(model=model, temperature=0.0, max_tokens=max_tokens, response_format={"type":           
+ "json_object"})
             messages = [
                 SystemMessage(content=_ALERT_INVESTIGATE_SYSTEM_PROMPT),
                 HumanMessage(content=f"Analyse this alert and produce the Korean investigation JSON:\n{user_input_str}"),

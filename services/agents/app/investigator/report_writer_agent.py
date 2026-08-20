@@ -9,6 +9,7 @@ Responsibilities:
 
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime
 from typing import Any
@@ -161,15 +162,14 @@ def _md_to_html(md: str, case_id: str) -> str:
 
 async def run_report_writer(state_dict: dict[str, Any]) -> dict[str, Any]:
     """LangGraph node."""
-    import os
-
     state = InvestigatorState.from_dict(state_dict)
     t0 = time.monotonic()
 
     logger.info("report_writer.start", case_id=state.case_id)
 
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    llm = ChatOpenAI(model=model, temperature=0)
+    max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "4096"))                                                    
+    llm = ChatOpenAI(model=model, temperature=0, max_tokens=max_tokens)
 
     context = _build_context(state)
     bundle_append = format_bundle_prompt_append(state.context_bundle)

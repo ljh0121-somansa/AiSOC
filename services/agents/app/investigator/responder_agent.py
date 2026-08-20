@@ -9,6 +9,7 @@ Responsibilities:
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 
@@ -64,10 +65,10 @@ Respond ONLY with a JSON object:
 """
 
 async def _llm_responder(state: InvestigatorState) -> dict[str, Any]:
-    import os
-
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    llm = ChatOpenAI(model=model, temperature=0)
+    max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "2048"))                                                    
+    llm = ChatOpenAI(model=model, temperature=0, max_tokens=max_tokens, response_format={"type":           
+ "json_object"})
 
     # Defence-in-depth: every field surfaced here originated in attacker-
     # influenced data (alert payloads, banners, dark-web excerpts, LLM

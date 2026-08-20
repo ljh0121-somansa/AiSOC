@@ -60,7 +60,9 @@ async def _llm_recon(state: InvestigatorState) -> dict[str, Any]:
     """
 
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    llm = ChatOpenAI(model=model, temperature=0)
+    max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "2048"))                                                    
+    llm = ChatOpenAI(model=model, temperature=0, max_tokens=max_tokens, response_format={"type":           
+ "json_object"})
 
     # Defence-in-depth: every field surfaced here can be attacker-influenced
     # (alert_summary often echoes log lines; raw_alert is verbatim event data).

@@ -11,6 +11,7 @@ Responsibilities:
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from typing import Any
@@ -57,10 +58,10 @@ Respond ONLY with a JSON object:
 """
 
 async def _llm_forensic(state: InvestigatorState) -> dict[str, Any]:
-    import os
-
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    llm = ChatOpenAI(model=model, temperature=0)
+    max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "2048"))                                                    
+    llm = ChatOpenAI(model=model, temperature=0, max_tokens=max_tokens, response_format={"type":           
+ "json_object"})
 
     # Defence-in-depth: alert_summary, recon.summary, and the enrichment cache
     # can all carry attacker-controlled strings (banners, dark-web excerpts,
