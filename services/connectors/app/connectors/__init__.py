@@ -95,6 +95,7 @@ from app.connectors.windows_event import WindowsEventConnector
 from app.connectors.wiz import WizConnector
 from app.connectors.zeek_suricata import ZeekSuricataConnector
 from app.connectors.zscaler import ZscalerConnector
+from app.connectors.elastic_search import ElasticSearchConnector
 
 if TYPE_CHECKING:
     pass
@@ -181,6 +182,7 @@ _CONNECTOR_CLASSES: tuple[type[BaseConnector], ...] = (
     WizConnector,
     ZeekSuricataConnector,
     ZscalerConnector,
+    ElasticSearchConnector,
 )
 
 
@@ -300,4 +302,5 @@ __all__ = [
     "ZscalerConnector",
     "get_connector_class",
     "list_connector_schemas",
+    "ElasticSearchConnector"
 ]

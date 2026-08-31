@@ -234,6 +234,74 @@ var connectorProfiles = map[string]connectorProfile{
 			"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "informational": 1,
 		},
 	},
+	"elastic_search": {
+		product:   OcsfProduct{Name: "Elasticsearch", VendorName: "Elastic"},
+		classUID:  2001, // Security Finding
+		className: "Security Finding",
+		fieldMap: map[string]string{
+			// 1. 식별자 및 시간 (finding.uid ➔ external_id / event_id 로 변경)
+			"external_id":           "external_id",
+			"raw_event.external_id": "external_id",
+			"raw_event.event.id":    "external_id",
+			"raw_event._id":         "external_id",
+			"created_at":            "time",
+			"raw_event.created_at":  "time",
+			"raw_event.@timestamp":  "time",
+
+			// 2. 제목 및 본문
+			"title":                  "message",
+			"raw_event.title":        "message",
+			"raw_event.message":      "message",
+			"description":            "raw_data",
+			"raw_event.description":  "raw_data",
+			"raw_event.log.original": "raw_data",
+
+			// 3. 네트워크 IP 정보
+			"src_ip":                   "src_endpoint.ip",
+			"raw_event.src_ip":         "src_endpoint.ip",
+			"raw_event.source.ip":      "src_endpoint.ip",
+			"raw_event.client.ip":      "src_endpoint.ip",
+			"dst_ip":                   "dst_endpoint.ip",
+			"raw_event.dst_ip":         "dst_endpoint.ip",
+			"raw_event.destination.ip": "dst_endpoint.ip",
+
+			// 4. 호스트 및 계정 정보
+			"hostname":            "device.name",
+			"raw_event.hostname":   "device.name",
+			"raw_event.host.name":  "device.name",
+			"username":            "actor.user.name",
+			"raw_event.username":  "actor.user.name",
+			"raw_event.user.name": "actor.user.name",
+
+			// 5. 파일, 도메인, URL
+			"file_hash":                 "file.hash",
+			"raw_event.file_hash":        "file.hash",
+			"raw_event.file.hash.sha256": "file.hash",
+			"domain":                    "url.hostname",
+			"raw_event.domain":          "url.hostname",
+			"url":                       "url.url_string",
+			"raw_event.url":             "url.url_string",
+
+			// 6. 심도 및 리스크
+			"severity":             "severity",
+			"raw_event.severity":   "severity",
+			"risk_score":           "risk_score",
+			"raw_event.risk_score": "risk_score",
+
+			// 7. 프로세스 및 파일 상세
+			"raw_event.process.name":       "process.name",
+			"raw_event.process.executable": "process.file.path",
+			"raw_event.file.name":         "file.name",
+			"raw_event.file.path":         "file.path",
+		},
+		severityMap: map[string]int{
+			"fatal": 6, "critical": 5, "crit": 5, "high": 4, "error": 4, "err": 4,
+			"medium": 3, "warn": 3, "warning": 3, "low": 2, "info": 1, "informational": 1,
+			"debug": 1, "trace": 1,
+			"FATAL": 6, "CRITICAL": 5, "CRIT": 5, "HIGH": 4, "ERROR": 4, "ERR": 4,
+			"MEDIUM": 3, "WARN": 3, "WARNING": 3, "LOW": 2, "INFO": 1, "INFORMATIONAL": 1,
+		},
+	},
 }
 
 // New creates a new Normalizer instance and loads the ATT&CK corpus.
@@ -375,10 +443,10 @@ func (n *Normalizer) Normalize(raw *RawEvent) (*NormalizedEvent, error) {
 			sevField = s
 		}
 	} else if val := getNestedField(raw.Payload, "raw_event.raw_event.severity"); val != nil {
-		if s, ok := val.(string); ok && s != "" {
-			sevField = s
-		}
-	}
+        if s, ok := val.(string); ok && s != "" {
+            sevField = s
+        }
+    }
 
 	// Fallback to Splunk _raw parsing
 	var splunkRaw string
@@ -515,6 +583,13 @@ func extractTechniqueIDs(payload map[string]interface{}) []string {
 	candidateKeys := []string{
 		"technique_id", "mitre_technique", "attck_technique", "tactic_id",
 		"mitre_techniques", "attack_technique",
+
+		"mitre_techniques.0",
+        "threat.technique.id",
+        "threat.tactic.id",
+        "raw_event.mitre_techniques",
+        "raw_event.threat.technique.id",
+
 		"raw_event.annotations.mitre_attack",
 		"raw_event.raw_event.annotations.mitre_attack",
 		"raw_event.raw_event.annotations.mitre_attack_id",
@@ -576,13 +651,33 @@ func normalizeTechniqueID(s string) string {
 
 // normalizeTime attempts to parse and re-format a timestamp as RFC3339
 func normalizeTime(t string) string {
+	t = strings.TrimSpace(t)
+	if t == "" {
+		return time.Now().UTC().Format(time.RFC3339Nano)
+	}
+
+	// 1. Epoch Timestamp (숫자 형태: 초/밀리초/마이크로초) 파싱
+	if num, err := strconv.ParseInt(t, 10, 64); err == nil {
+		switch {
+		case num > 1e14: // Microseconds
+			return time.Unix(0, num*1000).UTC().Format(time.RFC3339Nano)
+		case num > 1e11: // Milliseconds
+			return time.UnixMilli(num).UTC().Format(time.RFC3339Nano)
+		default: // Seconds
+			return time.Unix(num, 0).UTC().Format(time.RFC3339Nano)
+		}
+	}
 	formats := []string{
 		time.RFC3339Nano,
 		time.RFC3339,
-		"2006-01-02T15:04:05.000Z",
-		"2006-01-02T15:04:05Z",
+		"2006-01-02T15:04:05.999999999Z07:00", // ISO8601 (가변 소수점 + 타임존)
+		"2006-01-02T15:04:05.999999999-07:00",
+		"2006-01-02T15:04:05.999999999",
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05.999999999",       // Logstash / Syslog
 		"2006-01-02 15:04:05",
 		"01/02/2006 15:04:05",
+		"02/Jan/2006:15:04:05 -0700",          // Nginx / Apache
 	}
 	for _, f := range formats {
 		if parsed, err := time.Parse(f, t); err == nil {
