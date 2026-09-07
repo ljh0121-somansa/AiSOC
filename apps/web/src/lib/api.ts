@@ -1895,6 +1895,8 @@ export interface DashboardMetrics {
     info?: number;
     resolvedToday: number;
     mttr: number;
+    total_trend?: number | null;
+    critical_trend?: number | null;
   };
   cases: {
     open: number;
@@ -1932,12 +1934,12 @@ export interface FunnelMetrics {
   mitre_coverage: { covered: number; total: number; ratio: number };
   /** Period-over-period deltas (fraction, e.g. 0.05 = +5%). */
   deltas: {
-    events_of_interest: number;
-    correlation_instances: number;
-    alerts_generated: number;
-    signal_to_noise: number;
-    mttd_seconds: number;
-    analyst_queue_depth: number;
+    events_of_interest: number | null;
+    correlation_instances: number | null;
+    alerts_generated: number | null;
+    signal_to_noise: number | null;
+    mttd_seconds: number | null;
+    analyst_queue_depth: number | null;
   };
   /** ISO-8601 server timestamp. */
   generated_at: string;

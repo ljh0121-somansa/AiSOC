@@ -21,8 +21,9 @@ from langchain_openai import ChatOpenAI
 
 from app.core.cost_telemetry import record_llm_call
 from app.llm import safe_ainvoke
+from app.llm.prompt_builder import build_audit_prompt_payload, build_model_aware_messages
 from app.prompt_serialization import summarize_structure_for_llm
-from app.investigator.utils import safe_parse_agent_json
+from app.investigator.utils import normalize_string_list, safe_parse_agent_json
 
 from .bundle_prompt import format_bundle_prompt_append
 from .prompt_sanitizer import sanitize_text
@@ -31,27 +32,55 @@ from .tools import enrich_ioc, extract_iocs, map_to_mitre, sha256_of
 
 logger = structlog.get_logger()
 
-_SYSTEM_PROMPT = """You are the ReconAgent of an AI Security Operations Centre.
-Your task is to analyse a security alert and:
-1. List all unique IOCs (IPs, domains, URLs, file hashes) found in the alert.
-2. Identify probable MITRE ATT&CK techniques based on the alert description.
-3. Hypothesise which threat-actor group(s) may be responsible, citing your evidence in Korean.
-4. Summarise the attack surface at risk in Korean.
+_SYSTEM_PROMPT = """You are the ReconAgent in an AI Security Operations Centre (AiSOC).
+Your mission is to perform triage, extract indicators (IOCs), map MITRE ATT&CK techniques, and assess attack surface.
 
-CRITICAL:
-   - Write the value of "summary" and any descriptions strictly in Korean.
-   - The JSON keys MUST remain in English.
-   - Threat actor group names or MITRE technique names should remain in English (e.g. "APT28", "T1566").
+CRITICAL CONSTRAINTS:
+1. Return ONLY a valid JSON object matching the schema below.
+2. Write "analysis_rationale", "data_at_risk", "investigation_hypotheses", and "summary" in professional Korean.
+3. Keep JSON keys, MITRE Technique IDs, Threat Actor names, and IOC types in English.
 
-Respond ONLY with a JSON object matching this schema:
+JSON Schema:
 {
-  "iocs": [{"type": "ip|domain|url|hash", "value": "..."}],
-  "mitre_techniques": ["T1566", ...],
-  "threat_actors": ["APT28", ...],
-  "attack_surface": {"affected_systems": [...], "data_at_risk": "..."},
-  "summary": "One-paragraph reconnaissance summary in Korean."
+  "triage": {
+    "is_true_positive": <boolean: true or false based on evidence>,
+    "confidence_score": <float: 0.0 to 1.0>,
+    "severity": "CRITICAL|HIGH|MEDIUM|LOW",
+    "analysis_rationale": "<초기 정탐 판단 근거 in Korean>"
+  },
+  "iocs": [
+    {
+      "type": "ip|domain|url|hash|account|process",
+      "value": "<ioc_value>",
+      "scope": "internal|external",
+      "context": "<IOC 역할 및 컨텍스트 in Korean/English>"
+    }
+  ],
+  "mitre_mapping": [
+    {
+      "tactic": "<MITRE Tactic Name>",
+      "technique_id": "<MITRE Technique ID e.g. T1071.001>",
+      "technique_name": "<MITRE Technique Name>"
+    }
+  ],
+  "threat_actors": [
+    {
+      "name": "<Threat Group or Campaign Name>",
+      "evidence": "<위협 그룹/캠페인 추정 근거 in Korean>"
+    }
+  ],
+  "attack_surface": {
+    "affected_hosts": ["<host1>", "<host2>"],
+    "affected_identities": ["<account1>"],
+    "data_at_risk": "<위험 노출 자산 요약 in Korean>"
+  },
+  "investigation_hypotheses": [
+    "<ForensicAgent가 검증할 포렌식 가설 in Korean>"
+  ],
+  "summary": "<초기 정찰 종합 요약 in Korean>"
 }
 """
+
 async def _llm_recon(state: InvestigatorState) -> dict[str, Any]:
     """Call LLM to perform structured reconnaissance.
 
@@ -60,9 +89,8 @@ async def _llm_recon(state: InvestigatorState) -> dict[str, Any]:
     """
 
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "2048"))                                                    
-    llm = ChatOpenAI(model=model, temperature=0, max_tokens=max_tokens, response_format={"type":           
- "json_object"})
+    max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "16384"))
+    llm = ChatOpenAI(model=model, temperature=0, max_tokens=max_tokens)
 
     # Defence-in-depth: every field surfaced here can be attacker-influenced
     # (alert_summary often echoes log lines; raw_alert is verbatim event data).
@@ -80,22 +108,24 @@ async def _llm_recon(state: InvestigatorState) -> dict[str, Any]:
             max_lines=45,
             max_depth=3,
         )
-    prompt = f"Alert summary:\n{safe_summary}\n\nStructured alert summary:\n{raw_alert_blob}"
+    user_content = f"Alert summary:\n{safe_summary}\n\nStructured alert summary:\n{raw_alert_blob}"
     bundle_append = format_bundle_prompt_append(state.context_bundle)
     if bundle_append:
-        prompt = f"{prompt}\n\n{bundle_append}"
+        user_content = f"{user_content}\n\n{bundle_append}"
 
-    messages = [
-        SystemMessage(content=_SYSTEM_PROMPT),
-        HumanMessage(content=prompt),
-    ]
+    messages = build_model_aware_messages(
+        system_prompt=_SYSTEM_PROMPT,
+        user_content=user_content,
+        model_name=model,
+    )
 
     prompt_hash = state.log_llm_prompt(
         agent="ReconAgent",
-        prompt=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
+        prompt=build_audit_prompt_payload(
+            system_prompt=_SYSTEM_PROMPT,
+            user_content=user_content,
+            model_name=model,
+        ),
         model=model,
         purpose="recon: extract IOCs, MITRE techniques, and threat actors",
     )
@@ -118,9 +148,15 @@ async def _llm_recon(state: InvestigatorState) -> dict[str, Any]:
             tool="llm.recon",
         )
         cost_usd = call_record.cost_usd if call_record is not None else 0.0
+        reasoning = (
+            getattr(response, "additional_kwargs", {}).get("reasoning_content")
+            or getattr(response, "response_metadata", {}).get("reasoning_content")
+            or getattr(response, "reasoning_content", None)
+        )
         state.log_llm_response(
             agent="ReconAgent",
             response=content if isinstance(content, str) else str(content),
+            reasoning_content=str(reasoning) if reasoning else None,
             prompt_hash=prompt_hash,
             model=model,
             tokens_used=tokens,
@@ -204,7 +240,32 @@ async def run_recon(state_dict: dict[str, Any]) -> dict[str, Any]:
         )
 
     # 3. Build ReconFindings
-    mitre = list(set(llm_result.get("mitre_techniques", []) + map_to_mitre(state.alert_summary)))
+    
+    # Safely extract and format Threat Actors to preserve 'evidence'
+    raw_actors = llm_result.get("threat_actors", [])
+    formatted_actors = []
+    if isinstance(raw_actors, list):
+        for actor in raw_actors:
+            if isinstance(actor, dict):
+                name = actor.get("name") or actor.get("actor") or ""
+                evidence = actor.get("evidence", "")
+                if name:
+                    formatted_actors.append(f"{name} (근거: {evidence})" if evidence else name)
+            elif isinstance(actor, str):
+                formatted_actors.append(actor)
+    
+    # Safely extract MITRE mapping from the correct prompt key
+    raw_mitre = llm_result.get("mitre_mapping") or llm_result.get("mitre_techniques") or []
+    mitre_list = []
+    if isinstance(raw_mitre, list):
+        for m in raw_mitre:
+            if isinstance(m, dict):
+                tid = m.get("technique_id", "")
+                mitre_list.append(tid)
+            elif isinstance(m, str):
+                mitre_list.append(m)
+
+    mitre = list(set(normalize_string_list(mitre_list) + map_to_mitre(state.alert_summary)))
     for technique in mitre:
         state.log_evidence(
             agent="ReconAgent",
@@ -212,12 +273,15 @@ async def run_recon(state_dict: dict[str, Any]) -> dict[str, Any]:
             ref=technique,
             weight=0.8,
         )
+        
     state.recon = ReconFindings(
         iocs=iocs,
-        threat_actors=llm_result.get("threat_actors", []),
-        attack_surface=llm_result.get("attack_surface", {}),
+        threat_actors=formatted_actors,
+        attack_surface=llm_result.get("attack_surface", {}) if isinstance(llm_result.get("attack_surface"), dict) else {},
         mitre_techniques=mitre,
-        summary=llm_result.get("summary", ""),
+        summary=str(llm_result.get("summary") or ""),
+        triage=llm_result.get("triage", {}) if isinstance(llm_result.get("triage"), dict) else {},
+        investigation_hypotheses=normalize_string_list(llm_result.get("investigation_hypotheses", [])),
     )
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)

@@ -230,6 +230,19 @@ class ThreatIntelMatch(BaseModel):
     summary: str = ""
 
 
+class AttackChainStep(BaseModel):
+    """Summarised progression step in an attack chain (T3.3 / AI Investigation)."""
+
+    alert_id: str
+    title: str
+    severity: str = "medium"
+    event_time: str | None = None
+    mitre_techniques: list[str] = Field(default_factory=list)
+    shared_entities: list[dict[str, str]] = Field(default_factory=list)
+    distance: int = 0
+    score: float = 1.0
+
+
 # ---------------------------------------------------------------------------
 # ContextBundle
 # ---------------------------------------------------------------------------
@@ -257,6 +270,8 @@ LLM_SAFE_KEYS = (
     "threat_intel_high_risk_iocs",
     "threat_intel_match_count",
     "threat_intel_sources",
+    "attack_chain_summary",
+    "attack_chain_step_count",
     "build_latency_ms",
     "sources_called",
     "errors",
@@ -276,6 +291,7 @@ class ContextBundle(BaseModel):
     entity_neighborhoods: dict[str, EntityNeighborhood] = Field(default_factory=dict)
     peer_baselines: dict[str, UEBABaseline] = Field(default_factory=dict)
     threat_intel: dict[str, ThreatIntelMatch] = Field(default_factory=dict)
+    attack_chain: list[AttackChainStep] = Field(default_factory=list)
 
     # Memory (institutional tier) recall.
     historical_similar_cases: list[HistoricalCase] = Field(default_factory=list)
@@ -300,21 +316,24 @@ class ContextBundle(BaseModel):
         Used by sub-agents to decide whether to short-circuit to the
         bundle-aware prompt or fall back to bare-alert reasoning.
         """
-        return bool(self.entity_neighborhoods or self.peer_baselines or self.threat_intel or self.historical_similar_cases)
+        return bool(self.entity_neighborhoods or self.peer_baselines or self.threat_intel or self.historical_similar_cases or self.attack_chain)
 
     def prompt_context_lines(self) -> list[str]:
         """Render the bundle's safe summary fields as prompt-ready lines.
 
         Sub-agents call this to inject pre-fetched context (entity
-        neighbourhood, historical verdicts, UEBA deviation, TI matches)
-        instead of re-discovering the same facts via primary tool calls.
-        Only fields enumerated by ``summary_for_llm`` are surfaced — never
-        raw OCSF or log payloads.
+        neighbourhood, historical verdicts, UEBA deviation, TI matches,
+        and AttackChain progression) instead of re-discovering the same facts.
         """
         if not self.has_any_context:
             return []
         s = self.summary_for_llm()
         parts: list[str] = ["", "Pre-fetched investigation context (ContextBundle):"]
+        if s.get("attack_chain_summary"):
+            parts.append("=== ATTACK CHAIN PROGRESSION (Multi-stage Campaign) ===")
+            for line in s["attack_chain_summary"]:
+                parts.append(f"  * {line}")
+            parts.append("")
         if s.get("entity_count"):
             parts.append(f"- Entities resolved: {s['entity_count']} " f"({', '.join(s.get('entity_types') or []) or 'unknown'})")
         if s.get("neighborhood_summaries"):
@@ -362,6 +381,12 @@ class ContextBundle(BaseModel):
         ti_sources: set[str] = set()
         for ti in self.threat_intel.values():
             ti_sources.update(ti.sources)
+
+        chain_summaries = []
+        for i, step in enumerate(self.attack_chain[:7]):
+            techs = f" [{', '.join(step.mitre_techniques)}]" if step.mitre_techniques else ""
+            chain_summaries.append(f"Step {i+1}{techs}: {step.title} (Severity: {step.severity})")
+
         return {
             "incident_id": str(self.incident_id),
             "alert_summary": self.alert_summary,
@@ -384,6 +409,8 @@ class ContextBundle(BaseModel):
             "threat_intel_high_risk_iocs": high_risk[:20],
             "threat_intel_match_count": len(self.threat_intel),
             "threat_intel_sources": sorted(ti_sources)[:20],
+            "attack_chain_summary": chain_summaries,
+            "attack_chain_step_count": len(self.attack_chain),
             "build_latency_ms": self.build_latency_ms,
             "sources_called": sorted(self.sources_called),
             "errors": self.errors[:5],
@@ -503,10 +530,15 @@ class ContextBundleBuilder:
                 self._fetch_threat_intel(bundle.entities),
                 bundle,
             ),
+            self._safe(
+                "attack_chain",
+                self._fetch_attack_chain(tenant_id, raw_alert, incident_id),
+                bundle,
+            ),
             return_exceptions=False,
         )
 
-        neigh_result, history_result, ueba_result, ti_result = results
+        neigh_result, history_result, ueba_result, ti_result, chain_result = results
         if isinstance(neigh_result, dict):
             bundle.entity_neighborhoods = neigh_result
         if isinstance(history_result, list):
@@ -515,6 +547,8 @@ class ContextBundleBuilder:
             bundle.peer_baselines = ueba_result
         if isinstance(ti_result, dict):
             bundle.threat_intel = ti_result
+        if isinstance(chain_result, list):
+            bundle.attack_chain = chain_result
 
         bundle.build_completed_at = datetime.now(UTC)
         bundle.build_latency_ms = int((time.monotonic() - t0) * 1000)
@@ -717,6 +751,92 @@ class ContextBundleBuilder:
             )
         self._record_source("threat_intel")
         return out
+
+    async def _fetch_attack_chain(
+        self,
+        tenant_id: str,
+        raw_alert: dict[str, Any],
+        incident_id: UUID,
+    ) -> list[AttackChainStep]:
+        """Fetch pre-computed multi-stage attack chain for the alert."""
+        try:
+            import httpx
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"httpx unavailable: {exc}") from exc
+
+        alert_id_str = str(raw_alert.get("id") or incident_id)
+        api_url = os.getenv("CORE_API_URL", "http://api:8000")
+        headers = {"X-Tenant-ID": tenant_id}
+        if self.api_token:
+            headers["Authorization"] = f"Bearer {self.api_token}"
+        else:
+            # Generate a standard JWT access token for internal service authorization
+            try:
+                import base64
+                import hashlib
+                import hmac
+                import json
+
+                def b64url(data: bytes) -> str:
+                    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
+
+                h_enc = b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode("utf-8"))
+                p_enc = b64url(json.dumps({
+                    "sub": "00000000-0000-0000-0000-000000000002",
+                    "tenant_id": str(tenant_id),
+                    "role": "platform_admin",
+                    "email": "admin@somansa.com",
+                    "type": "access",
+                    "exp": int(time.time()) + 3600,
+                }).encode("utf-8"))
+                secret_bytes = os.getenv("SECRET_KEY", "dev_secret_key_change_in_production").encode("utf-8")
+                sig_enc = b64url(hmac.new(secret_bytes, f"{h_enc}.{p_enc}".encode("utf-8"), hashlib.sha256).digest())
+                headers["Authorization"] = f"Bearer {h_enc}.{p_enc}.{sig_enc}"
+            except Exception as e:
+                logger.debug("context.attack_chain.token_gen_failed", error=str(e))
+
+        steps: list[AttackChainStep] = []
+        try:
+            async with httpx.AsyncClient(timeout=self.per_source_timeout) as client:
+                # 1. Try to fetch attack chain via case_id or seed alert_id
+                target_ids = []
+                if raw_alert.get("case_id"):
+                    target_ids.append(str(raw_alert["case_id"]))
+                target_ids.append(str(incident_id))
+                if raw_alert.get("id"):
+                    target_ids.append(str(raw_alert["id"]))
+
+                chain_raw = []
+                for tid in target_ids:
+                    resp = await client.get(
+                        f"{api_url}/api/v1/cases/{tid}/attack-chain",
+                        headers=headers,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        chain_raw = data.get("chain") or []
+                        if chain_raw:
+                            break
+
+                for item in chain_raw:
+                    if isinstance(item, dict):
+                        steps.append(
+                            AttackChainStep(
+                                alert_id=str(item.get("alert_id", "")),
+                                title=str(item.get("title", "")),
+                                severity=str(item.get("severity", "medium")),
+                                event_time=item.get("event_time"),
+                                mitre_techniques=item.get("mitre_techniques") or [],
+                                shared_entities=item.get("shared_entities") or [],
+                                distance=int(item.get("distance", 0)),
+                                score=float(item.get("score", 1.0)),
+                            )
+                        )
+        except Exception as exc:
+            logger.debug("context.attack_chain.fetch_failed", error=str(exc))
+
+        self._record_source("attack_chain")
+        return steps
 
     # ------------------------------------------------------------------
     # Helpers

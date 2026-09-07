@@ -19,44 +19,36 @@ from langchain_openai import ChatOpenAI
 
 from app.context import ContextBundle
 from app.investigator.prompt_sanitizer import sanitize_text, wrap_untrusted
+from app.investigator.utils import safe_parse_agent_json
 from app.llm import safe_ainvoke
+from app.llm.prompt_builder import build_model_aware_messages
 from app.models.state import AgentStatus, InvestigationState
 from app.prompt_serialization import format_extra_fields_for_llm, summarize_structure_for_llm
 
 logger = structlog.get_logger()
 
-_SYSTEM_PROMPT = """\
-You are the Identity & Authentication Analysis Agent of an AI Security
-Operations Centre.
+_SYSTEM_PROMPT = """You are the Identity & Authentication Analysis Agent of an AI Security Operations Centre.
+Investigate identity/authentication alerts and classify into: true_positive, false_positive, or benign.
 
-Given a security alert related to identity, authentication, or access
-control, perform a deep investigation and produce a structured assessment.
+[Example 1]
+Alert: Simultaneous logins for user 'admin' from Seoul (IP: 211.x) and London (IP: 82.x) within 5 minutes
+Output:
+{"verdict": "true_positive", "confidence": 0.95, "identity_indicators": ["impossible_travel", "concurrent_sessions"], "attack_type": "impossible_travel", "rationale": "물리적으로 불가능한 시간 내 원거리 동시 로그인 발생으로 계정 탈취 의심."}
 
-Evaluate the following patterns:
-1. Impossible travel — two logins from geographically distant locations
-   within a physically impossible time window.  Consider VPNs as possible
-   benign explanations but still flag them.
-2. Credential stuffing / password spraying — many failed login attempts
-   across different accounts from the same source, or one account from
-   many sources.
-3. Brute force — repeated failed attempts on a single account within a
-   short time window.
-4. Privilege escalation — a user gaining admin rights, adding themselves
-   to privileged groups, or accessing resources far beyond their normal
-   scope.
-5. Anomalous session behaviour — concurrent sessions from different
-   devices, token replay, MFA bypass attempts.
+[Example 2]
+Alert: 2 failed login attempts followed by successful login during normal business hours
+Output:
+{"verdict": "benign", "confidence": 0.85, "identity_indicators": [], "attack_type": "unknown", "rationale": "단순 비밀번호 오입력 후 정상 로그인으로 이상 징후 없음."}
 
-You MUST respond with a JSON object and nothing else:
+[Response Format]
+Return ONLY a JSON object:
 {
   "verdict": "true_positive" | "false_positive" | "benign",
-  "confidence": <float 0.0–1.0>,
-  "identity_indicators": ["<indicator1>", "<indicator2>", ...],
-  "attack_type": "impossible_travel" | "credential_stuffing" | "brute_force" |
-                 "privilege_escalation" | "session_anomaly" | "unknown",
-  "rationale": "<2-4 sentence explanation in Korean>"
+  "confidence": <float 0.0-1.0>,
+  "identity_indicators": ["<indicator1>", "<indicator2>"],
+  "attack_type": "impossible_travel" | "credential_stuffing" | "brute_force" | "privilege_escalation" | "session_anomaly" | "unknown",
+  "rationale": "<한국어 분석 근거>"
 }
-- LANGUAGE RULE: To optimize token usage, perform all internal reasoning and JSON keys in English, but you MUST write the "rationale" value in natural, professional Korean for the security analyst UI.
 """
 
 
@@ -137,30 +129,29 @@ def _build_identity_context(state: InvestigationState) -> str:
 
 def _parse_response(text: str) -> dict[str, Any]:
     """Extract JSON verdict from LLM output."""
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.split("\n")
-        lines = [line for line in lines if not line.strip().startswith("```")]
-        cleaned = "\n".join(lines).strip()
+    if not text or not str(text).strip():
+        raise ValueError("LLM returned empty response")
 
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}") + 1
-        if start >= 0 and end > start:
-            data = json.loads(cleaned[start:end])
-        else:
-            raise
+    data = safe_parse_agent_json(text)
+    if not data or not isinstance(data, dict):
+        raise ValueError(f"Failed to parse valid JSON from LLM response (raw: {str(text)[:200]!r})")
 
     verdict = data.get("verdict", "true_positive")
     if verdict not in ("true_positive", "false_positive", "benign"):
         verdict = "true_positive"
 
-    confidence = max(0.0, min(1.0, float(data.get("confidence", 0.5))))
+    try:
+        confidence = float(data.get("confidence", 0.5))
+    except (ValueError, TypeError):
+        confidence = 0.5
+    confidence = max(0.0, min(1.0, confidence))
+
     indicators = data.get("identity_indicators", [])
-    attack_type = data.get("attack_type", "unknown")
-    rationale = str(data.get("rationale", "No rationale provided."))
+    if not isinstance(indicators, list):
+        indicators = [str(indicators)] if indicators else []
+
+    attack_type = str(data.get("attack_type", "unknown"))
+    rationale = str(data.get("rationale") or "No rationale provided.")
 
     return {
         "verdict": verdict,
@@ -177,15 +168,7 @@ async def run_identity(
 ) -> InvestigationState:
     """Analyse an identity/authentication alert for compromise indicators.
 
-    Accepts an optional :class:`ContextBundle` (T2.1) carrying pre-fetched
-    entity neighbourhood, historical similar-case verdicts, UEBA deviation
-    (peer-baseline cosine distance), and threat-intel matches. When supplied
-    the bundle's safe summary fields are appended to the LLM prompt; the
-    agent's own enrichment paths become *augmentations*, not primary
-    discovery.
-
-    Backward-compatible: when ``bundle`` is ``None`` the agent falls back
-    to the prior bare-alert reasoning path.
+    Accepts an optional ContextBundle carrying pre-fetched entity neighbourhood.
     """
     logger.info("Identity agent starting", incident_id=str(state.incident_id))
 
@@ -197,21 +180,26 @@ async def run_identity(
     prompt_context = base_context + (("\n" + "\n".join(bundle_lines)) if bundle_lines else "")
 
     model_name = os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or os.getenv("AISOC_LLM_MODEL", "gpt-4o-mini")
-    llm = ChatOpenAI(model=model_name, temperature=0.0, max_tokens=768, response_format={"type":           
- "json_object"})
+    llm = ChatOpenAI(model=model_name, temperature=0.0, max_tokens=1024)
 
     t0 = time.monotonic()
+    raw_text = ""
     try:
-        response = await safe_ainvoke(
-            llm,
-            [
-                SystemMessage(content=_SYSTEM_PROMPT),
-                HumanMessage(content=prompt_context),
-            ],
+        messages = build_model_aware_messages(
+            system_prompt=_SYSTEM_PROMPT,
+            user_content=prompt_context,
+            model_name=model_name,
         )
-        result = _parse_response(response.content)
+        response = await safe_ainvoke(llm, messages)
+        raw_text = str(getattr(response, "content", ""))
+        result = _parse_response(raw_text)
     except Exception as exc:
-        logger.error("Identity agent LLM call failed", error=str(exc))
+        logger.error(
+            "Identity agent LLM call failed",
+            error=str(exc),
+            raw_response=raw_text[:200] if raw_text else "N/A",
+            incident_id=str(state.incident_id),
+        )
         state.add_finding(f"Identity analysis LLM error: {exc}")
         return state
 

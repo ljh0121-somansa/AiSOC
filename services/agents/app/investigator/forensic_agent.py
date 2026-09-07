@@ -21,8 +21,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from app.core.cost_telemetry import record_llm_call
 from app.llm import safe_ainvoke
+from app.llm.prompt_builder import build_audit_prompt_payload, build_model_aware_messages
 from app.prompt_serialization import summarize_structure_for_llm
-from app.investigator.utils import safe_parse_agent_json
+from app.investigator.utils import normalize_string_list, safe_parse_agent_json
 
 from .bundle_prompt import format_bundle_prompt_append
 from .prompt_sanitizer import (
@@ -34,34 +35,55 @@ from .tools import sha256_of
 
 logger = structlog.get_logger()
 
-_SYSTEM_PROMPT = """You are the ForensicAgent of an AI Security Operations Centre.
-Given a security alert and its enrichment data, produce:
-1. A chronological timeline of events (at most 15 entries) - write event descriptions in Korean.
-2. A list of forensic artefacts (file paths, registry keys, network indicators).
-3. A root-cause hypothesis (one sentence in Korean).
-4. An estimated blast radius (what systems/data were or could be affected, in Korean).
-5. A confidence score (0.0–1.0) for your analysis.
+_SYSTEM_PROMPT = """You are the ForensicAgent in an AI Security Operations Centre (AiSOC).
+Reconstruct the multi-stage attack timeline and campaign from the alert and Attack Chain progression.
 
-CRITICAL:
-   - Write the value of "root_cause_hypothesis", "blast_radius", "summary", and timeline "event" descriptions strictly in Korean.
-   - The JSON keys MUST remain in English.
+CRITICAL CONSTRAINTS:
+1. Return ONLY a valid JSON object matching the schema below.
+2. Write "description", "root_cause_hypothesis", and "forensic_summary" in professional Korean.
+3. Keep JSON keys, Technique IDs, and event_type in English.
 
-Respond ONLY with a JSON object:
+JSON Schema:
 {
-  "timeline": [{"ts": "ISO8601 or relative", "event": "...", "src": "..."}],
-  "artefacts": ["C:\\\\path\\\\to\\\\file.exe", "HKCU\\\\..."],
-  "root_cause_hypothesis": "...",
-  "blast_radius": "...",
-  "confidence": 0.75,
-  "summary": "Two-sentence forensic summary in Korean."
+  "attack_timeline": [
+    {
+      "step": 1,
+      "host": "<affected_hostname_or_ip>",
+      "event_type": "<C2_BEACONING|CREDENTIAL_DUMP|LATERAL_MOVEMENT|VSS_DELETION|RANSOMWARE_IMPACT>",
+      "description": "<공격 행위 설명 in Korean>",
+      "mitre_technique": "<MITRE Technique ID e.g. T1071.001>"
+    }
+  ],
+  "confidence": <float: 0.0 to 1.0>,
+  "lateral_movement_detected": {
+    "has_lateral_movement": <boolean: true or false>,
+    "movement_paths": [
+      {
+        "source_host": "<source_host>",
+        "target_host": "<target_host>",
+        "protocol": "SMB",
+        "used_account": "<used_account_or_unknown>"
+      }
+    ]
+  },
+  "compromised_assets": {
+    "hosts": ["<compromised_host_1>", "<compromised_host_2>"],
+    "identities": ["<compromised_account_1>"],
+    "exfiltrated_data_bytes": <integer: estimated bytes or 0>
+  },
+  "artefacts": [
+    "<file_path_or_registry_key_or_process_name_or_event_id>"
+  ],
+  "blast_radius": "<피해 확산 범위 요약 in Korean>",
+  "root_cause_hypothesis": "<사고 근본 원인 분석 in Korean>",
+  "forensic_summary": "<공격 체인 연관 분석 종합 요약 in Korean>"
 }
 """
 
 async def _llm_forensic(state: InvestigatorState) -> dict[str, Any]:
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "2048"))                                                    
-    llm = ChatOpenAI(model=model, temperature=0, max_tokens=max_tokens, response_format={"type":           
- "json_object"})
+    max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "16384"))
+    llm = ChatOpenAI(model=model, temperature=0, max_tokens=max_tokens)
 
     # Defence-in-depth: alert_summary, recon.summary, and the enrichment cache
     # can all carry attacker-controlled strings (banners, dark-web excerpts,
@@ -77,27 +99,29 @@ async def _llm_forensic(state: InvestigatorState) -> dict[str, Any]:
         max_depth=2,
     )
 
-    prompt = (
-        f"Alert summary:\n{safe_summary}\n\n"
+    bundle_append = format_bundle_prompt_append(state.context_bundle)
+    user_content = (
+        f"Alert: {safe_summary}\n\n"
         f"Recon findings:\n{safe_recon}\n"
         f"MITRE techniques: {safe_mitre}\n\n"
-        f"Enrichment data (sample):\n{enrichment_blob}"
+        f"Enrichment Data:\n{enrichment_blob}"
     )
-    bundle_append = format_bundle_prompt_append(state.context_bundle)
     if bundle_append:
-        prompt = f"{prompt}\n\n{bundle_append}"
+        user_content = f"{user_content}\n\n{bundle_append}"
 
-    messages = [
-        SystemMessage(content=_SYSTEM_PROMPT),
-        HumanMessage(content=prompt),
-    ]
+    messages = build_model_aware_messages(
+        system_prompt=_SYSTEM_PROMPT,
+        user_content=user_content,
+        model_name=model,
+    )
 
     prompt_hash = state.log_llm_prompt(
         agent="ForensicAgent",
-        prompt=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
+        prompt=build_audit_prompt_payload(
+            system_prompt=_SYSTEM_PROMPT,
+            user_content=user_content,
+            model_name=model,
+        ),
         model=model,
         purpose="forensic: timeline, artefacts, root cause, blast radius",
     )
@@ -119,9 +143,15 @@ async def _llm_forensic(state: InvestigatorState) -> dict[str, Any]:
             tool="llm.forensic",
         )
         cost_usd = call_record.cost_usd if call_record is not None else 0.0
+        reasoning = (
+            getattr(response, "additional_kwargs", {}).get("reasoning_content")
+            or getattr(response, "response_metadata", {}).get("reasoning_content")
+            or getattr(response, "reasoning_content", None)
+        )
         state.log_llm_response(
             agent="ForensicAgent",
             response=content if isinstance(content, str) else str(content),
+            reasoning_content=str(reasoning) if reasoning else None,
             prompt_hash=prompt_hash,
             model=model,
             tokens_used=tokens,
@@ -153,13 +183,35 @@ async def run_forensic(state_dict: dict[str, Any]) -> dict[str, Any]:
 
     llm_result = await _llm_forensic(state)
 
+    try:
+        conf_val = float(llm_result.get("confidence", 0.0))
+    except (ValueError, TypeError):
+        conf_val = 0.0
+
+    timeline_data = llm_result.get("timeline") or llm_result.get("attack_timeline") or []
+    if not isinstance(timeline_data, list):
+        timeline_data = [timeline_data] if timeline_data else []
+
+    blast_val = llm_result.get("blast_radius") or llm_result.get("compromised_assets") or ""
+    if isinstance(blast_val, dict):
+        hosts_str = ", ".join(blast_val.get("hosts", [])) if isinstance(blast_val.get("hosts"), list) else str(blast_val.get("hosts", ""))
+        users_str = ", ".join(blast_val.get("identities", [])) if isinstance(blast_val.get("identities"), list) else str(blast_val.get("identities", ""))
+        blast_str = f"영향 시스템: {hosts_str or '없음'} | 영향 계정: {users_str or '없음'}"
+    else:
+        blast_str = str(blast_val)
+
+    summary_str = str(llm_result.get("summary") or llm_result.get("forensic_summary") or "")
+    root_cause_str = str(llm_result.get("root_cause_hypothesis") or llm_result.get("root_cause_analysis") or "")
+
     state.forensic = ForensicFindings(
-        timeline=llm_result.get("timeline", []),
-        artefacts=llm_result.get("artefacts", []),
-        root_cause_hypothesis=llm_result.get("root_cause_hypothesis", ""),
-        blast_radius=llm_result.get("blast_radius", ""),
-        confidence=float(llm_result.get("confidence", 0.0)),
-        summary=llm_result.get("summary", ""),
+        timeline=timeline_data,
+        artefacts=normalize_string_list(llm_result.get("artefacts", [])),
+        root_cause_hypothesis=root_cause_str,
+        blast_radius=blast_str,
+        confidence=conf_val,
+        summary=summary_str,
+        lateral_movement_detected=llm_result.get("lateral_movement_detected", {}) if isinstance(llm_result.get("lateral_movement_detected"), dict) else {},
+        compromised_assets=llm_result.get("compromised_assets", {}) if isinstance(llm_result.get("compromised_assets"), dict) else {},
     )
 
     # Cite each forensic artefact as evidence for downstream replay

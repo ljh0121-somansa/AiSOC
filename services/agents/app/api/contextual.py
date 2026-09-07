@@ -379,7 +379,7 @@ async def _call_llm(system: str, user: str, model: str) -> tuple[str, int]:
         logger.warning("contextual.llm.import_failed", error=str(exc))
         return _fallback_response(system, user), 0
     max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "2048")) 
-    llm = ChatOpenAI(model=model, temperature=0.2, max_tokens=max_tokens, response_format={"type": "json_object"})
+    llm = ChatOpenAI(model=model, temperature=0.2, max_tokens=max_tokens)
     response = await safe_ainvoke(llm, [SystemMessage(content=system), HumanMessage(content=user)])
     text = response.content if isinstance(response.content, str) else str(response.content)
     try:
@@ -413,7 +413,7 @@ async def _stream_llm(system: str, user: str, model: str) -> AsyncIterator[str]:
             yield text[i : i + 8]
         return
     max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "2048")) 
-    llm = ChatOpenAI(model=model, temperature=0.2, max_tokens=max_tokens, streaming=True, response_format={"type": "json_object"})
+    llm = ChatOpenAI(model=model, temperature=0.2, max_tokens=max_tokens, streaming=True)
     buffer = ""
     async for chunk in safe_astream(llm, [SystemMessage(content=system), HumanMessage(content=user)]):
         if not hasattr(chunk, "content") or not chunk.content:

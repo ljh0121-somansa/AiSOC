@@ -19,8 +19,9 @@ from langchain_openai import ChatOpenAI
 
 from app.core.cost_telemetry import record_llm_call
 from app.llm import safe_ainvoke
+from app.llm.prompt_builder import build_audit_prompt_payload, build_model_aware_messages
 from app.prompt_serialization import summarize_structure_for_llm
-from app.investigator.utils import safe_parse_agent_json
+from app.investigator.utils import normalize_string_list, safe_parse_agent_json
 
 from .bundle_prompt import format_bundle_prompt_append
 from .prompt_sanitizer import (
@@ -32,43 +33,92 @@ from .tools import sha256_of
 
 logger = structlog.get_logger()
 
-_SYSTEM_PROMPT = """You are the ResponderAgent of an AI Security Operations Centre.
-Based on the forensic findings, generate a concrete incident response plan.
-All actions are DRY-RUN only — do NOT perform any real actions.
+_SYSTEM_PROMPT = """You are the ResponderAgent in an AI Security Operations Centre (AiSOC).
+Establish a prioritized containment and remediation plan based on forensic findings.
 
-CRITICAL FORMATTING RULES:
-   - Output ONLY raw JSON text matching the schema below.
-   - Absolute Prohibition: Do NOT output <think> tags, thinking process, reasoning steps, or markdown wrappers (NEVER use ```json or ```).
-   - Your response MUST strictly start with '{' and end with '}'.
-   - Value language: Write 'action', 'rationale', step lists, and 'summary' strictly in KOREAN.
-   - Tech specs: You MUST separate the exact CLI command or script (e.g. PowerShell, Bash, netsh, iptables, AD cmdlets) into the 'command' field of recommended_actions. Do NOT embed CLI commands inside the 'action' field, keep them in 'command' field separately for better readability. For steps arrays, include the command in backticks (`...`) inside the Korean text description.
-   - The JSON keys MUST remain in English.
-   - The values for 'risk' and 'risk_level' MUST strictly be one of: "low", "medium", "high", "critical" (do NOT translate these system status keywords).
-Respond ONLY with a JSON object:
+CRITICAL CONSTRAINTS:
+1. Return ONLY a valid JSON object matching the exact schema below.
+2. Write "rationale", "action_description", and "impact_assessment" in professional Korean.
+3. Keep commands, IP addresses, JSON keys, and protocol names in standard English.
+4. DO NOT over-analyze the target OS or directory environments. If exact OS is unknown, provide standard generic commands (e.g., iptables for Linux or generic PowerShell).
+
+[Example 1 - Linux Network Isolation]
+Output:
 {
-  "recommended_actions": [
+  "incident_disposition": {
+    "threat_level": "HIGH",
+    "containment_strategy": "TARGETED_BLOCKING",
+    "rationale": "내부 웹 서버에서 비정상 아웃바운드 트래픽이 감지되어 외부 공격 인프라와의 즉각적인 통신 차단이 필요합니다."
+  },
+  "containment_actions": [
     {
-      "priority": 1,
-      "action": "Korean action description explaining what to do",
-      "command": "Exact CLI command or script to execute (e.g., netsh interface ipv4 set subinterface ...)",
-      "rationale": "Korean rationale",
-      "risk": "low|medium|high"
+      "timeframe": "P1_UNDER_1_HOUR",
+      "action_type": "FIREWALL_BLOCK",
+      "target": "10.0.0.50",
+      "action_description": "알려진 외부 C2 서버 IP 대역으로의 아웃바운드 트래픽 전면 차단",
+      "command_or_rule": "iptables -A OUTPUT -d 198.51.100.0/24 -j DROP",
+      "requires_hitl_approval": true
     }
   ],
-  "containment_steps": ["Step 1: ...", "Step 2: ..." all steps in Korean text with `CLI command`],
-  "eradication_steps": ["Korean text with `CLI command`"],
-  "recovery_steps": ["Korean text with `CLI command`"],
-  "estimated_effort_hours": 4.0,
-  "risk_level": "low|medium|high|critical",
-  "summary": "Two-sentence response summary in Korean."
+  "business_impact_assessment": {
+    "service_interruption_risk": "LOW",
+    "impact_assessment": "악성 목적지 IP만 선별 차단하므로 정상적인 대고객 웹 서비스에는 지장이 없습니다."
+  }
+}
+
+[Example 2 - Windows Credential Reset]
+Output:
+{
+  "incident_disposition": {
+    "threat_level": "CRITICAL",
+    "containment_strategy": "AGGRESSIVE_ISOLATION",
+    "rationale": "자격 증명 탈취 후 내부 AD 서버로의 횡적이동이 확인되어 즉각적인 계정 무효화가 시급합니다."
+  },
+  "containment_actions": [
+    {
+      "timeframe": "P1_UNDER_1_HOUR",
+      "action_type": "CREDENTIAL_RESET",
+      "target": "admin_user",
+      "action_description": "침해 의심 계정의 강제 세션 만료 및 비밀번호 초기화",
+      "command_or_rule": "Revoke-AzureADUserAllRefreshToken -ObjectId admin_user; Set-ADAccountPassword -Identity admin_user -Reset",
+      "requires_hitl_approval": false
+    }
+  ],
+  "business_impact_assessment": {
+    "service_interruption_risk": "MEDIUM",
+    "impact_assessment": "해당 관리자 계정을 사용하는 배치 스크립트나 서비스가 있을 경우 일시적 인증 실패가 발생할 수 있습니다."
+  }
+}
+
+JSON Schema:
+{
+  "incident_disposition": {
+    "threat_level": "<CRITICAL|HIGH|MEDIUM|LOW>",
+    "containment_strategy": "<AGGRESSIVE_ISOLATION|TARGETED_BLOCKING|MONITORING>",
+    "rationale": "<대응 전략 선정 근거 in Korean>"
+  },
+  "containment_actions": [
+    {
+      "timeframe": "<P1_UNDER_1_HOUR|P2_UNDER_4_HOURS|P3_UNDER_24_HOURS>",
+      "action_type": "<NETWORK_ISOLATION|FIREWALL_BLOCK|ACCOUNT_SUSPENSION|CREDENTIAL_RESET|THREAT_HUNTING>",
+      "target": "<target_host_ip_or_user>",
+      "action_description": "<대응 조치 설명 in Korean>",
+      "command_or_rule": "<actionable_command_or_firewall_rule>",
+      "requires_hitl_approval": <boolean: true or false>
+    }
+  ],
+  "business_impact_assessment": {
+    "service_interruption_risk": "<HIGH|MEDIUM|LOW>",
+    "impact_assessment": "<비즈니스 영향도 평가 in Korean>"
+  },
+  "estimated_effort_hours": <float: e.g. 2.5>
 }
 """
 
 async def _llm_responder(state: InvestigatorState) -> dict[str, Any]:
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "2048"))                                                    
-    llm = ChatOpenAI(model=model, temperature=0, max_tokens=max_tokens, response_format={"type":           
- "json_object"})
+    max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "16384"))
+    llm = ChatOpenAI(model=model, temperature=0, max_tokens=max_tokens)
 
     # Defence-in-depth: every field surfaced here originated in attacker-
     # influenced data (alert payloads, banners, dark-web excerpts, LLM
@@ -87,30 +137,30 @@ async def _llm_responder(state: InvestigatorState) -> dict[str, Any]:
         max_depth=2,
     )
 
-    prompt = (
+    user_content = (
         f"Alert: {safe_alert}\n\n"
         f"Root cause: {safe_root_cause}\n"
         f"Blast radius: {safe_blast}\n"
         f"Confidence: {state.forensic.confidence:.0%}\n"
-        f"MITRE: {safe_mitre}\n"
-        f"Threat actors: {safe_actors}\n\n"
-        f"Timeline (last 5):\n{timeline_blob}"
+        f"Threat actors: {safe_actors}"
     )
     bundle_append = format_bundle_prompt_append(state.context_bundle)
     if bundle_append:
-        prompt = f"{prompt}\n\n{bundle_append}"
+        user_content = f"{user_content}\n\n{bundle_append}"
 
-    messages = [
-        SystemMessage(content=_SYSTEM_PROMPT),
-        HumanMessage(content=prompt),
-    ]
+    messages = build_model_aware_messages(
+        system_prompt=_SYSTEM_PROMPT,
+        user_content=user_content,
+        model_name=model,
+    )
 
     prompt_hash = state.log_llm_prompt(
         agent="ResponderAgent",
-        prompt=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
+        prompt=build_audit_prompt_payload(
+            system_prompt=_SYSTEM_PROMPT,
+            user_content=user_content,
+            model_name=model,
+        ),
         model=model,
         purpose="responder: containment/eradication/recovery plan",
     )
@@ -132,9 +182,15 @@ async def _llm_responder(state: InvestigatorState) -> dict[str, Any]:
             tool="llm.responder",
         )
         cost_usd = call_record.cost_usd if call_record is not None else 0.0
+        reasoning = (
+            getattr(response, "additional_kwargs", {}).get("reasoning_content")
+            or getattr(response, "response_metadata", {}).get("reasoning_content")
+            or getattr(response, "reasoning_content", None)
+        )
         state.log_llm_response(
             agent="ResponderAgent",
             response=content if isinstance(content, str) else str(content),
+            reasoning_content=str(reasoning) if reasoning else None,
             prompt_hash=prompt_hash,
             model=model,
             tokens_used=tokens,
@@ -165,15 +221,53 @@ async def run_responder(state_dict: dict[str, Any]) -> dict[str, Any]:
 
     llm_result = await _llm_responder(state)
 
+    # Extract risk_level from incident_disposition or direct key
+    disp = llm_result.get("incident_disposition", {}) if isinstance(llm_result.get("incident_disposition"), dict) else {}
+    risk_lvl = str(disp.get("threat_level") or llm_result.get("risk_level") or "medium").lower()
+    if risk_lvl not in ("critical", "high", "medium", "low"):
+        risk_lvl = "medium"
+
+    # Extract summary from disposition rationale or summary
+    resp_summary = str(disp.get("rationale") or llm_result.get("summary") or "")
+
+    # Extract containment actions
+    actions_raw = llm_result.get("containment_actions") or llm_result.get("recommended_actions") or []
+    containment: list[str] = []
+    eradication: list[str] = []
+    recovery: list[str] = []
+    rec_actions: list[dict[str, Any]] = []
+
+    if isinstance(actions_raw, list):
+        for act in actions_raw:
+            if isinstance(act, dict):
+                desc = act.get("action_description") or act.get("description") or act.get("action") or str(act)
+                tf = act.get("timeframe", "")
+                atype = act.get("action_type", "")
+                cmd = act.get("command_or_rule", "")
+                
+                step_str = f"[{atype}] {desc}" + (f" (실행: `{cmd}`)" if cmd else "")
+                if "P1" in tf or "1_HOUR" in tf:
+                    containment.append(step_str)
+                elif "P2" in tf or "4_HOURS" in tf:
+                    eradication.append(step_str)
+                else:
+                    recovery.append(step_str)
+                rec_actions.append(act)
+            elif isinstance(act, str):
+                containment.append(act)
+
     state.responder = ResponderPlan(
-        recommended_actions=llm_result.get("recommended_actions", []),
-        containment_steps=llm_result.get("containment_steps", []),
-        eradication_steps=llm_result.get("eradication_steps", []),
-        recovery_steps=llm_result.get("recovery_steps", []),
-        estimated_effort_hours=float(llm_result.get("estimated_effort_hours", 0)),
-        risk_level=llm_result.get("risk_level", "medium"),
+        recommended_actions=rec_actions or llm_result.get("recommended_actions", []),
+        containment_steps=containment or normalize_string_list(llm_result.get("containment_steps", [])),
+        eradication_steps=eradication or normalize_string_list(llm_result.get("eradication_steps", [])),
+        recovery_steps=recovery or normalize_string_list(llm_result.get("recovery_steps", [])),
+        estimated_effort_hours=float(llm_result.get("estimated_effort_hours", 2.0)),
+        risk_level=risk_lvl,
         dry_run=True,
-        summary=llm_result.get("summary", ""),
+        summary=resp_summary,
+        incident_disposition=llm_result.get("incident_disposition", {}) if isinstance(llm_result.get("incident_disposition"), dict) else {},
+        containment_actions=llm_result.get("containment_actions", []) if isinstance(llm_result.get("containment_actions"), list) else [],
+        business_impact_assessment=llm_result.get("business_impact_assessment", {}) if isinstance(llm_result.get("business_impact_assessment"), dict) else {},
     )
 
     # Record the headline risk decision so auditors can see why we picked this level

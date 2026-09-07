@@ -1183,9 +1183,19 @@ function InvestigationPanel({
         {/* Recon */}
         <div className="rounded-xl border border-slate-800/80 bg-slate-900/40 p-4 space-y-2">
           <h4 className="text-xs font-semibold uppercase tracking-wide text-blue-300">Recon</h4>
-          {recon?.summary != null && <p className="text-xs text-slate-400">{String(recon.summary)}</p>}
+          {recon?.summary != null && recon.summary !== '' && <p className="text-xs text-slate-400">{String(recon.summary)}</p>}
+          
+          {Array.isArray(recon?.threat_actors) && recon.threat_actors.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-1">
+              <p className="text-[11px] text-slate-500 mr-1 mt-0.5">Threat Actors:</p>
+              {(recon.threat_actors as string[]).map((t) => (
+                <span key={t} className="rounded bg-red-500/10 px-1.5 py-0.5 text-[10px] text-red-300 ring-1 ring-red-500/20">{t}</span>
+              ))}
+            </div>
+          )}
+
           {Array.isArray(recon?.iocs) && recon.iocs.length > 0 && (
-            <div>
+            <div className="mt-3">
               <p className="text-[11px] text-slate-500 mb-1">IOCs found:</p>
               <ul className="space-y-0.5">
                 {(recon.iocs as Array<{ type: string; value: string }>).slice(0, 5).map((ioc) => (
@@ -1197,7 +1207,7 @@ function InvestigationPanel({
             </div>
           )}
           {Array.isArray(recon?.mitre_techniques) && recon.mitre_techniques.length > 0 && (
-            <div className="flex flex-wrap gap-1">
+            <div className="mt-3 flex flex-wrap gap-1">
               {(recon.mitre_techniques as string[]).map((t) => (
                 <span key={t} className="rounded bg-orange-500/10 px-1.5 py-0.5 text-[10px] text-orange-300 ring-1 ring-orange-500/20">{t}</span>
               ))}
@@ -1208,15 +1218,55 @@ function InvestigationPanel({
         {/* Forensic */}
         <div className="rounded-xl border border-slate-800/80 bg-slate-900/40 p-4 space-y-2">
           <h4 className="text-xs font-semibold uppercase tracking-wide text-purple-300">Forensic</h4>
-          {forensic?.summary != null && <p className="text-xs text-slate-400">{String(forensic.summary)}</p>}
-          {forensic?.root_cause_hypothesis != null && (
-            <div>
-              <p className="text-[11px] text-slate-500">Root cause hypothesis:</p>
+          {forensic?.summary != null && forensic.summary !== '' && <p className="text-xs text-slate-400">{String(forensic.summary)}</p>}
+          
+          {forensic?.root_cause_hypothesis != null && forensic.root_cause_hypothesis !== '' && (
+            <div className="mt-2">
+              <p className="text-[11px] font-medium text-slate-500">Root cause hypothesis:</p>
               <p className="text-xs text-slate-300">{String(forensic.root_cause_hypothesis)}</p>
             </div>
           )}
+          
+          {forensic?.blast_radius != null && forensic.blast_radius !== '' && (
+            <div className="mt-2">
+              <p className="text-[11px] font-medium text-slate-500">Blast radius:</p>
+              <p className="text-xs text-slate-300">{String(forensic.blast_radius)}</p>
+            </div>
+          )}
+
+          {Array.isArray(forensic?.timeline) && forensic.timeline.length > 0 && (
+            <div className="mt-3">
+              <p className="text-[11px] font-medium text-purple-400/80 mb-1.5 uppercase tracking-wider">Attack Timeline</p>
+              <ul className="space-y-2">
+                {(forensic.timeline as any[]).map((step, i) => {
+                  if (typeof step === 'string') {
+                    return (
+                      <li key={i} className="flex items-start gap-1.5 text-xs text-slate-300">
+                        <span className="mt-1 h-1.5 w-1.5 flex-none rounded-full bg-purple-400" />
+                        <span>{step}</span>
+                      </li>
+                    );
+                  }
+                  return (
+                    <li key={i} className="flex items-start gap-1.5 text-xs text-slate-300">
+                      <span className="mt-1 h-1.5 w-1.5 flex-none rounded-full bg-purple-400" />
+                      <div className="flex flex-col w-full">
+                        <span className="font-medium text-slate-200">
+                          {step.event_type || 'Event'} 
+                          {step.mitre_technique && <span className="ml-1 text-[10px] text-slate-500 font-mono">({step.mitre_technique})</span>}
+                        </span>
+                        {step.host && <span className="text-[10px] text-slate-400">Host: {step.host}</span>}
+                        <span className="mt-0.5 text-slate-400">{step.description}</span>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          )}
+
           {typeof forensic?.confidence === 'number' && (
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 mt-3 pt-2 border-t border-slate-700/50">
               <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-800">
                 <div className="h-full rounded-full bg-purple-500" style={{ width: `${(forensic.confidence as number) * 100}%` }} />
               </div>
@@ -1228,23 +1278,59 @@ function InvestigationPanel({
         {/* Responder */}
         <div className="rounded-xl border border-slate-800/80 bg-slate-900/40 p-4 space-y-2">
           <h4 className="text-xs font-semibold uppercase tracking-wide text-amber-300">Response</h4>
-          {responder?.summary != null && <p className="text-xs text-slate-400">{String(responder.summary)}</p>}
-          {Array.isArray(responder?.recommended_actions) && (
-            <ul className="space-y-2">
-              {(responder.recommended_actions as any[]).slice(0, 4).map((action, i) => (
-                <li key={i} className="flex items-start gap-1.5 text-xs text-slate-300">
-                  <span className="mt-1 h-1.5 w-1.5 flex-none rounded-full bg-amber-400" />
-                  <div className="flex flex-col gap-1 w-full">
-                    <span>{typeof action === 'string' ? action : action?.action ?? JSON.stringify(action)}</span>
-                    {typeof action !== 'string' && action?.command && (
-                      <code className="text-[10px] bg-slate-950/80 px-2 py-1 rounded text-amber-200 font-mono select-all block w-full mt-1 border border-slate-800/80 overflow-x-auto whitespace-nowrap">
-                        {action.command}
-                      </code>
-                    )}
-                  </div>
-                </li>
-              ))}
-            </ul>
+          {responder?.summary != null && responder.summary !== '' && <p className="text-xs text-slate-400">{String(responder.summary)}</p>}
+          
+          {Array.isArray(responder?.containment_steps) && responder.containment_steps.length > 0 && (
+            <div className="mt-3">
+              <p className="text-[11px] font-medium text-amber-400/80 mb-1.5 uppercase tracking-wider">Containment (P1)</p>
+              <ul className="space-y-2">
+                {(responder.containment_steps as any[]).slice(0, 3).map((step, i) => (
+                  <li key={i} className="flex items-start gap-1.5 text-xs text-slate-300">
+                    <span className="mt-1 h-1.5 w-1.5 flex-none rounded-full bg-amber-400" />
+                    <div className="flex flex-col gap-1 w-full">
+                      <span>{typeof step === 'string' ? step : JSON.stringify(step)}</span>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {Array.isArray(responder?.eradication_steps) && responder.eradication_steps.length > 0 && (
+            <div className="mt-3">
+              <p className="text-[11px] font-medium text-orange-400/80 mb-1.5 uppercase tracking-wider">Eradication (P2)</p>
+              <ul className="space-y-2">
+                {(responder.eradication_steps as any[]).slice(0, 3).map((step, i) => (
+                  <li key={i} className="flex items-start gap-1.5 text-xs text-slate-300">
+                    <span className="mt-1 h-1.5 w-1.5 flex-none rounded-full bg-orange-400" />
+                    <div className="flex flex-col gap-1 w-full">
+                      <span>{typeof step === 'string' ? step : JSON.stringify(step)}</span>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          
+          {Array.isArray(responder?.recommended_actions) && responder.recommended_actions.length > 0 && (
+            <div className="mt-3">
+              <p className="text-[11px] font-medium text-slate-500 mb-1.5 uppercase tracking-wider">Additional Actions</p>
+              <ul className="space-y-2">
+                {(responder.recommended_actions as any[]).slice(0, 2).map((action, i) => (
+                  <li key={i} className="flex items-start gap-1.5 text-xs text-slate-300">
+                    <span className="mt-1 h-1.5 w-1.5 flex-none rounded-full bg-slate-600" />
+                    <div className="flex flex-col gap-1 w-full">
+                      <span>{typeof action === 'string' ? action : action?.action_description ?? action?.action ?? JSON.stringify(action)}</span>
+                      {typeof action !== 'string' && action?.command_or_rule && (
+                        <code className="text-[10px] bg-slate-950/80 px-2 py-1 rounded text-amber-200 font-mono select-all block w-full mt-1 border border-slate-800/80 overflow-x-auto whitespace-nowrap">
+                          {action.command_or_rule}
+                        </code>
+                      )}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
           )}
           {responder?.risk_level != null && (
             <span className={clsx(

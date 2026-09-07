@@ -94,11 +94,19 @@ async def get_attack_chain(
             raise HTTPException(status_code=404, detail="case_not_found")
         alert_ids = list(case_row.alert_ids or [])
 
-    # Pick the seed alert: earliest event_time linked to the case. We
-    # prefer ``case.alert_ids`` (denormalised) but fall back to a probe
-    # on ``alerts.case_id`` if that list is empty so a freshly-linked
-    # case still resolves.
     seed_alert_id: uuid.UUID | None = None
+    # If not found yet, check if case_id is actually an alert_id in alerts table
+    direct_alert = (
+        await db.execute(
+            select(Alert)
+            .where(
+                Alert.id == case_id,
+                Alert.tenant_id == user.tenant_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if direct_alert is not None:
+        seed_alert_id = direct_alert.id
     candidate_ids: list[uuid.UUID] = []
     if alert_ids:
         for a in alert_ids:

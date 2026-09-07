@@ -67,6 +67,8 @@ class ReconFindings(BaseModel):
     attack_surface: dict[str, Any] = Field(default_factory=dict)
     mitre_techniques: list[str] = Field(default_factory=list)
     summary: str = ""
+    triage: dict[str, Any] = Field(default_factory=dict)
+    investigation_hypotheses: list[str] = Field(default_factory=list)
 
 
 class ForensicFindings(BaseModel):
@@ -78,7 +80,8 @@ class ForensicFindings(BaseModel):
     blast_radius: str = ""
     confidence: float = 0.0  # 0–1
     summary: str = ""
-
+    lateral_movement_detected: dict[str, Any] = Field(default_factory=dict)
+    compromised_assets: dict[str, Any] = Field(default_factory=dict)
 
 class ResponderPlan(BaseModel):
     """Output of ResponderAgent (dry-run — no live execution)."""
@@ -91,6 +94,9 @@ class ResponderPlan(BaseModel):
     risk_level: str = "medium"
     dry_run: bool = True
     summary: str = ""
+    incident_disposition: dict[str, Any] = Field(default_factory=dict)
+    containment_actions: list[dict[str, Any]] = Field(default_factory=list)
+    business_impact_assessment: dict[str, Any] = Field(default_factory=dict)
 
 
 class InvestigatorState(BaseModel):
@@ -185,13 +191,14 @@ class InvestigatorState(BaseModel):
         agent: str,
         response: str,
         *,
+        reasoning_content: str | None = None,
         prompt_hash: str | None = None,
         model: str | None = None,
         tokens_used: int = 0,
         latency_ms: int = 0,
         cost_usd: float = 0.0,
     ) -> str:
-        """Record the literal LLM response. Returns the output hash."""
+        """Record the literal LLM response and optional reasoning/thinking content. Returns output hash."""
         output_hash = _stable_hash(response)
         meta = {
             "response": response[:8000],
@@ -200,6 +207,8 @@ class InvestigatorState(BaseModel):
             "cost_usd": cost_usd,
             "prompt_hash": prompt_hash,
         }
+        if reasoning_content:
+            meta["reasoning_content"] = reasoning_content[:16000]
         self.audit_log.append(
             AuditEntry(
                 kind=StepKind.LLM_RESPONSE,

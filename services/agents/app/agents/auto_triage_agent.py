@@ -22,7 +22,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from app.investigator.prompt_sanitizer import sanitize_text, wrap_untrusted
+from app.investigator.utils import safe_parse_agent_json
 from app.llm import safe_ainvoke
+from app.llm.prompt_builder import build_model_aware_messages
 from app.models.state import AgentStatus, InvestigationState
 from app.prompt_serialization import format_extra_fields_for_llm
 
@@ -40,36 +42,29 @@ _metrics: dict[str, Any] = {
     "tp_count": 0,
 }
 
-_SYSTEM_PROMPT = """\
-You are the Auto-Triage Agent of an AI Security Operations Centre.
+_SYSTEM_PROMPT = """You are the Auto-Triage Agent of an AI Security Operations Centre.
+Classify incoming security alerts into exactly one verdict: true_positive, false_positive, or benign.
 
-Given a security alert (summary + raw payload), classify it into exactly one
-of three verdicts:
+[Example 1]
+Alert: Suspicious login from unknown public IP 198.51.100.23
+Output:
+{"verdict": "true_positive", "confidence": 0.85, "rationale": "인가되지 않은 외부 공인 IP 대역에서의 로그인 시도로 계정 탈취 의심이 있어 심층 조사가 필요합니다."}
 
-  • true_positive  — the alert describes a genuine security threat that
-    requires investigation and potential response.
-  • false_positive — the alert was triggered by benign activity that
-    superficially resembles a threat (e.g. scheduled vulnerability scans,
-    authorised pen-tests, known-good software flagged by signature).
-  • benign — the alert describes real but non-threatening activity that
-    does not warrant investigation (e.g. informational log, expected
-    configuration change).
+[Example 2]
+Alert: Scheduled Nessus Vulnerability Scanner activity on port 443
+Output:
+{"verdict": "false_positive", "confidence": 0.95, "rationale": "보안팀의 승인된 정기 취약점 점검 도구에 의해 발생한 정상 스캔 이벤트입니다."}
 
-You MUST respond with a JSON object and nothing else:
-{
-  "verdict": "true_positive" | "false_positive" | "benign",
-  "confidence": <float 0.0–1.0>,
-  "rationale": "<2-4 sentence explanation of your reasoning in Korean>"
-}
+[Example 3]
+Alert: Low-priority informational DNS query log with no IOC match
+Output:
+{"verdict": "benign", "confidence": 0.90, "rationale": "알려진 악성 IOC나 이상 징후가 없는 단순 정보성 DNS 쿼리 로그입니다."}
 
-Reasoning guidelines:
-- Consider the severity, IOC presence, MITRE technique IDs, and alert context.
-- Vendor risk_score > 0.7 with critical keywords strongly suggests TP.
-- Alerts about scheduled scans, test environments, or known-good hashes lean FP.
-- Informational alerts with no IOCs and low risk lean benign.
-- Be conservative: when uncertain, lean toward true_positive to avoid missing threats.
-- confidence should reflect how certain you are, not the severity of the threat.
-- LANGUAGE RULE: To optimize token usage, perform all internal reasoning and JSON keys in English, but you MUST write the "rationale" value in natural, professional Korean for the security analyst UI.
+[Response Format]
+Return ONLY a valid JSON object matching the examples above.
+- "verdict": "true_positive" | "false_positive" | "benign"
+- "confidence": float between 0.0 and 1.0
+- "rationale": Professional explanation in Korean
 """
 
 
@@ -132,31 +127,33 @@ def _build_alert_context(state: InvestigationState) -> str:
 
 
 def _parse_llm_response(text: str) -> dict[str, Any]:
-    """Extract the JSON verdict from the LLM response, tolerating markdown fences."""
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.split("\n")
-        lines = [line for line in lines if not line.strip().startswith("```")]
-        cleaned = "\n".join(lines).strip()
+    """Extract the JSON verdict from the LLM response, tolerating markdown fences and thinking tags."""
+    if not text or not str(text).strip():
+        return {
+            "verdict": "true_positive",
+            "confidence": 0.5,
+            "rationale": "Empty LLM response received; escalating for manual triage.",
+        }
 
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}") + 1
-        if start >= 0 and end > start:
-            data = json.loads(cleaned[start:end])
-        else:
-            raise
+    data = safe_parse_agent_json(text)
+    if not data or not isinstance(data, dict):
+        return {
+            "verdict": "true_positive",
+            "confidence": 0.5,
+            "rationale": "Unstructured LLM response received; escalating for manual triage.",
+        }
 
     verdict = data.get("verdict", "true_positive")
     if verdict not in ("true_positive", "false_positive", "benign"):
         verdict = "true_positive"
 
-    confidence = float(data.get("confidence", 0.5))
+    try:
+        confidence = float(data.get("confidence", 0.5))
+    except (ValueError, TypeError):
+        confidence = 0.5
     confidence = max(0.0, min(1.0, confidence))
 
-    rationale = data.get("rationale", "No rationale provided by LLM.")
+    rationale = data.get("rationale") or "No rationale provided by LLM."
 
     return {
         "verdict": verdict,
@@ -178,22 +175,26 @@ async def run_auto_triage(state: InvestigationState) -> InvestigationState:
     alert_context = _build_alert_context(state)
 
     model_name = os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or os.getenv("AISOC_LLM_MODEL", "gpt-4o-mini")
-    llm = ChatOpenAI(model=model_name, temperature=0.0, max_tokens=512, response_format={"type":           
- "json_object"})
+    llm = ChatOpenAI(model=model_name, temperature=0.0, max_tokens=1024)
 
     t0 = time.monotonic()
+    raw_text = ""
     try:
-        response = await safe_ainvoke(
-            llm,
-            [
-                SystemMessage(content=_SYSTEM_PROMPT),
-                HumanMessage(content=alert_context),
-            ],
+        messages = build_model_aware_messages(
+            system_prompt=_SYSTEM_PROMPT,
+            user_content=f"ALERT TELEMETRY:\n{alert_context}",
+            model_name=model_name,
         )
-        raw_text = response.content
+        response = await safe_ainvoke(llm, messages)
+        raw_text = str(getattr(response, "content", ""))
         result = _parse_llm_response(raw_text)
     except Exception as exc:
-        logger.error("Auto-triage LLM call failed, escalating", error=str(exc))
+        logger.error(
+            "Auto-triage LLM call failed, escalating",
+            error=str(exc),
+            raw_response=raw_text[:200] if raw_text else "N/A",
+            incident_id=str(state.incident_id),
+        )
         state.add_finding(f"Auto-triage LLM error: {exc} — escalating to manual triage")
         _metrics["escalated_count"] += 1
         _metrics["total_processed"] += 1

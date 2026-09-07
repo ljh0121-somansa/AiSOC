@@ -20,47 +20,37 @@ from langchain_openai import ChatOpenAI
 
 from app.context import ContextBundle
 from app.investigator.prompt_sanitizer import sanitize_text, wrap_untrusted
+from app.investigator.utils import safe_parse_agent_json
 from app.llm import safe_ainvoke
+from app.llm.prompt_builder import build_model_aware_messages
 from app.models.state import AgentStatus, InvestigationState
 from app.prompt_serialization import format_extra_fields_for_llm, summarize_structure_for_llm
 
 logger = structlog.get_logger()
 
-_SYSTEM_PROMPT = """\
-You are the Insider Threat Analysis Agent of an AI Security Operations Centre.
+_SYSTEM_PROMPT = """You are the Insider Threat Analysis Agent of an AI Security Operations Centre.
+Investigate insider-threat alerts and classify into: true_positive, false_positive, or benign.
 
-Given a security alert that may indicate insider-threat activity, perform a
-thorough investigation and produce a structured assessment.
+[Example 1]
+Alert: User copied 50GB of sensitive database dumps to unauthorized USB drive at 2 AM
+Output:
+{"verdict": "true_positive", "confidence": 0.95, "threat_indicators": ["bulk_download", "usb_storage_attached", "off_hours_access"], "threat_category": "data_exfiltration", "user_risk_level": "critical", "rationale": "심야 시간에 대용량 기밀 데이터를 비인가 USB로 유출하려는 정황 포착."}
 
-Evaluate the following behavioural patterns:
-1. Data exfiltration — large file transfers, bulk downloads from sensitive
-   repositories, unusually high print volumes, or mass email forwarding to
-   external addresses.
-2. Off-hours access — login or system activity during atypical hours for the
-   user's baseline schedule.
-3. Privilege abuse — accessing systems or data outside the user's role,
-   creating unauthorised accounts, elevating own privileges, or disabling
-   security controls.
-4. Removable media / USB — USB mass storage device connections, especially on
-   hosts where removable media is policy-prohibited.
-5. Communication to personal accounts — sending corporate data to personal
-   email (gmail, outlook, yahoo), personal cloud storage (Dropbox, Google
-   Drive), or messaging apps.
-6. Resignation / termination indicators — user is on notice period, recently
-   received negative performance review, or has submitted resignation.
+[Example 2]
+Alert: Scheduled monthly data backup job executed by service account
+Output:
+{"verdict": "benign", "confidence": 0.90, "threat_indicators": [], "threat_category": "unknown", "user_risk_level": "low", "rationale": "정기 시스템 백업 스크립트에 의한 정상 대용량 파일 생성."}
 
-You MUST respond with a JSON object and nothing else:
+[Response Format]
+Return ONLY a JSON object:
 {
   "verdict": "true_positive" | "false_positive" | "benign",
-  "confidence": <float 0.0–1.0>,
-  "threat_indicators": ["<indicator1>", "<indicator2>", ...],
-  "threat_category": "data_exfiltration" | "off_hours_access" |
-                     "privilege_abuse" | "removable_media" |
-                     "personal_comms" | "flight_risk" | "unknown",
+  "confidence": <float 0.0-1.0>,
+  "threat_indicators": ["<indicator1>", "<indicator2>"],
+  "threat_category": "data_exfiltration" | "off_hours_access" | "privilege_abuse" | "removable_media" | "personal_comms" | "flight_risk" | "unknown",
   "user_risk_level": "low" | "medium" | "high" | "critical",
-  "rationale": "<2-4 sentence explanation in Korean>"
+  "rationale": "<한국어 분석 근거>"
 }
-- LANGUAGE RULE: To optimize token usage, perform all internal reasoning and JSON keys in English, but you MUST write the "rationale" value in natural, professional Korean for the security analyst UI.
 """
 
 
@@ -157,33 +147,33 @@ def _build_insider_context(state: InvestigationState) -> str:
 
 def _parse_response(text: str) -> dict[str, Any]:
     """Extract JSON verdict from LLM output."""
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.split("\n")
-        lines = [line for line in lines if not line.strip().startswith("```")]
-        cleaned = "\n".join(lines).strip()
+    if not text or not str(text).strip():
+        raise ValueError("LLM returned empty response")
 
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}") + 1
-        if start >= 0 and end > start:
-            data = json.loads(cleaned[start:end])
-        else:
-            raise
+    data = safe_parse_agent_json(text)
+    if not data or not isinstance(data, dict):
+        raise ValueError(f"Failed to parse valid JSON from LLM response (raw: {str(text)[:200]!r})")
 
     verdict = data.get("verdict", "true_positive")
     if verdict not in ("true_positive", "false_positive", "benign"):
         verdict = "true_positive"
 
-    confidence = max(0.0, min(1.0, float(data.get("confidence", 0.5))))
+    try:
+        confidence = float(data.get("confidence", 0.5))
+    except (ValueError, TypeError):
+        confidence = 0.5
+    confidence = max(0.0, min(1.0, confidence))
+
     indicators = data.get("threat_indicators", [])
-    threat_category = data.get("threat_category", "unknown")
-    user_risk = data.get("user_risk_level", "medium")
+    if not isinstance(indicators, list):
+        indicators = [str(indicators)] if indicators else []
+
+    threat_category = str(data.get("threat_category", "unknown"))
+    user_risk = str(data.get("user_risk_level", "medium"))
     if user_risk not in ("low", "medium", "high", "critical"):
         user_risk = "medium"
-    rationale = str(data.get("rationale", "No rationale provided."))
+
+    rationale = str(data.get("rationale") or "No rationale provided.")
 
     return {
         "verdict": verdict,
@@ -220,21 +210,26 @@ async def run_insider_threat(
     prompt_context = base_context + (("\n" + "\n".join(bundle_lines)) if bundle_lines else "")
 
     model_name = os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or os.getenv("AISOC_LLM_MODEL", "gpt-4o-mini")
-    llm = ChatOpenAI(model=model_name, temperature=0.0, max_tokens=768, response_format={"type":           
- "json_object"})
+    llm = ChatOpenAI(model=model_name, temperature=0.0, max_tokens=1024)
 
     t0 = time.monotonic()
+    raw_text = ""
     try:
-        response = await safe_ainvoke(
-            llm,
-            [
-                SystemMessage(content=_SYSTEM_PROMPT),
-                HumanMessage(content=prompt_context),
-            ],
+        messages = build_model_aware_messages(
+            system_prompt=_SYSTEM_PROMPT,
+            user_content=prompt_context,
+            model_name=model_name,
         )
-        result = _parse_response(response.content)
+        response = await safe_ainvoke(llm, messages)
+        raw_text = str(getattr(response, "content", ""))
+        result = _parse_response(raw_text)
     except Exception as exc:
-        logger.error("Insider threat agent LLM call failed", error=str(exc))
+        logger.error(
+            "Insider threat agent LLM call failed",
+            error=str(exc),
+            raw_response=raw_text[:200] if raw_text else "N/A",
+            incident_id=str(state.incident_id),
+        )
         state.add_finding(f"Insider threat analysis LLM error: {exc}")
         return state
 

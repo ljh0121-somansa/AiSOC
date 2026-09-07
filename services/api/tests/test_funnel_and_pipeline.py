@@ -95,35 +95,34 @@ def _scalars_all_result(values: list) -> MagicMock:
 class TestPctDelta:
     """Period-over-period percentage helper.
 
-    Tiny and pure — the contract is exactly two lines: zero-base
-    returns 0.0 (never ``inf``), otherwise round to two decimals.
+    Returns fractional ratios (0.5 for +50%, -0.25 for -25%).
+    Returns None when previous is zero and current > 0.
+    Returns 0.0 when both are zero.
     """
 
-    def test_zero_previous_returns_zero(self) -> None:
+    def test_zero_previous_returns_none_or_zero(self) -> None:
         from app.api.v1.endpoints.metrics import _pct_delta
 
-        # The dashboard cannot render ``inf`` or ``NaN`` — we'd
-        # rather show "no change" than a useless ∞ pill.
-        assert _pct_delta(10.0, 0.0) == 0.0
+        assert _pct_delta(10.0, 0.0) is None
         assert _pct_delta(0.0, 0.0) == 0.0
 
     def test_positive_change(self) -> None:
         from app.api.v1.endpoints.metrics import _pct_delta
 
-        # 100 → 150 ⇒ +50% exactly.
-        assert _pct_delta(150.0, 100.0) == 50.0
+        # 100 → 150 ⇒ +0.5 (+50%) exactly.
+        assert _pct_delta(150.0, 100.0) == 0.5
 
     def test_negative_change(self) -> None:
         from app.api.v1.endpoints.metrics import _pct_delta
 
-        # 100 → 75 ⇒ −25% exactly.
-        assert _pct_delta(75.0, 100.0) == -25.0
+        # 100 → 75 ⇒ −0.25 (−25%) exactly.
+        assert _pct_delta(75.0, 100.0) == -0.25
 
-    def test_rounds_to_two_decimals(self) -> None:
+    def test_rounds_to_four_decimals(self) -> None:
         from app.api.v1.endpoints.metrics import _pct_delta
 
-        # 3/7 ⇒ 0.4285714… ⇒ 42.86% (2 dp).
-        assert _pct_delta(10.0, 7.0) == round(((10 - 7) / 7) * 100.0, 2)
+        # 3/7 ⇒ 0.4285714… ⇒ 0.4286 (4 dp).
+        assert _pct_delta(10.0, 7.0) == round((10 - 7) / 7, 4)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -385,19 +384,19 @@ class TestGetFunnelMetrics:
         assert payload.correlation_efficiency == 0.15
         assert payload.alert_yield == 0.25
         assert payload.mitre_coverage.covered == 30
-        # Deltas are percent change vs previous window.
-        # EOI: 200 vs 100 → +100%
-        assert payload.deltas.events_of_interest == 100.0
-        # Correlations: 30 vs 10 → +200%
-        assert payload.deltas.correlation_instances == 200.0
-        # Alerts: 50 vs 25 → +100%
-        assert payload.deltas.alerts_generated == 100.0
-        # SNR: 0.6 vs 0.5 → +20%
-        assert payload.deltas.signal_to_noise == 20.0
-        # MTTD: 90 vs 100 → −10% (faster is better — UI flips sign)
-        assert payload.deltas.mttd_seconds == -10.0
-        # Queue: 5 vs 8 → −37.5%
-        assert payload.deltas.analyst_queue_depth == -37.5
+        # Deltas are fractional ratio change vs previous window.
+        # EOI: 200 vs 100 → +1.0 (+100%)
+        assert payload.deltas.events_of_interest == 1.0
+        # Correlations: 30 vs 10 → +2.0 (+200%)
+        assert payload.deltas.correlation_instances == 2.0
+        # Alerts: 50 vs 25 → +1.0 (+100%)
+        assert payload.deltas.alerts_generated == 1.0
+        # SNR: 0.6 vs 0.5 → +0.2 (+20%)
+        assert payload.deltas.signal_to_noise == 0.2
+        # MTTD: 90 vs 100 → −0.1 (−10%)
+        assert payload.deltas.mttd_seconds == -0.1
+        # Queue: 5 vs 8 → −0.375 (−37.5%)
+        assert payload.deltas.analyst_queue_depth == -0.375
 
     @pytest.mark.asyncio
     async def test_period_validation_accepts_known_values(self) -> None:

@@ -20,44 +20,37 @@ from langchain_openai import ChatOpenAI
 
 from app.context import ContextBundle
 from app.investigator.prompt_sanitizer import sanitize_text, wrap_untrusted
+from app.investigator.utils import safe_parse_agent_json
 from app.llm import safe_ainvoke
+from app.llm.prompt_builder import build_model_aware_messages
 from app.models.state import AgentStatus, InvestigationState
 from app.prompt_serialization import format_extra_fields_for_llm, summarize_structure_for_llm
 
 logger = structlog.get_logger()
 
-_SYSTEM_PROMPT = """\
-You are the Cloud Infrastructure Analysis Agent of an AI Security Operations
-Centre.
+_SYSTEM_PROMPT = """You are the Cloud Infrastructure Analysis Agent of an AI Security Operations Centre.
+Investigate cloud infrastructure alerts and classify into: true_positive, false_positive, or benign.
 
-Given a security alert related to cloud infrastructure (AWS, Azure, GCP, or
-other providers), perform a deep investigation and produce a structured
-assessment.
+[Example 1]
+Alert: S3 bucket 'finance-records' made publicly readable with 0.0.0.0/0 ACL
+Output:
+{"verdict": "true_positive", "confidence": 0.95, "cloud_indicators": ["public_s3_bucket", "insecure_acl"], "risk_category": "storage_exposure", "cloud_provider": "aws", "rationale": "민감 금융 데이터 버킷이 외부에 전체 공개되어 데이터 유출 위험이 높습니다."}
 
-Evaluate the following patterns:
-1. Storage exposure — publicly accessible S3 buckets, GCS buckets, or Azure
-   Blob containers.  Check ACL and bucket policy for unintended public access.
-2. Security group / firewall misconfigs — overly permissive inbound rules
-   (0.0.0.0/0 on sensitive ports), missing egress restrictions.
-3. IAM anomalies — principals with excessive privileges, unused admin
-   credentials, cross-account role assumption from unknown accounts.
-4. Unusual API activity — high-volume enumeration (ListBuckets, DescribeInstances),
-   calls from unexpected regions or IP ranges, service actions rarely used by
-   the principal.
-5. Infrastructure drift — resources deployed outside of IaC, manual changes to
-   production, disabled CloudTrail / audit logging.
+[Example 2]
+Alert: CloudFront origin access identity update via Terraform deployment
+Output:
+{"verdict": "benign", "confidence": 0.90, "cloud_indicators": [], "risk_category": "infra_drift", "cloud_provider": "aws", "rationale": "정상 IaC 파이프라인을 통한 CDN 배포 설정 변경입니다."}
 
-You MUST respond with a JSON object and nothing else:
+[Response Format]
+Return ONLY a JSON object:
 {
   "verdict": "true_positive" | "false_positive" | "benign",
-  "confidence": <float 0.0–1.0>,
-  "cloud_indicators": ["<indicator1>", "<indicator2>", ...],
-  "risk_category": "storage_exposure" | "security_group_misconfig" |
-                   "iam_anomaly" | "unusual_api" | "infra_drift" | "unknown",
+  "confidence": <float 0.0-1.0>,
+  "cloud_indicators": ["<indicator1>", "<indicator2>"],
+  "risk_category": "storage_exposure" | "security_group_misconfig" | "iam_anomaly" | "unusual_api" | "infra_drift" | "unknown",
   "cloud_provider": "aws" | "azure" | "gcp" | "other",
-  "rationale": "<2-4 sentence explanation in Korean>"
+  "rationale": "<한국어 분석 근거>"
 }
-- LANGUAGE RULE: To optimize token usage, perform all internal reasoning and JSON keys in English, but you MUST write the "rationale" value in natural, professional Korean for the security analyst UI.
 """
 
 
@@ -141,31 +134,30 @@ def _build_cloud_context(state: InvestigationState) -> str:
 
 def _parse_response(text: str) -> dict[str, Any]:
     """Extract JSON verdict from LLM output."""
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.split("\n")
-        lines = [line for line in lines if not line.strip().startswith("```")]
-        cleaned = "\n".join(lines).strip()
+    if not text or not str(text).strip():
+        raise ValueError("LLM returned empty response")
 
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}") + 1
-        if start >= 0 and end > start:
-            data = json.loads(cleaned[start:end])
-        else:
-            raise
+    data = safe_parse_agent_json(text)
+    if not data or not isinstance(data, dict):
+        raise ValueError(f"Failed to parse valid JSON from LLM response (raw: {str(text)[:200]!r})")
 
     verdict = data.get("verdict", "true_positive")
     if verdict not in ("true_positive", "false_positive", "benign"):
         verdict = "true_positive"
 
-    confidence = max(0.0, min(1.0, float(data.get("confidence", 0.5))))
+    try:
+        confidence = float(data.get("confidence", 0.5))
+    except (ValueError, TypeError):
+        confidence = 0.5
+    confidence = max(0.0, min(1.0, confidence))
+
     indicators = data.get("cloud_indicators", [])
-    risk_category = data.get("risk_category", "unknown")
-    cloud_provider = data.get("cloud_provider", "other")
-    rationale = str(data.get("rationale", "No rationale provided."))
+    if not isinstance(indicators, list):
+        indicators = [str(indicators)] if indicators else []
+
+    risk_category = str(data.get("risk_category", "unknown"))
+    cloud_provider = str(data.get("cloud_provider", "other"))
+    rationale = str(data.get("rationale") or "No rationale provided.")
 
     return {
         "verdict": verdict,
@@ -202,21 +194,26 @@ async def run_cloud(
     prompt_context = base_context + (("\n" + "\n".join(bundle_lines)) if bundle_lines else "")
 
     model_name = os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or os.getenv("AISOC_LLM_MODEL", "gpt-4o-mini")
-    llm = ChatOpenAI(model=model_name, temperature=0.0, max_tokens=768, response_format={"type":           
- "json_object"})
+    llm = ChatOpenAI(model=model_name, temperature=0.0, max_tokens=1024)
 
     t0 = time.monotonic()
+    raw_text = ""
     try:
-        response = await safe_ainvoke(
-            llm,
-            [
-                SystemMessage(content=_SYSTEM_PROMPT),
-                HumanMessage(content=prompt_context),
-            ],
+        messages = build_model_aware_messages(
+            system_prompt=_SYSTEM_PROMPT,
+            user_content=prompt_context,
+            model_name=model_name,
         )
-        result = _parse_response(response.content)
+        response = await safe_ainvoke(llm, messages)
+        raw_text = str(getattr(response, "content", ""))
+        result = _parse_response(raw_text)
     except Exception as exc:
-        logger.error("Cloud agent LLM call failed", error=str(exc))
+        logger.error(
+            "Cloud agent LLM call failed",
+            error=str(exc),
+            raw_response=raw_text[:200] if raw_text else "N/A",
+            incident_id=str(state.incident_id),
+        )
         state.add_finding(f"Cloud analysis LLM error: {exc}")
         return state
 

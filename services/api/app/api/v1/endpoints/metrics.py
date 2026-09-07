@@ -49,6 +49,8 @@ class AlertMetrics(BaseModel):
     low: int
     resolvedToday: int
     mttr: float
+    total_trend: float | None = None
+    critical_trend: float | None = None
 
 
 class CaseMetrics(BaseModel):
@@ -122,12 +124,12 @@ class MitreCoverage(BaseModel):
 class FunnelDeltas(BaseModel):
     """Period-over-period percentage deltas for the funnel KPI bar."""
 
-    events_of_interest: float
-    correlation_instances: float
-    alerts_generated: float
-    signal_to_noise: float
-    mttd_seconds: float
-    analyst_queue_depth: float
+    events_of_interest: float | None = None
+    correlation_instances: float | None = None
+    alerts_generated: float | None = None
+    signal_to_noise: float | None = None
+    mttd_seconds: float | None = None
+    analyst_queue_depth: float | None = None
 
 
 class FunnelMetrics(BaseModel):
@@ -216,6 +218,28 @@ async def get_dashboard_metrics(
         )
     )
 
+    # Calculate real 24h trend vs previous 24h
+    yesterday_start = today_start - timedelta(days=1)
+    today_total_q = await db.scalar(
+        select(func.count()).where(and_(Alert.tenant_id == tenant_id, Alert.created_at >= today_start))
+    ) or 0
+    yesterday_total_q = await db.scalar(
+        select(func.count()).where(
+            and_(Alert.tenant_id == tenant_id, Alert.created_at >= yesterday_start, Alert.created_at < today_start)
+        )
+    ) or 0
+    today_critical_q = await db.scalar(
+        select(func.count()).where(and_(Alert.tenant_id == tenant_id, Alert.severity == "critical", Alert.created_at >= today_start))
+    ) or 0
+    yesterday_critical_q = await db.scalar(
+        select(func.count()).where(
+            and_(Alert.tenant_id == tenant_id, Alert.severity == "critical", Alert.created_at >= yesterday_start, Alert.created_at < today_start)
+        )
+    ) or 0
+
+    total_trend = _pct_delta(today_total_q, yesterday_total_q)
+    critical_trend = _pct_delta(today_critical_q, yesterday_critical_q)
+
     # MTTR for the dashboard tile: average resolved-alert duration over last 7d
     mttr_dashboard_q = await db.scalar(
         select(func.avg(func.extract("epoch", Alert.resolved_at - Alert.created_at) / 3600)).where(
@@ -236,6 +260,8 @@ async def get_dashboard_metrics(
         low=low_q or 0,
         resolvedToday=resolved_today_q or 0,
         mttr=round(float(mttr_dashboard_q or 0.0), 2),
+        total_trend=total_trend,
+        critical_trend=critical_trend,
     )
 
     # ── Case counts ───────────────────────────────────────────────────────────
@@ -690,16 +716,17 @@ _FUNNEL_PERIOD_MAP: dict[str, timedelta] = {
 }
 
 
-def _pct_delta(current: float, previous: float) -> float:
-    """Compute period-over-period percentage change.
+def _pct_delta(current: float | int, previous: float | int) -> float | None:
+    """Compute period-over-period fractional ratio change (e.g. 0.5 for +50%).
 
-    Returns 0.0 when the previous value is zero (avoids `inf`). Otherwise:
-
-        ((current - previous) / previous) * 100, rounded to 2 decimals.
+    Returns None when the previous value is zero and current > 0 (no baseline),
+    or 0.0 when both are zero. Otherwise returns (current - previous) / previous.
     """
     if previous == 0:
-        return 0.0
-    return round(((current - previous) / previous) * 100.0, 2)
+        if current == 0:
+            return 0.0
+        return None
+    return round(float(current - previous) / float(previous), 4)
 
 
 async def _events_of_interest(db, tenant_id, start, end) -> int:

@@ -20,36 +20,35 @@ from langchain_openai import ChatOpenAI
 
 from app.context import ContextBundle
 from app.investigator.prompt_sanitizer import sanitize_text, wrap_untrusted
+from app.investigator.utils import safe_parse_agent_json
 from app.llm import safe_ainvoke
+from app.llm.prompt_builder import build_model_aware_messages
 from app.models.state import AgentStatus, InvestigationState
 from app.prompt_serialization import format_extra_fields_for_llm, summarize_structure_for_llm
 
 logger = structlog.get_logger()
 
-_SYSTEM_PROMPT = """\
-You are the Phishing Analysis Agent of an AI Security Operations Centre.
+_SYSTEM_PROMPT = """You are the Phishing Analysis Agent of an AI Security Operations Centre.
+Perform phishing analysis on email/messaging alerts and classify into: true_positive, false_positive, or benign.
 
-Given a security alert related to email or messaging, perform a deep phishing
-analysis and produce a structured assessment.
+[Example 1]
+Alert: Email with mismatched sender and display URL http://paypa1-update.com
+Output:
+{"verdict": "true_positive", "confidence": 0.95, "phishing_indicators": ["homograph_domain", "credential_harvesting"], "rationale": "공식 도메인을 모사한 피싱 사이트로 연결되는 악성 링크가 포함되어 있습니다."}
 
-Evaluate the following indicators:
-1. Sender reputation — domain age, SPF/DKIM/DMARC alignment, known abuse lists.
-2. URL analysis — mismatched display text vs. href, newly registered domains,
-   URL shorteners hiding destinations, IDN homograph attacks.
-3. Attachment analysis — executable extensions masquerading as documents,
-   password-protected archives, macro-enabled Office docs.
-4. Language patterns — urgency/fear language ("account suspended", "act now"),
-   impersonation of authority figures, grammatical anomalies.
-5. Header anomalies — reply-to mismatch, forged X-headers, unusual routing.
+[Example 2]
+Alert: Internal HR announcement email with company portal link
+Output:
+{"verdict": "benign", "confidence": 0.90, "phishing_indicators": [], "rationale": "정상적인 사내 인사 공지 메일이며 악성 지표가 없습니다."}
 
-You MUST respond with a JSON object and nothing else:
+[Response Format]
+Return ONLY a JSON object:
 {
   "verdict": "true_positive" | "false_positive" | "benign",
-  "confidence": <float 0.0–1.0>,
-  "phishing_indicators": ["<indicator1>", "<indicator2>", ...],
-  "rationale": "<2-4 sentence explanation in Korean>"
+  "confidence": <float 0.0-1.0>,
+  "phishing_indicators": ["<indicator1>", "<indicator2>"],
+  "rationale": "<한국어 분석 근거>"
 }
-- LANGUAGE RULE: To optimize token usage, perform all internal reasoning and JSON keys in English, but you MUST write the "rationale" value in natural, professional Korean for the security analyst UI.
 """
 
 
@@ -131,29 +130,28 @@ def _build_phishing_context(state: InvestigationState) -> str:
 
 def _parse_response(text: str) -> dict[str, Any]:
     """Extract JSON verdict from LLM output."""
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.split("\n")
-        lines = [line for line in lines if not line.strip().startswith("```")]
-        cleaned = "\n".join(lines).strip()
+    if not text or not str(text).strip():
+        raise ValueError("LLM returned empty response")
 
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}") + 1
-        if start >= 0 and end > start:
-            data = json.loads(cleaned[start:end])
-        else:
-            raise
+    data = safe_parse_agent_json(text)
+    if not data or not isinstance(data, dict):
+        raise ValueError(f"Failed to parse valid JSON from LLM response (raw: {str(text)[:200]!r})")
 
     verdict = data.get("verdict", "true_positive")
     if verdict not in ("true_positive", "false_positive", "benign"):
         verdict = "true_positive"
 
-    confidence = max(0.0, min(1.0, float(data.get("confidence", 0.5))))
+    try:
+        confidence = float(data.get("confidence", 0.5))
+    except (ValueError, TypeError):
+        confidence = 0.5
+    confidence = max(0.0, min(1.0, confidence))
+
     indicators = data.get("phishing_indicators", [])
-    rationale = str(data.get("rationale", "No rationale provided."))
+    if not isinstance(indicators, list):
+        indicators = [str(indicators)] if indicators else []
+
+    rationale = str(data.get("rationale") or "No rationale provided.")
 
     return {
         "verdict": verdict,
@@ -189,21 +187,26 @@ async def run_phishing(
     prompt_context = base_context + (("\n" + "\n".join(bundle_lines)) if bundle_lines else "")
 
     model_name = os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or os.getenv("AISOC_LLM_MODEL", "gpt-4o-mini")
-    llm = ChatOpenAI(model=model_name, temperature=0.0, max_tokens=768, response_format={"type":           
- "json_object"})
+    llm = ChatOpenAI(model=model_name, temperature=0.0, max_tokens=1024)
 
     t0 = time.monotonic()
+    raw_text = ""
     try:
-        response = await safe_ainvoke(
-            llm,
-            [
-                SystemMessage(content=_SYSTEM_PROMPT),
-                HumanMessage(content=prompt_context),
-            ],
+        messages = build_model_aware_messages(
+            system_prompt=_SYSTEM_PROMPT,
+            user_content=prompt_context,
+            model_name=model_name,
         )
-        result = _parse_response(response.content)
+        response = await safe_ainvoke(llm, messages)
+        raw_text = str(getattr(response, "content", ""))
+        result = _parse_response(raw_text)
     except Exception as exc:
-        logger.error("Phishing agent LLM call failed", error=str(exc))
+        logger.error(
+            "Phishing agent LLM call failed",
+            error=str(exc),
+            raw_response=raw_text[:200] if raw_text else "N/A",
+            incident_id=str(state.incident_id),
+        )
         state.add_finding(f"Phishing analysis LLM error: {exc}")
         return state
 

@@ -451,14 +451,28 @@ export function DashboardView() {
             value={metrics.alerts.total}
             sub={`${metrics.alerts.new} new today`}
             color="blue"
-            trend={{ value: 0, label: 'vs yesterday' }}
+            trend={
+              typeof metrics.alerts.total_trend === 'number'
+                ? {
+                    value: Math.round(metrics.alerts.total_trend * 100),
+                    label: 'vs yesterday',
+                  }
+                : undefined
+            }
           />
           <MetricCard
             label="Critical"
             value={metrics.alerts.critical}
             sub="Require immediate action"
             color="red"
-            trend={{ value: 0, label: 'vs yesterday' }}
+            trend={
+              typeof metrics.alerts.critical_trend === 'number'
+                ? {
+                    value: Math.round(metrics.alerts.critical_trend * 100),
+                    label: 'vs yesterday',
+                  }
+                : undefined
+            }
           />
           <MetricCard
             label="Open Cases"

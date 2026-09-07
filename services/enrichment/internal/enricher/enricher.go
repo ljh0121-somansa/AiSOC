@@ -2,7 +2,6 @@ package enricher
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
@@ -129,7 +128,13 @@ func (e *Enricher) Enrich(ctx context.Context, req EnrichRequest) (*EnrichmentRe
 	case IOCTypeURL:
 		result, err = e.enrichURL(ctx, req.Value)
 	default:
-		return nil, fmt.Errorf("unsupported IOC type: %s", req.IOCType)
+		// Return a clean no-op result for non-network or unsupported IOC types
+		// (e.g. process, account, hostname) so callers do not receive 500 errors.
+		return &EnrichmentResult{
+			IOCType:    req.IOCType,
+			Value:      req.Value,
+			EnrichedAt: time.Now(),
+		}, nil
 	}
 
 	if err != nil {

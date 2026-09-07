@@ -76,6 +76,47 @@ const PRIORITY_TONE: Record<RecommendedAction['priority'], string> = {
   info: 'border-gray-500/40 bg-gray-500/10 text-gray-300',
 };
 
+/**
+ * Parses action text for a leading command prefix (e.g., "CONTAINMENT:")
+ * and inline code blocks wrapped in backticks.
+ */
+function ActionTextFormatter({ text }: { text: string }) {
+  // Extract leading uppercase prefix e.g., "CONTAINMENT:" or "ACTION_REQUIRED:"
+  const prefixMatch = text.match(/^([A-Z_]+):\s*(.*)$/);
+  const hasPrefix = Boolean(prefixMatch);
+  const prefix = hasPrefix ? prefixMatch![1] : null;
+  const remainingText = hasPrefix ? prefixMatch![2] : text;
+
+  // Split remaining text by backticks to render code blocks
+  const parts = remainingText.split(/`([^`]+)`/g);
+
+  return (
+    <div className="flex flex-col gap-1 items-start">
+      {prefix && (
+        <span className="text-[10px] font-semibold tracking-wider text-indigo-300 bg-indigo-500/10 border border-indigo-500/20 px-1.5 py-0.5 rounded uppercase">
+          {prefix}
+        </span>
+      )}
+      <span className="text-sm text-gray-200">
+        {parts.map((part, i) => {
+          // Odd indices are the matches inside backticks
+          if (i % 2 === 1) {
+            return (
+              <code
+                key={i}
+                className="bg-gray-800/80 text-gray-300 px-1.5 py-0.5 rounded text-[11px] font-mono border border-gray-700/50 mx-0.5"
+              >
+                {part}
+              </code>
+            );
+          }
+          return <span key={i}>{part}</span>;
+        })}
+      </span>
+    </div>
+  );
+}
+
 // ─── Props ───────────────────────────────────────────────────────────────────
 
 export interface InvestigationRailProps {
@@ -431,7 +472,9 @@ function RecommendedActionsSection({ actions }: { actions: RecommendedAction[] }
               >
                 {a.priority}
               </span>
-              <p className="text-sm text-gray-200 flex-1">{a.action}</p>
+              <div className="flex-1 mt-0.5">
+                <ActionTextFormatter text={a.action} />
+              </div>
             </div>
             {a.rationale && (
               <p className="mt-1 text-xs text-gray-500 ml-[3.25rem]">

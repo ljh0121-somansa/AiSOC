@@ -1456,6 +1456,17 @@ async def auto_create_case(body: AutoCreateCaseRequest, request: Request, db: DB
             )).fetchone()                                                                                  
         except Exception:                                                                                  
             pass                                                                                           
+
+    # Fallback: If not found by ID directly, probe by title & tenant to find the canonical persisted alert
+    if alert_row is None and body.title:
+        try:
+            alert_row = (await db.execute(
+                text("SELECT * FROM alerts WHERE tenant_id = :tenant_id AND title = :title ORDER BY event_time DESC LIMIT 1").bindparams(
+                    tenant_id=tenant_uuid, title=body.title.strip()
+                )
+            )).fetchone()
+        except Exception:
+            pass                                                                                           
                                                                                                             
     def _clean_str(val: Any) -> str:
         if not val:
@@ -1480,9 +1491,9 @@ async def auto_create_case(body: AutoCreateCaseRequest, request: Request, db: DB
                 SELECT * FROM aisoc_cases
                 WHERE tenant_id = :tenant_id
                   AND status IN ('open', 'investigating', 'in_progress', 'pending')
-                  AND (:aid = ANY(alert_ids) OR alert_ids ?| :aids)
+                  AND :aid = ANY(alert_ids)
                 ORDER BY created_at DESC LIMIT 1
-            """).bindparams(tenant_id=tenant_uuid, aid=uuid.UUID(alert_ids[0]), aids=alert_ids)
+            """).bindparams(tenant_id=tenant_uuid, aid=uuid.UUID(alert_ids[0]))
         )).fetchone()
         if existing_open_case:
             cid = existing_open_case.id

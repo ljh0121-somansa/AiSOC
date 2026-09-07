@@ -342,8 +342,7 @@ async def agent_alert_investigate(body: AgentAlertInvestigateRequest) -> dict[st
             from langchain_core.messages import HumanMessage, SystemMessage
             from langchain_openai import ChatOpenAI
             max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "2048")) 
-            llm = ChatOpenAI(model=model, temperature=0.0, max_tokens=max_tokens, response_format={"type":           
- "json_object"})
+            llm = ChatOpenAI(model=model, temperature=0.0, max_tokens=max_tokens)
             messages = [
                 SystemMessage(content=_ALERT_INVESTIGATE_SYSTEM_PROMPT),
                 HumanMessage(content=f"Analyse this alert and produce the Korean investigation JSON:\n{user_input_str}"),
