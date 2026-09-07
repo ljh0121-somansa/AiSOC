@@ -51,7 +51,7 @@ async def test_fire_removes_durable_row():
     store = InMemoryTimerStore()
     sched = _scheduler(store)
     task = sched.schedule("act-3", timeout_seconds=0.01, safe_default="rejected")
-    await task
+    _ = await task  # wait for the timer to fire
     assert await store.list_pending() == []
 
 

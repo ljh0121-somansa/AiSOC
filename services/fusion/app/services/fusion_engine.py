@@ -4,6 +4,7 @@ Core fusion engine: orchestrates deduplication → correlation → ML scoring.
 
 from __future__ import annotations
 
+from typing import Any
 from uuid import UUID
 
 import structlog
@@ -16,6 +17,7 @@ from app.models.alert import (
     IncidentSummary,
     RawAlert,
 )
+from app.services.alert_enricher import AlertEnricher
 from app.services.attack_chain_grouper import AttackChainGrouper
 from app.services.confidence import ConfidenceScorer
 from app.services.correlator import Correlator
@@ -122,15 +124,23 @@ class FusionEngine:
         confidence_scorer: ConfidenceScorer | None = None,
         ueba_cache: UebaSignalCache | None = None,
         chain_grouper: AttackChainGrouper | None = None,
+        enricher: AlertEnricher | None = None,
+        memory_provider: Any = None,
     ) -> None:
         self._dedup = deduplicator
         self._correlator = correlator
         self._ml_scorer = ml_scorer or MLScorer()
         self._entity_risk = entity_risk
+        # Wave 1 — live institutional-memory priors for the confidence nudge
+        # (optional; None = no nudge). Refreshed out-of-band from disposition
+        # history by app.memory.provider.MemoryPriorProvider.
+        self._memory_provider = memory_provider
         # Phase A4 — behavioral-model signal (optional; None = no UEBA fusion).
         self._ueba_cache = ueba_cache
         # Phase C4 — fuse-time attack-chain former/extender (optional).
         self._chain_grouper = chain_grouper
+        # Wave 1 — fuse-time TI/vuln enrichment (optional; None = no enrichment).
+        self._enricher = enricher
         # Confidence + explainability is intrinsic to a fused alert — every
         # alert leaves the engine with a high/med/low label and an evidence
         # chain. The scorer is pure / stateless so we instantiate a default.
@@ -179,6 +189,19 @@ class FusionEngine:
             alert=alert,
         )
 
+        # --- Step 2.5: Fuse-time enrichment (Wave 1) ---
+        # Populate fused.enrichments with TI / vuln matches BEFORE confidence +
+        # vuln-boost read it, so the threat_intel factor and exploit-in-wild
+        # boost actually fire. Best-effort: an enrichment miss/outage is a no-op
+        # and leaves the scorer's honest "no TI match" prior in place.
+        if self._enricher is not None:
+            try:
+                enrichments = await self._enricher.enrich(alert)
+                if enrichments:
+                    fused.enrichments.update(enrichments)
+            except Exception as exc:
+                logger.warning("fuse_enrichment_failed", error=str(exc))
+
         # --- Step 3: ML scoring ---
         try:
             fused = await self._ml_scorer.score(fused)
@@ -189,7 +212,8 @@ class FusionEngine:
         # Pure, synchronous projection of the values already on ``fused``.
         # Runs after ML scoring so the rationale picks up anomaly / priority.
         try:
-            fused = self._confidence_scorer.score(fused)
+            priors = self._memory_provider.get_priors(str(fused.tenant_id)) if self._memory_provider is not None else None
+            fused = self._confidence_scorer.score(fused, priors=priors)
         except Exception as exc:
             logger.warning("confidence_scoring_failed", error=str(exc))
 

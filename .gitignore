@@ -51,6 +51,11 @@ coverage.xml
 # uploaded as artefacts — never committed.
 coverage/
 **/coverage/
+# BUT keep app-source route directories literally named `coverage` (e.g. the
+# /tools/coverage page). The rules above are for generated test-coverage output;
+# without this negation the coverage tool page silently drops from the build.
+!apps/web/src/app/**/coverage/
+!apps/web/src/app/**/coverage/**
 *.lcov
 
 # IDE

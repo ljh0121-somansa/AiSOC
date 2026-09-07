@@ -35,6 +35,7 @@ from typing import Any
 import structlog
 
 from app.models.alert import AlertSeverity, RawAlert
+from app.services.provenance import extract_provenance
 
 logger = structlog.get_logger()
 
@@ -189,33 +190,7 @@ def promote_normalized_event(message: dict[str, Any]) -> RawAlert | None:
     severity = _SEVERITY_BY_ID.get(severity_id if isinstance(severity_id, int) else 0, AlertSeverity.MEDIUM)
 
     tactics, techniques = _mitre(ocsf)
-    
-    # ─── Splunk Airgap Fallback (Parse raw_data) ───
-    # If the Go normalizer failed to parse fields because the server is airgapped
-    # and the new Go binary couldn't be built, we rescue the fields here in Python.
-    raw_data_str = str(ocsf.get("raw_data") or "")
-    if "Splunk" in str(ocsf.get("metadata", {}).get("product", {}).get("name", "")) or "splunk" in str(message.get("connector_type", "")):
-        if severity == AlertSeverity.MEDIUM:
-            raw_sev = _extract_splunk_kv(raw_data_str, "severity") or _extract_splunk_kv(raw_data_str, "urgency")
-            if raw_sev:
-                raw_sev = raw_sev.lower()
-                if raw_sev == "critical": severity = AlertSeverity.CRITICAL
-                elif raw_sev == "high": severity = AlertSeverity.HIGH
-                elif raw_sev == "low": severity = AlertSeverity.LOW
-                elif raw_sev in ("info", "informational"): severity = AlertSeverity.INFO
-        
-        if not techniques:
-            techniques = _extract_splunk_mitre(raw_data_str)
-            
-    src_ip = _get_nested(ocsf, "src_endpoint", "ip") or _extract_splunk_kv(raw_data_str, "src_ip") or _extract_splunk_kv(raw_data_str, "src")
-    hostname = _get_nested(ocsf, "device", "name") or _extract_splunk_kv(raw_data_str, "orig_host") or _extract_splunk_kv(raw_data_str, "entity")
-    username = _get_nested(ocsf, "actor", "user", "name") or _extract_splunk_kv(raw_data_str, "USER") or _extract_splunk_kv(raw_data_str, "user")
-    
-    desc = raw_data_str
-    if _extract_splunk_kv(raw_data_str, "risk_message"):
-        desc = _extract_splunk_kv(raw_data_str, "risk_message")
-    elif _extract_splunk_kv(raw_data_str, "orig_rule_description"):
-        desc = _extract_splunk_kv(raw_data_str, "orig_rule_description")
+    connector_id, connector_type, class_uid = extract_provenance(message, ocsf)
 
     return RawAlert(
         tenant_id=tenant_id,
@@ -232,4 +207,7 @@ def promote_normalized_event(message: dict[str, Any]) -> RawAlert | None:
         mitre_techniques=techniques,
         raw_event=ocsf,
         event_time=_event_time(ocsf),
+        connector_id=connector_id,
+        connector_type=connector_type,
+        ocsf_class_uid=class_uid,
     )

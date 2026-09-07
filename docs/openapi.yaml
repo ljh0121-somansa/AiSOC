@@ -2683,6 +2683,47 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
       security:
       - HTTPBearer: []
+  /api/v1/rules/{rule_id}/backtest:
+    post:
+      tags:
+      - detection_rules
+      summary: Backtest a detection rule against historical lake events
+      description: 'Run a rule over the last N days of REAL events in the ClickHouse
+        lake and
+
+        report exactly how many would have fired (Wave 2). Tenant-scoped via
+
+        ``lake_sql.rewrite_for_tenant``. Read-only.'
+      operationId: backtest_detection_rule_api_v1_rules__rule_id__backtest_post
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: rule_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Rule Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BacktestRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BacktestResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/detection/rules:
     get:
       tags:
@@ -3262,6 +3303,55 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/detection-proposals/{proposal_id}/backtest:
+    post:
+      tags:
+      - detection_rules
+      - dac
+      summary: Backtest Proposal
+      description: 'Run the candidate rule over the last N days of REAL lake events
+        and
+
+        attach the result to ``eval_result["backtest"]`` (Wave 2, W2.2).
+
+
+        This is a third, honest signal alongside the fixture gate + MITRE baseline:
+
+        a rule that would have fired on a large fraction of historical events is
+
+        noisy. When ``AISOC_BACKTEST_MAX_HIT_RATE`` is set, ``/decide`` blocks
+
+        approval above that hit-rate (opt-in — informational by default).'
+      operationId: backtest_proposal_api_v1_detection_proposals__proposal_id__backtest_post
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: proposal_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Proposal Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BacktestProposalRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProposalResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/detection-proposals/{proposal_id}/eval:
     post:
       tags:
@@ -3370,6 +3460,56 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ProposalResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/detection/tuning/auto-suggest:
+    post:
+      tags:
+      - detection
+      summary: Auto Suggest Tuning
+      description: 'Derive human-approval-gated tuning suggestions from disposition
+        history.
+
+
+        Wave 1 wiring: connects the previously-orphaned ``suggest_tuning`` engine
+        to
+
+        real per-rule disposition history and, optionally, opens DRAFT detection
+
+        proposals (source ``auto-tuner``) into the governed lifecycle. Nothing is
+
+        auto-applied — an engineer reviews + eval-gates before promotion.'
+      operationId: auto_suggest_tuning_api_v1_detection_tuning_auto_suggest_post
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: window_days
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 180
+          minimum: 1
+          default: 30
+          title: Window Days
+      - name: create_proposals
+        in: query
+        required: false
+        schema:
+          type: boolean
+          default: true
+          title: Create Proposals
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutoSuggestResponse'
         '422':
           description: Validation Error
           content:
@@ -6715,6 +6855,165 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/ledger/{run_id}/publish/preview:
+    post:
+      tags:
+      - replay
+      summary: Preview Publish
+      description: Build the redacted snapshot + alias map for the pre-publish review.
+      operationId: preview_publish_api_v1_ledger__run_id__publish_preview_post
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: run_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Run Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublishPreview'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/ledger/{run_id}/publish:
+    post:
+      tags:
+      - replay
+      summary: Publish Replay
+      description: Persist an immutable, redacted public snapshot and return its share
+        URL.
+      operationId: publish_replay_api_v1_ledger__run_id__publish_post
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: run_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Run Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublishRequest'
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublishResult'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/ledger/{run_id}/published:
+    get:
+      tags:
+      - replay
+      summary: List Published
+      operationId: list_published_api_v1_ledger__run_id__published_get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: run_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Run Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PublishedSummary'
+                title: Response List Published Api V1 Ledger  Run Id  Published Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/ledger/publish/{slug}:
+    delete:
+      tags:
+      - replay
+      summary: Unpublish Replay
+      operationId: unpublish_replay_api_v1_ledger_publish__slug__delete
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: slug
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Slug
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/r/{slug}:
+    get:
+      tags:
+      - replay-public
+      summary: Get Public Replay
+      description: 'Public, unauthenticated read of a redacted replay snapshot.
+
+
+        Uses a non-RLS session because ``published_replays`` is intentionally
+
+        public-by-design (post-redaction, non-identifying). Increments a
+
+        best-effort view counter (the only mutation the immutability trigger
+
+        permits).'
+      operationId: get_public_replay_api_v1_r__slug__get
+      parameters:
+      - name: slug
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Slug
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicReplay'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/identity/effective-permissions/providers:
     get:
       tags:
@@ -8967,6 +9266,147 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/data-lifecycle/retention:
+    get:
+      tags:
+      - data_lifecycle
+      summary: Get Retention
+      operationId: get_retention_api_v1_data_lifecycle_retention_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetentionOut'
+      security:
+      - HTTPBearer: []
+    put:
+      tags:
+      - data_lifecycle
+      summary: Put Retention
+      operationId: put_retention_api_v1_data_lifecycle_retention_put
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RetentionUpdate'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetentionOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
+  /api/v1/data-lifecycle/parsers:
+    get:
+      tags:
+      - data_lifecycle
+      summary: List Parsers
+      operationId: list_parsers_api_v1_data_lifecycle_parsers_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/ParserOut'
+                type: array
+                title: Response List Parsers Api V1 Data Lifecycle Parsers Get
+      security:
+      - HTTPBearer: []
+    post:
+      tags:
+      - data_lifecycle
+      summary: Create Parser
+      operationId: create_parser_api_v1_data_lifecycle_parsers_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ParserIn'
+        required: true
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ParserOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
+  /api/v1/data-lifecycle/parsers/test:
+    post:
+      tags:
+      - data_lifecycle
+      summary: Test Parser
+      description: 'Dry-run a parser pipeline against a sample event — validate +
+        preview
+
+        the reshaped event without persisting anything (W5.2/W5.3).'
+      operationId: test_parser_api_v1_data_lifecycle_parsers_test_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ParserTestIn'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ParserTestOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
+  /api/v1/data-lifecycle/parsers/{parser_id}:
+    delete:
+      tags:
+      - data_lifecycle
+      summary: Delete Parser
+      operationId: delete_parser_api_v1_data_lifecycle_parsers__parser_id__delete
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: parser_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Parser Id
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/feedback/alert-override:
     post:
       tags:
@@ -9366,6 +9806,48 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/nl-detection/propose:
+    post:
+      tags:
+      - nl_detection
+      summary: Propose From Nl
+      description: 'AI Detection Builder (W3.2): NL threat description -> Sigma rule
+        +
+
+        AUTO-GENERATED positive/negative fixtures -> non-circular eval-gate ->
+
+        governed DRAFT proposal.
+
+
+        Fixtures are DERIVED from the generated rule''s own selection (not invented
+
+        by the LLM), so the gate genuinely proves the rule fires on a positive and
+
+        stays quiet on a negative. If the rule can''t be auto-verified, no proposal
+
+        is opened and the human is asked to supply fixtures — the honest outcome.'
+      operationId: propose_from_nl_api_v1_nl_detection_propose_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NLProposeRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NLProposeResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
   /api/v1/detection-loop/suggest:
     post:
       tags:
@@ -10841,6 +11323,73 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/posture/scan:
+    post:
+      tags:
+      - posture
+      summary: Cspm Scan
+      description: 'Agentless CSPM MVP (W6.2): evaluate a cloud-resource snapshot
+        against the
+
+        misconfiguration checks, returning findings + a severity summary + the
+
+        auto-generated compliance evidence (W6.1). Stateless — the findings store
+
+        endpoints above persist what an operator chooses to keep.'
+      operationId: cspm_scan_api_v1_posture_scan_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CspmScanRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CspmScanResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
+  /api/v1/posture/destinations/preview:
+    post:
+      tags:
+      - posture
+      summary: Destination Preview
+      description: Preview the exact payload a destination would send (W6.3) — no
+        send.
+      operationId: destination_preview_api_v1_posture_destinations_preview_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DestinationPreviewRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Destination Preview Api V1 Posture Destinations Preview
+                  Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
   /api/v1/easm/scan:
     post:
       tags:
@@ -11553,6 +12102,74 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/report-builder/validate:
+    post:
+      tags:
+      - report_builder
+      summary: Validate Report
+      description: 'Validate a report definition (whitelisted widget types + sources,
+        unique
+
+        ids, bounded size) without rendering or persisting it.'
+      operationId: validate_report_api_v1_report_builder_validate_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReportDefinitionBody'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Validate Report Api V1 Report Builder Validate Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
+  /api/v1/report-builder/render:
+    post:
+      tags:
+      - report_builder
+      summary: Render
+      description: 'Render a report by resolving each widget''s data server-side.
+        Wires the
+
+        real ``alerts_by_severity`` resolver (tenant-scoped) + ``static``; other
+
+        sources render an honest ``error`` until their resolver is wired.'
+      operationId: render_api_v1_report_builder_render_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReportDefinitionBody'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Render Api V1 Report Builder Render Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
   /api/v1/airgap/status:
     get:
       tags:
@@ -13601,8 +14218,8 @@ components:
         corrected_verdict:
           type: string
           title: Corrected Verdict
-          description: 'Analyst''s verdict: true_positive | false_positive | benign
-            | escalate'
+          description: 'Analyst''s verdict: true_positive | benign_true_positive |
+            false_positive | benign | escalate'
         reason:
           anyOf:
           - type: string
@@ -14834,6 +15451,32 @@ components:
       - access_token
       - refresh_token
       title: AuthenticateFinishResponse
+    AutoSuggestResponse:
+      properties:
+        window_days:
+          type: integer
+          title: Window Days
+        records_considered:
+          type: integer
+          title: Records Considered
+        suggestions:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Suggestions
+        proposals_created:
+          type: integer
+          title: Proposals Created
+      type: object
+      required:
+      - window_days
+      - records_considered
+      - suggestions
+      - proposals_created
+      title: AutoSuggestResponse
+      description: Disposition-history tuning suggestions + how many became draft
+        proposals.
     AutoTuneRequest:
       properties:
         enabled:
@@ -14859,6 +15502,97 @@ components:
       - tenant_id
       - actions
       title: AutonomyPolicyResponse
+    BacktestProposalRequest:
+      properties:
+        window_days:
+          type: integer
+          maximum: 365.0
+          minimum: 1.0
+          title: Window Days
+          default: 30
+        limit:
+          type: integer
+          maximum: 100000.0
+          minimum: 1.0
+          title: Limit
+          default: 5000
+        source:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source
+          description: Optional connector_type filter.
+      type: object
+      title: BacktestProposalRequest
+      description: Backtest a candidate proposal's rule over historical lake events
+        (W2.2).
+    BacktestRequest:
+      properties:
+        window_days:
+          type: integer
+          maximum: 365.0
+          minimum: 1.0
+          title: Window Days
+          description: How many days of history to scan.
+          default: 30
+        limit:
+          type: integer
+          maximum: 100000.0
+          minimum: 1.0
+          title: Limit
+          description: Max events to scan.
+          default: 5000
+        source:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source
+          description: Optional connector_type filter (e.g. 'okta_system_log').
+      type: object
+      title: BacktestRequest
+      description: Backtest a rule over historical lake events.
+    BacktestResponse:
+      properties:
+        rule_id:
+          type: string
+          format: uuid
+          title: Rule Id
+        rule_language:
+          type: string
+          title: Rule Language
+        window_days:
+          type: integer
+          title: Window Days
+        events_scanned:
+          type: integer
+          title: Events Scanned
+        would_fire:
+          type: integer
+          title: Would Fire
+        hit_rate:
+          type: number
+          title: Hit Rate
+        sample_matches:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Sample Matches
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+      type: object
+      required:
+      - rule_id
+      - rule_language
+      - window_days
+      - events_scanned
+      - would_fire
+      - hit_rate
+      - sample_matches
+      title: BacktestResponse
     BaselineResponse:
       properties:
         id:
@@ -16730,6 +17464,42 @@ components:
       - status
       - created_at
       title: CrossTenantIncident
+    CspmScanRequest:
+      properties:
+        resources:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Resources
+          description: Normalised cloud-resource snapshot.
+      type: object
+      title: CspmScanRequest
+    CspmScanResponse:
+      properties:
+        findings:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Findings
+        summary:
+          additionalProperties:
+            type: integer
+          type: object
+          title: Summary
+        evidence:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Evidence
+      type: object
+      required:
+      - findings
+      - summary
+      - evidence
+      title: CspmScanResponse
     DashboardMetrics:
       properties:
         alerts:
@@ -16933,6 +17703,26 @@ components:
       - hybrid
       - airgap
       title: DeploymentMode
+    DestinationPreviewRequest:
+      properties:
+        kind:
+          type: string
+          title: Kind
+          description: opsgenie | email | webhook
+        alert:
+          additionalProperties: true
+          type: object
+          title: Alert
+        recipients:
+          items:
+            type: string
+          type: array
+          title: Recipients
+      type: object
+      required:
+      - kind
+      - alert
+      title: DestinationPreviewRequest
     DetectionRuleResponse:
       properties:
         id:
@@ -18382,6 +19172,14 @@ components:
           type: string
           format: date-time
           title: Generated At
+        repeat_alerts_suppressed:
+          type: integer
+          title: Repeat Alerts Suppressed
+          default: 0
+        repeat_suppression_rate:
+          type: number
+          title: Repeat Suppression Rate
+          default: 0.0
       type: object
       required:
       - period
@@ -20651,6 +21449,69 @@ components:
       - description
       - model_used
       title: NLDetectionResponse
+    NLProposeRequest:
+      properties:
+        description:
+          type: string
+          maxLength: 2000
+          minLength: 10
+          title: Description
+        severity:
+          type: string
+          enum:
+          - informational
+          - low
+          - medium
+          - high
+          - critical
+          title: Severity
+          default: medium
+        mitre_techniques:
+          items:
+            type: string
+          type: array
+          title: Mitre Techniques
+      type: object
+      required:
+      - description
+      title: NLProposeRequest
+    NLProposeResponse:
+      properties:
+        proposal_id:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Proposal Id
+        status:
+          type: string
+          title: Status
+        passed:
+          type: boolean
+          title: Passed
+        reason:
+          type: string
+          title: Reason
+        sigma:
+          type: string
+          title: Sigma
+        fixtures:
+          additionalProperties: true
+          type: object
+          title: Fixtures
+        model_used:
+          type: string
+          title: Model Used
+      type: object
+      required:
+      - proposal_id
+      - status
+      - passed
+      - reason
+      - sigma
+      - fixtures
+      - model_used
+      title: NLProposeResponse
     NLQueryExecuteRequest:
       properties:
         question:
@@ -21205,6 +22066,10 @@ components:
         true_positive_corrections:
           type: integer
           title: True Positive Corrections
+        benign_true_positive_corrections:
+          type: integer
+          title: Benign True Positive Corrections
+          default: 0
         benign_corrections:
           type: integer
           title: Benign Corrections
@@ -21271,6 +22136,93 @@ components:
       - parameter_overrides
       - created_at
       title: PackAssignmentOut
+    ParserIn:
+      properties:
+        name:
+          type: string
+          maxLength: 200
+          minLength: 1
+          title: Name
+        source:
+          type: string
+          title: Source
+          default: generic
+        transforms:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Transforms
+        enabled:
+          type: boolean
+          title: Enabled
+          default: true
+      type: object
+      required:
+      - name
+      title: ParserIn
+    ParserOut:
+      properties:
+        id:
+          type: string
+          format: uuid
+          title: Id
+        name:
+          type: string
+          title: Name
+        source:
+          type: string
+          title: Source
+        transforms:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Transforms
+        enabled:
+          type: boolean
+          title: Enabled
+      type: object
+      required:
+      - id
+      - name
+      - source
+      - transforms
+      - enabled
+      title: ParserOut
+    ParserTestIn:
+      properties:
+        transforms:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Transforms
+        sample_event:
+          additionalProperties: true
+          type: object
+          title: Sample Event
+      type: object
+      required:
+      - transforms
+      - sample_event
+      title: ParserTestIn
+    ParserTestOut:
+      properties:
+        event:
+          additionalProperties: true
+          type: object
+          title: Event
+        warnings:
+          items:
+            type: string
+          type: array
+          title: Warnings
+      type: object
+      required:
+      - event
+      - warnings
+      title: ParserTestOut
     PasskeyCredentialOut:
       properties:
         id:
@@ -21765,6 +22717,101 @@ components:
       - created_at
       - updated_at
       title: ProposalResponse
+    PublicReplay:
+      properties:
+        slug:
+          type: string
+          title: Slug
+        title:
+          type: string
+          title: Title
+        case_id:
+          type: string
+          title: Case Id
+        snapshot:
+          additionalProperties: true
+          type: object
+          title: Snapshot
+        view_count:
+          type: integer
+          title: View Count
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+      type: object
+      required:
+      - slug
+      - title
+      - case_id
+      - snapshot
+      - view_count
+      - created_at
+      title: PublicReplay
+    PublishPreview:
+      properties:
+        run_id:
+          type: string
+          format: uuid
+          title: Run Id
+        title:
+          type: string
+          title: Title
+        snapshot:
+          additionalProperties: true
+          type: object
+          title: Snapshot
+        alias_map:
+          additionalProperties:
+            type: string
+          type: object
+          title: Alias Map
+      type: object
+      required:
+      - run_id
+      - title
+      - snapshot
+      - alias_map
+      title: PublishPreview
+      description: 'Pre-publish diff: what the public will see + what will be hidden.'
+    PublishRequest:
+      properties:
+        confirm:
+          type: boolean
+          title: Confirm
+          description: Must be true to publish.
+          default: false
+        title_override:
+          anyOf:
+          - type: string
+            maxLength: 200
+          - type: 'null'
+          title: Title Override
+      type: object
+      title: PublishRequest
+    PublishResult:
+      properties:
+        slug:
+          type: string
+          title: Slug
+        url:
+          type: string
+          title: Url
+        run_id:
+          type: string
+          format: uuid
+          title: Run Id
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+      type: object
+      required:
+      - slug
+      - url
+      - run_id
+      - created_at
+      title: PublishResult
     PublishStatus:
       type: string
       enum:
@@ -21772,6 +22819,36 @@ components:
       - approved
       - rejected
       title: PublishStatus
+    PublishedSummary:
+      properties:
+        slug:
+          type: string
+          title: Slug
+        url:
+          type: string
+          title: Url
+        title:
+          type: string
+          title: Title
+        case_id:
+          type: string
+          title: Case Id
+        view_count:
+          type: integer
+          title: View Count
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+      type: object
+      required:
+      - slug
+      - url
+      - title
+      - case_id
+      - view_count
+      - created_at
+      title: PublishedSummary
     QueryRequest:
       properties:
         question:
@@ -22285,6 +23362,65 @@ components:
       required:
       - yaml
       title: ReplaceRulesRequest
+    ReportDefinitionBody:
+      properties:
+        name:
+          type: string
+          maxLength: 200
+          minLength: 1
+          title: Name
+        widgets:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Widgets
+      type: object
+      required:
+      - name
+      title: ReportDefinitionBody
+    RetentionOut:
+      properties:
+        raw_events_days:
+          type: integer
+          title: Raw Events Days
+        alerts_days:
+          type: integer
+          title: Alerts Days
+        audit_days:
+          type: integer
+          title: Audit Days
+      type: object
+      required:
+      - raw_events_days
+      - alerts_days
+      - audit_days
+      title: RetentionOut
+    RetentionUpdate:
+      properties:
+        raw_events_days:
+          anyOf:
+          - type: integer
+            maximum: 3650.0
+            minimum: 1.0
+          - type: 'null'
+          title: Raw Events Days
+        alerts_days:
+          anyOf:
+          - type: integer
+            maximum: 3650.0
+            minimum: 1.0
+          - type: 'null'
+          title: Alerts Days
+        audit_days:
+          anyOf:
+          - type: integer
+            maximum: 3650.0
+            minimum: 1.0
+          - type: 'null'
+          title: Audit Days
+      type: object
+      title: RetentionUpdate
     ReviewAction:
       properties:
         action:
