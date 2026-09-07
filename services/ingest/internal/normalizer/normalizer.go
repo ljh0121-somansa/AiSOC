@@ -124,41 +124,6 @@ var connectorProfiles = map[string]connectorProfile{
 			"High": 4, "Medium": 3, "Low": 2, "Informational": 1,
 		},
 	},
-	"splunk": {
-		product:   OcsfProduct{Name: "Splunk Enterprise", VendorName: "Splunk"},
-		classUID:  4001,
-		className: "Security Finding",
-		fieldMap: map[string]string{
-			"_time":                          "time",
-			"raw_event.created_at":           "time",
-			"raw_event.raw_event._time":      "time",
-			"raw_event.src":                  "src_endpoint.ip",
-			"raw_event.src_ip":               "src_endpoint.ip",
-			"raw_event.raw_event.src":        "src_endpoint.ip",
-			"raw_event.raw_event.src_ip":     "src_endpoint.ip",
-			"raw_event.dst":                  "dst_endpoint.ip",
-			"raw_event.dst_ip":               "dst_endpoint.ip",
-			"raw_event.raw_event.dst":        "dst_endpoint.ip",
-			"raw_event.raw_event.dst_ip":     "dst_endpoint.ip",
-			"raw_event.USER":                 "actor.user.name",
-			"raw_event.user":                 "actor.user.name",
-			"raw_event.raw_event.USER":       "actor.user.name",
-			"raw_event.raw_event.user":       "actor.user.name",
-			"raw_event.orig_host":            "device.name",
-			"raw_event.host":                 "device.name",
-			"raw_event.raw_event.orig_host":  "device.name",
-			"raw_event.raw_event.host":       "device.name",
-			"raw_event.raw_event.entity":     "device.name",
-			"raw_event.raw_event.risk_object": "device.name",
-			"urgency":                        "severity",
-			"raw_event.severity":             "severity",
-			"raw_event.raw_event.severity":   "severity",
-		},
-		severityMap: map[string]int{
-			"critical": 5, "high": 4, "medium": 3, "low": 2, "informational": 1, "info": 1,
-			"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFORMATIONAL": 1, "INFO": 1,
-		},
-	},
 	// splunk — connector type emitted by SplunkConnector (#528). Its
 	// fetch_alerts already returns a canonical envelope (external_id / title /
 	// severity / src_ip / hostname / created_at + the original row under
@@ -180,27 +145,7 @@ var connectorProfiles = map[string]connectorProfile{
 			"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "informational": 1,
 		},
 	},
-	// splunk — connector type emitted by SplunkConnector (#528). Its
-	// fetch_alerts already returns a canonical envelope (external_id / title /
-	// severity / src_ip / hostname / created_at + the original row under
-	// raw_event), so the field map reads those lowercase canonical keys, NOT
-	// raw Splunk fields. Class 2001 (Security Finding, category 2) means the
-	// fusion promoter promotes a notable as a vendor-asserted finding
-	// regardless of severity, so a Medium notable is never silently dropped.
-	"splunk": {
-		product:   OcsfProduct{Name: "Splunk", VendorName: "Splunk"},
-		classUID:  2001,
-		className: "Security Finding",
-		fieldMap: map[string]string{
-			"title":       "message",
-			"external_id": "finding.uid",
-			"src_ip":      "src_endpoint.ip",
-			"hostname":    "device.name",
-		},
-		severityMap: map[string]int{
-			"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "informational": 1,
-		},
-	},
+
 	"okta_system_log": {
 		product:   OcsfProduct{Name: "Okta System Log", VendorName: "Okta"},
 		classUID:  3002,
