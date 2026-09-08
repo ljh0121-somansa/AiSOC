@@ -173,6 +173,48 @@ var connectorProfiles = map[string]connectorProfile{
 			"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFORMATIONAL": 1, "INFO": 1,
 		},
 	},
+	// splunk — connector type emitted by SplunkConnector (#528). Its
+	// fetch_alerts already returns a canonical envelope (external_id / title /
+	// severity / src_ip / hostname / created_at + the original row under
+	// raw_event), so the field map reads those lowercase canonical keys, NOT
+	// raw Splunk fields. Class 2001 (Security Finding, category 2) means the
+	// fusion promoter promotes a notable as a vendor-asserted finding
+	// regardless of severity, so a Medium notable is never silently dropped.
+	"splunk": {
+		product:   OcsfProduct{Name: "Splunk", VendorName: "Splunk"},
+		classUID:  2001,
+		className: "Security Finding",
+		fieldMap: map[string]string{
+			"title":       "message",
+			"external_id": "finding.uid",
+			"src_ip":      "src_endpoint.ip",
+			"hostname":    "device.name",
+		},
+		severityMap: map[string]int{
+			"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "informational": 1,
+		},
+	},
+	// splunk — connector type emitted by SplunkConnector (#528). Its
+	// fetch_alerts already returns a canonical envelope (external_id / title /
+	// severity / src_ip / hostname / created_at + the original row under
+	// raw_event), so the field map reads those lowercase canonical keys, NOT
+	// raw Splunk fields. Class 2001 (Security Finding, category 2) means the
+	// fusion promoter promotes a notable as a vendor-asserted finding
+	// regardless of severity, so a Medium notable is never silently dropped.
+	"splunk": {
+		product:   OcsfProduct{Name: "Splunk", VendorName: "Splunk"},
+		classUID:  2001,
+		className: "Security Finding",
+		fieldMap: map[string]string{
+			"title":       "message",
+			"external_id": "finding.uid",
+			"src_ip":      "src_endpoint.ip",
+			"hostname":    "device.name",
+		},
+		severityMap: map[string]int{
+			"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "informational": 1,
+		},
+	},
 	"okta_system_log": {
 		product:   OcsfProduct{Name: "Okta System Log", VendorName: "Okta"},
 		classUID:  3002,
@@ -345,20 +387,91 @@ func New(cfg *config.Config) (*Normalizer, error) {
 	return n, nil
 }
 
+// Canonical connector-envelope handling.
+//
+// Pull connectors normalize inside their own fetch_alerts and emit a canonical
+// envelope (source + raw_event + external_id/title/severity/src_ip/hostname/
+// created_at), NOT a raw vendor row. Only a handful of connector types have a
+// hand-written raw profile above, so historically every other connector (incl.
+// CrowdStrike and Okta, whose profile keys never matched their connector ids)
+// fell to the generic Network-Activity profile and lost its class + severity.
+// We instead detect the envelope and map its canonical fields directly,
+// defaulting to an OCSF Security Finding (class 2001, category 2) so vendor
+// alerts promote regardless of severity.
+var _canonicalSeverityMap = map[string]int{
+	"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "informational": 1,
+}
+
+var _canonicalFieldMap = map[string]string{
+	"title":       "message",
+	"external_id": "finding.uid",
+	"src_ip":      "src_endpoint.ip",
+	"hostname":    "device.name",
+	"actor":       "actor.user.name",
+}
+
+// canonicalClassByConnector overrides the default Security Finding class for
+// connector types whose canonical alerts are better modeled as another OCSF
+// class (identity providers -> Authentication 3002).
+var canonicalClassByConnector = map[string]struct {
+	classUID  int
+	className string
+}{
+	"okta":         {3002, "Authentication"},
+	"azure_entra":  {3002, "Authentication"},
+	"auth0":        {3002, "Authentication"},
+	"duo_security": {3002, "Authentication"},
+	"onepassword":  {3002, "Authentication"},
+}
+
+func isCanonicalEnvelope(p map[string]interface{}) bool {
+	if p == nil {
+		return false
+	}
+	_, hasRaw := p["raw_event"]
+	_, hasSource := p["source"]
+	return hasRaw && hasSource
+}
+
+func canonicalProfile(connectorType string) connectorProfile {
+	classUID, className := 2001, "Security Finding"
+	if override, ok := canonicalClassByConnector[connectorType]; ok {
+		classUID, className = override.classUID, override.className
+	}
+	name := connectorType
+	if name == "" {
+		name = "Connector"
+	}
+	return connectorProfile{
+		product:     OcsfProduct{Name: name, VendorName: name},
+		classUID:    classUID,
+		className:   className,
+		fieldMap:    _canonicalFieldMap,
+		severityMap: _canonicalSeverityMap,
+	}
+}
+
 // Normalize converts a raw event to a NormalizedEvent
 func (n *Normalizer) Normalize(raw *RawEvent) (*NormalizedEvent, error) {
 	if raw.TenantID == "" {
 		return nil, fmt.Errorf("tenant_id is required")
 	}
 
-	profile, ok := connectorProfiles[raw.ConnectorType]
-	if !ok {
-		if n.cfg.NormalizerMode == "strict" {
-			return nil, fmt.Errorf("unknown connector type: %s", raw.ConnectorType)
+	var profile connectorProfile
+	if isCanonicalEnvelope(raw.Payload) {
+		// Connector-normalized envelope: map its canonical fields directly.
+		profile = canonicalProfile(raw.ConnectorType)
+	} else {
+		var ok bool
+		profile, ok = connectorProfiles[raw.ConnectorType]
+		if !ok {
+			if n.cfg.NormalizerMode == "strict" {
+				return nil, fmt.Errorf("unknown connector type: %s", raw.ConnectorType)
+			}
+			// Lenient: use generic profile
+			profile = connectorProfiles["splunk"]
+			log.Warn().Str("connector_type", raw.ConnectorType).Msg("Using generic profile for unknown connector")
 		}
-		// Lenient: use generic profile
-		profile = connectorProfiles["splunk"]
-		log.Warn().Str("connector_type", raw.ConnectorType).Msg("Using generic profile for unknown connector")
 	}
 
 	warnings := []string{}
@@ -374,6 +487,10 @@ func (n *Normalizer) Normalize(raw *RawEvent) (*NormalizedEvent, error) {
 	if t, ok := raw.Payload["time"].(string); ok && t != "" {
 		eventTime = t
 	} else if t, ok := raw.Payload["timestamp"].(string); ok && t != "" {
+		eventTime = t
+	} else if t, ok := raw.Payload["created_at"].(string); ok && t != "" {
+		// Canonical connector envelopes (e.g. Splunk, #528) carry the event
+		// time under created_at; honor it so the notable's event time survives.
 		eventTime = t
 	}
 	ocsf["time"] = normalizeTime(eventTime)
@@ -488,7 +605,11 @@ func (n *Normalizer) Normalize(raw *RawEvent) (*NormalizedEvent, error) {
 
 	ocsf["tenant_uid"] = raw.TenantID
 	ocsf["source_connector_id"] = raw.ConnectorID
-	ocsf["event_id"] = generateEventID(raw)
+	// Replay-stable id: derived from tenant + connector + a stable vendor id
+	// (see generateEventID). Reused as the envelope ID + Kafka key below so a
+	// re-ingested event dedups end-to-end (Kafka key + ClickHouse event_id).
+	eventID := generateEventID(raw)
+	ocsf["event_id"] = eventID
 
 	// Preserve raw data
 	if rawBytes, err := json.Marshal(raw.Payload); err == nil {
@@ -547,14 +668,12 @@ func (n *Normalizer) Normalize(raw *RawEvent) (*NormalizedEvent, error) {
 		}
 	}
 
-	eventID := uuid.New().String()
-
 	return &NormalizedEvent{
-		ID:                   eventID,
-		ConnectorID:          raw.ConnectorID,
-		TenantID:             raw.TenantID,
-		OcsfEvent:            ocsf,
-		NormalizationVersion: n.version,
+		ID:                    eventID,
+		ConnectorID:           raw.ConnectorID,
+		TenantID:              raw.TenantID,
+		OcsfEvent:             ocsf,
+		NormalizationVersion:  n.version,
 		NormalizationWarnings: warnings,
 	}, nil
 }
@@ -721,11 +840,45 @@ func setNestedField(m map[string]interface{}, path string, val interface{}) {
 	setNestedField(nested, parts[1], val)
 }
 
-// generateEventID creates a deterministic event ID for deduplication
+// firstString returns the first non-empty string value among the given payload
+// keys, or "" if none are present.
+func firstString(payload map[string]interface{}, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := payload[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// generateEventID creates a deterministic, replay-stable event ID for
+// deduplication (#529).
+//
+// It is derived from the connector instance + tenant + a STABLE vendor
+// identifier (external_id / event_id / id / _cd, in priority order) so
+// re-ingesting the same event — overlapping poll windows, backfills, restarts —
+// always yields the same canonical ID. ReceivedAt is deliberately excluded from
+// this path; it is set per poll and previously made the ID change on every
+// poll. When no stable vendor ID exists we fall back to the event time plus a
+// content hash of the payload, so a byte-identical replay still collapses to
+// one ID while two same-timestamp events with different content stay distinct.
 func generateEventID(raw *RawEvent) string {
-	key := fmt.Sprintf("%s:%s:%s", raw.ConnectorID, raw.TenantID, raw.ReceivedAt)
-	if id, ok := raw.Payload["id"].(string); ok && id != "" {
-		key += ":" + id
+	base := fmt.Sprintf("%s:%s", raw.ConnectorID, raw.TenantID)
+	for _, field := range []string{"external_id", "event_id", "id", "_cd"} {
+		if v, ok := raw.Payload[field].(string); ok && v != "" {
+			return uuid.NewSHA1(uuid.NameSpaceOID, []byte(base+":"+field+"="+v)).String()
+		}
+	}
+	key := base
+	if t := firstString(raw.Payload, "time", "created_at", "timestamp"); t != "" {
+		key += ":t=" + t
+	} else {
+		key += ":r=" + raw.ReceivedAt
+	}
+	// json.Marshal sorts map keys, so the same payload always hashes to the
+	// same content string — the hash is deterministic across replays.
+	if rawBytes, err := json.Marshal(raw.Payload); err == nil {
+		key += ":c=" + string(rawBytes)
 	}
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(key)).String()
 }

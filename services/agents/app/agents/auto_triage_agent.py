@@ -2,9 +2,13 @@
 Auto-Triage Agent: LLM-based autonomous alert classification.
 
 Uses structured LLM reasoning to classify alerts as true_positive,
-false_positive, or benign — replacing simple keyword heuristics with
-contextual analysis.  High-confidence FP/benign verdicts are auto-closed;
-uncertain alerts escalate into the full triage → enrichment → investigation
+benign_true_positive, false_positive, or benign — replacing simple keyword
+heuristics with contextual analysis. The taxonomy separates detection validity
+from activity maliciousness so a rule that correctly detects authorized
+activity (an approved pen-test, a scheduled scan) is a benign_true_positive,
+not a false_positive (see ``app.agents.dispositions``). High-confidence
+FP / benign / benign_true_positive verdicts are auto-closed; true_positive and
+needs_review escalate into the full triage → enrichment → investigation
 pipeline.
 
 Metrics (module-level counters) are exposed via the /triage/stats API.
@@ -19,16 +23,38 @@ from typing import Any
 
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
+from app.agents.dispositions import (
+    AUTO_CLOSEABLE_DISPOSITIONS,
+    BENIGN,
+    BENIGN_TRUE_POSITIVE,
+    FALSE_POSITIVE,
+    LLM_VERDICTS,
+    TRUE_POSITIVE,
+    normalize_disposition,
+)
 from app.investigator.prompt_sanitizer import sanitize_text, wrap_untrusted
 from app.llm import safe_ainvoke
+from app.llm.factory import make_chat_model
 from app.models.state import AgentStatus, InvestigationState
 from app.prompt_serialization import format_extra_fields_for_llm
+from app.prompting.envelope import make_nonce, scan_evidence_fields, system_rule
 
 logger = structlog.get_logger()
 
 AUTO_CLOSE_THRESHOLD: float = float(os.getenv("AISOC_AUTO_CLOSE_THRESHOLD", "0.85"))
+
+
+class AutoTriageError(RuntimeError):
+    """Raised when the LLM auto-triage call or its response parsing fails.
+
+    Issue #571: the old code swallowed LLM/parse exceptions and returned a
+    RUNNING state with a null verdict, so the worker's deterministic fallback
+    (`_llm_triage`'s except branch) was unreachable and a null verdict could be
+    recorded as "completed". Raising a typed error lets the caller fall back to
+    deterministic triage or mark the alert ``needs_review`` — never null.
+    """
+
 
 _metrics: dict[str, Any] = {
     "auto_resolved_count": 0,
@@ -37,37 +63,52 @@ _metrics: dict[str, Any] = {
     "confidence_sum": 0.0,
     "fp_count": 0,
     "benign_count": 0,
+    "btp_count": 0,
     "tp_count": 0,
+    "injection_demoted": 0,
 }
 
 _SYSTEM_PROMPT = """\
 You are the Auto-Triage Agent of an AI Security Operations Centre.
 
-Given a security alert (summary + raw payload), classify it into exactly one
-of three verdicts:
+Judge two INDEPENDENT questions, then pick one verdict:
+  1. Detection validity — did the rule correctly detect its intended condition?
+  2. Activity maliciousness — was the detected activity an actual threat?
 
-  • true_positive  — the alert describes a genuine security threat that
-    requires investigation and potential response.
-  • false_positive — the alert was triggered by benign activity that
-    superficially resembles a threat (e.g. scheduled vulnerability scans,
-    authorised pen-tests, known-good software flagged by signature).
-  • benign — the alert describes real but non-threatening activity that
-    does not warrant investigation (e.g. informational log, expected
-    configuration change).
+Classify the alert into exactly one of these verdicts:
+
+  • true_positive — a VALID detection of MALICIOUS or unauthorized activity
+    that requires investigation and potential response.
+  • benign_true_positive — a VALID detection of AUTHORIZED, expected, or
+    otherwise non-malicious activity. The rule fired correctly, but the
+    behaviour was sanctioned (e.g. a scheduled vulnerability scan, an approved
+    penetration test, sanctioned admin/red-team tooling). This is NOT a false
+    positive: the detection was right, so recording it as false_positive would
+    unfairly penalize the rule and corrupt its false-positive-rate metric.
+  • false_positive — an INVALID or noisy detection: the rule's intended
+    condition was not actually present (misfire, bad signature, mis-parsed
+    field). Only use this when the detection itself was wrong.
+  • benign — real but non-threatening activity that is not a detection-validity
+    statement (informational log, expected configuration change).
+  • needs_review — insufficient evidence to decide safely; route to a human.
 
 You MUST respond with a JSON object and nothing else:
 {
-  "verdict": "true_positive" | "false_positive" | "benign",
+  "verdict": "true_positive" | "benign_true_positive" | "false_positive" | "benign" | "needs_review",
   "confidence": <float 0.0–1.0>,
   "rationale": "<2-4 sentence explanation of your reasoning in Korean>"
 }
 
 Reasoning guidelines:
 - Consider the severity, IOC presence, MITRE technique IDs, and alert context.
-- Vendor risk_score > 0.7 with critical keywords strongly suggests TP.
-- Alerts about scheduled scans, test environments, or known-good hashes lean FP.
+- Vendor risk_score > 0.7 with critical keywords strongly suggests true_positive.
+- Scheduled scans and authorized penetration tests, when the rule correctly
+  detected the behaviour, are benign_true_positive — NOT false_positive.
+- Reserve false_positive for cases where the rule misfired or its intended
+  detection condition was not actually present.
 - Informational alerts with no IOCs and low risk lean benign.
-- Be conservative: when uncertain, lean toward true_positive to avoid missing threats.
+- Be conservative: when uncertain, prefer true_positive or needs_review over
+  auto-closing, to avoid missing threats.
 - confidence should reflect how certain you are, not the severity of the threat.
 - LANGUAGE RULE: To optimize token usage, perform all internal reasoning and JSON keys in English, but you MUST write the "rationale" value in natural, professional Korean for the security analyst UI.
 """
@@ -79,6 +120,9 @@ def get_metrics() -> dict[str, Any]:
     total = m["total_processed"]
     m["auto_resolution_rate"] = m["auto_resolved_count"] / total if total > 0 else 0.0
     m["fp_rate"] = m["fp_count"] / total if total > 0 else 0.0
+    # Benign-true-positive rate is reported independently of fp_rate so a valid
+    # detection of authorized activity never looks like a false positive.
+    m["btp_rate"] = m.get("btp_count", 0) / total if total > 0 else 0.0
     m["avg_confidence"] = m["confidence_sum"] / total if total > 0 else 0.0
     return m
 
@@ -149,9 +193,12 @@ def _parse_llm_response(text: str) -> dict[str, Any]:
         else:
             raise
 
-    verdict = data.get("verdict", "true_positive")
-    if verdict not in ("true_positive", "false_positive", "benign"):
-        verdict = "true_positive"
+    # Normalize to the canonical taxonomy (shared with the deterministic
+    # fallback). ``benign_true_positive`` is a first-class outcome; an
+    # unrecognised verdict fails safe to ``true_positive`` (never auto-closed).
+    verdict = normalize_disposition(data.get("verdict"), default=TRUE_POSITIVE)
+    if verdict not in LLM_VERDICTS:
+        verdict = TRUE_POSITIVE
 
     confidence = float(data.get("confidence", 0.5))
     confidence = max(0.0, min(1.0, confidence))
@@ -175,6 +222,14 @@ async def run_auto_triage(state: InvestigationState) -> InvestigationState:
     state.status = AgentStatus.RUNNING
     state.iteration_count += 1
 
+    # Prompt-injection guard: scan the untrusted alert evidence BEFORE reasoning
+    # over it. A high-severity hit demotes the case to L0 (manual review) so the
+    # agent can never be steered into auto-closing an alert whose own evidence
+    # is trying to manipulate the model. Per-run nonce fences the instructions.
+    raw = state.raw_alert or {}
+    injection = scan_evidence_fields((str(k), v) for k, v in raw.items() if isinstance(v, str | int | float | list | dict))
+    nonce = make_nonce()
+
     alert_context = _build_alert_context(state)
 
     model_name = os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or os.getenv("AISOC_LLM_MODEL", "gpt-4o-mini")
@@ -186,18 +241,20 @@ async def run_auto_triage(state: InvestigationState) -> InvestigationState:
         response = await safe_ainvoke(
             llm,
             [
-                SystemMessage(content=_SYSTEM_PROMPT),
+                SystemMessage(content=_SYSTEM_PROMPT + "\n\n" + system_rule(nonce)),
                 HumanMessage(content=alert_context),
             ],
         )
         raw_text = response.content
         result = _parse_llm_response(raw_text)
     except Exception as exc:
-        logger.error("Auto-triage LLM call failed, escalating", error=str(exc))
-        state.add_finding(f"Auto-triage LLM error: {exc} — escalating to manual triage")
-        _metrics["escalated_count"] += 1
+        # Issue #571: do NOT swallow + return a null-verdict RUNNING state.
+        # Raise a typed error so the caller falls back to deterministic triage
+        # (or marks the alert needs_review) instead of completing with no verdict.
+        logger.error("Auto-triage LLM call failed", error=str(exc))
+        state.add_finding(f"Auto-triage LLM error: {exc}")
         _metrics["total_processed"] += 1
-        return state
+        raise AutoTriageError(str(exc)) from exc
 
     elapsed_ms = round((time.monotonic() - t0) * 1000)
 
@@ -207,9 +264,13 @@ async def run_auto_triage(state: InvestigationState) -> InvestigationState:
 
     _metrics["total_processed"] += 1
     _metrics["confidence_sum"] += confidence
-    if verdict == "false_positive":
+    if verdict == FALSE_POSITIVE:
         _metrics["fp_count"] += 1
-    elif verdict == "benign":
+    elif verdict == BENIGN_TRUE_POSITIVE:
+        # Benign true positive is a VALID detection — tracked separately so it
+        # never inflates the false-positive rate (#526).
+        _metrics["btp_count"] += 1
+    elif verdict == BENIGN:
         _metrics["benign_count"] += 1
     else:
         _metrics["tp_count"] += 1
@@ -225,7 +286,24 @@ async def run_auto_triage(state: InvestigationState) -> InvestigationState:
     state.add_finding(f"Auto-triage: verdict={verdict}, confidence={confidence:.2f}, latency={elapsed_ms}ms")
     state.add_finding(f"Auto-triage rationale: {rationale}")
 
-    should_auto_close = verdict in ("false_positive", "benign") and confidence >= AUTO_CLOSE_THRESHOLD
+    # Auto-close FP / benign / benign_true_positive (no active threat, no
+    # response needed); true_positive and needs_review always escalate.
+    should_auto_close = verdict in AUTO_CLOSEABLE_DISPOSITIONS and confidence >= AUTO_CLOSE_THRESHOLD
+
+    # Prompt-injection L0 demotion: a high-severity injection signal always
+    # blocks auto-close and routes to a human, regardless of the LLM's verdict.
+    if injection.should_demote_to_l0:
+        _metrics["injection_demoted"] += 1
+        should_auto_close = False
+        ledger = injection.as_ledger_dict()
+        state.confidence_basis.append(f"prompt_injection={ledger.get('max_severity')} (auto-close blocked, demoted to L0)")
+        state.add_finding("Prompt-injection detected in alert evidence — demoted to manual review (L0); auto-close blocked.")
+        logger.warning(
+            "auto_triage.prompt_injection_demoted",
+            incident_id=str(state.incident_id),
+            signals=len(injection.signals),
+            max_severity=ledger.get("max_severity"),
+        )
 
     if should_auto_close:
         _metrics["auto_resolved_count"] += 1

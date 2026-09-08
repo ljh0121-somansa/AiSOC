@@ -26,8 +26,6 @@ from app.connectors.base import BaseConnector, Capability, ConnectorSchema, Fiel
 logger = structlog.get_logger()
 
 _LIMIT = 500
-# CEF:Version|DeviceVendor|DeviceProduct|DeviceVersion|SignatureID|Name|Severity|Extension
-_CEF_RE = re.compile(r"CEF:\d+\|(?P<hdr>(?:[^|\\]|\\.)*(?:\|(?:[^|\\]|\\.)*){6})\|(?P<ext>.*)$")
 
 
 def _cef_severity(value: Any) -> str:

@@ -29,7 +29,7 @@ const OSQUERY_TLS_HOST = process.env.OSQUERY_TLS_URL || 'http://localhost:8090';
 
 const nextConfig = {
   reactStrictMode: true,
-  transpilePackages: ['@aisoc/ui', '@aisoc/types'],
+  transpilePackages: ['@aisoc/ui', '@aisoc/types', '@aisoc/report-card'],
   // pnpm monorepo: anchor Turbopack at the repository root so it can resolve
   // the hoisted `next` package via apps/web/node_modules/next (symlink into
   // the root .pnpm store). Setting this to __dirname caused Turbopack to

@@ -1,0 +1,6 @@
+{
+  "extensions": [
+    "../.harness/harness/extensions/harness-prompts.ts"
+  ]
+}
+

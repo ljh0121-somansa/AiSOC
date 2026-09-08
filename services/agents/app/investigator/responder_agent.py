@@ -9,16 +9,15 @@ Responsibilities:
 
 from __future__ import annotations
 
-import os
 import time
 from typing import Any
 
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
 from app.core.cost_telemetry import record_llm_call
 from app.llm import safe_ainvoke
+from app.llm.factory import make_chat_model, resolve_model_alias
 from app.prompt_serialization import summarize_structure_for_llm
 from app.investigator.utils import safe_parse_agent_json
 
@@ -65,10 +64,12 @@ Respond ONLY with a JSON object:
 """
 
 async def _llm_responder(state: InvestigatorState) -> dict[str, Any]:
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "2048"))                                                    
-    llm = ChatOpenAI(model=model, temperature=0, max_tokens=max_tokens, response_format={"type":           
- "json_object"})
+    model = resolve_model_alias("investigation")
+    llm = make_chat_model(
+        "investigation",
+        temperature=0,
+        response_format={"type": "json_object"},
+    )
 
     # Defence-in-depth: every field surfaced here originated in attacker-
     # influenced data (alert payloads, banners, dark-web excerpts, LLM

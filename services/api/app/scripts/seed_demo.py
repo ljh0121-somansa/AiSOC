@@ -54,7 +54,9 @@ from app.models.investigation import (
     InvestigationEvent,
     InvestigationRun,
 )
+from app.models.published_replay import PublishedReplay
 from app.models.tenant import Tenant, User
+from app.services.replay_redaction import build_redacted_snapshot
 
 # Deterministic random for reproducible seeds.
 _rng = random.Random(42)
@@ -2073,7 +2075,21 @@ async def _seed_in_flight_investigation(session, tenant: Tenant) -> int:
     existing = await session.execute(
         select(InvestigationRun).where(InvestigationRun.tenant_id == tenant.id).where(InvestigationRun.case_id == incident["key"]).limit(1)
     )
-    if existing.scalar_one_or_none() is not None:
+    existing_run = existing.scalar_one_or_none()
+    if existing_run is not None:
+        # Cases/runs may already exist from a prior seed while published_replays
+        # was never created (table missing during an earlier Postgres outage).
+        # Still ensure the canonical /r/demo-lockbit row lands.
+        events = (
+            (
+                await session.execute(
+                    select(InvestigationEvent).where(InvestigationEvent.run_id == existing_run.id).order_by(InvestigationEvent.seq.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        await _seed_published_replay(session, tenant, existing_run, list(events))
         return 0
 
     started = datetime.now(UTC) - timedelta(minutes=6)
@@ -2226,6 +2242,72 @@ async def _seed_in_flight_investigation(session, tenant: Tenant) -> int:
     session.add_all(artifacts)
     await session.flush()
 
+    await _seed_published_replay(session, tenant, run, events)
+
+    return 1
+
+
+# Stable slug for the canonical public demo replay (linked from the README /
+# marketing site). Re-seeding is idempotent on this slug.
+CANONICAL_REPLAY_SLUG = "demo-lockbit"
+
+
+async def _seed_published_replay(
+    session,
+    tenant: Tenant,
+    run: InvestigationRun,
+    events: list[InvestigationEvent],
+) -> int:
+    """Publish INC-RT-001 as the canonical public replay at /r/demo-lockbit.
+
+    Uses the same redaction pipeline as the live publish flow so the demo
+    snapshot is byte-for-byte what an operator would get. Idempotent on the
+    fixed slug.
+    """
+    existing = await session.execute(select(PublishedReplay).where(PublishedReplay.slug == CANONICAL_REPLAY_SLUG).limit(1))
+    if existing.scalar_one_or_none() is not None:
+        return 0
+
+    last_ts = events[-1].ts if events else run.started_at
+    run_dict = {
+        "case_id": run.case_id,
+        "alert_summary": run.alert_summary,
+        "raw_alert": run.raw_alert,
+        "model_used": run.model_used,
+        "status": run.status,
+        "started_at": run.started_at,
+        "completed_at": last_ts,
+    }
+    event_dicts = [
+        {
+            "seq": e.seq,
+            "kind": e.kind,
+            "agent": e.agent,
+            "summary": e.summary,
+            "payload": e.payload,
+            "ts": e.ts,
+            "duration_ms": e.duration_ms,
+        }
+        for e in events
+    ]
+    result = build_redacted_snapshot(run=run_dict, events=event_dicts)
+    snapshot = result.snapshot
+    # The seeded run is still "running", but the decision step establishes a
+    # confirmed LockBit incident at 0.96 confidence — reflect that in the
+    # public verdict stamp (this is clearly-labelled demo data).
+    snapshot["verdict"] = "confirmed_incident"
+
+    session.add(
+        PublishedReplay(
+            slug=CANONICAL_REPLAY_SLUG,
+            run_id=run.id,
+            tenant_id=tenant.id,
+            case_id=run.case_id,
+            title=result.title or "Ransomware investigation",
+            snapshot=snapshot,
+        )
+    )
+    await session.flush()
     return 1
 
 

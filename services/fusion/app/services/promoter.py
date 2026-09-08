@@ -35,6 +35,7 @@ from typing import Any
 import structlog
 
 from app.models.alert import AlertSeverity, RawAlert
+from app.services.provenance import extract_provenance
 
 logger = structlog.get_logger()
 
@@ -213,7 +214,8 @@ def promote_normalized_event(message: dict[str, Any]) -> RawAlert | None:
     severity = _SEVERITY_BY_ID.get(severity_id if isinstance(severity_id, int) else 0, AlertSeverity.MEDIUM)
 
     tactics, techniques = _mitre(ocsf)
-    
+    connector_id, connector_type, class_uid = extract_provenance(message, ocsf)
+
     # ─── Splunk Airgap Fallback (Parse raw_data) ───
     # If the Go normalizer failed to parse fields because the server is airgapped
     # and the new Go binary couldn't be built, we rescue the fields here in Python.
@@ -227,10 +229,10 @@ def promote_normalized_event(message: dict[str, Any]) -> RawAlert | None:
                 elif raw_sev == "high": severity = AlertSeverity.HIGH
                 elif raw_sev == "low": severity = AlertSeverity.LOW
                 elif raw_sev in ("info", "informational"): severity = AlertSeverity.INFO
-        
+
         if not techniques:
             techniques = _extract_splunk_mitre(raw_data_str)
-            
+
     src_ip = (
         _get_nested(ocsf, "src_endpoint", "ip")
         or _extract_splunk_kv(raw_data_str, "src_ip")
@@ -260,7 +262,7 @@ def promote_normalized_event(message: dict[str, Any]) -> RawAlert | None:
     username = _get_nested(ocsf, "actor", "user", "name") or _extract_splunk_kv(raw_data_str, "username") or _extract_splunk_kv(raw_data_str, "user") or _extract_splunk_kv(raw_data_str, "USER")
     file_hash = _first_file_hash(ocsf) or _extract_splunk_kv(raw_data_str, "file_hash") or _extract_splunk_kv(raw_data_str, "hash") or _extract_splunk_kv(raw_data_str, "sha256")
     domain = _extract_splunk_kv(raw_data_str, "domain")
-    
+
     raw_risk = (
         _extract_splunk_kv(raw_data_str, "risk_score")
         or _extract_splunk_kv(raw_data_str, "crscore")
@@ -310,4 +312,7 @@ def promote_normalized_event(message: dict[str, Any]) -> RawAlert | None:
         mitre_techniques=techniques,
         raw_event=ocsf,
         event_time=_event_time(ocsf),
+        connector_id=connector_id,
+        connector_type=connector_type,
+        ocsf_class_uid=class_uid,
     )

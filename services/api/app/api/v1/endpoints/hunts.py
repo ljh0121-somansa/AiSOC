@@ -39,6 +39,7 @@ from sqlalchemy import text
 from app.api.v1.deps import AuthUser, DBSession
 from app.core.airgap import AirgapViolation, enforce_airgap_for_url
 from app.services.hunt_query_generator import generate_queries_tiered
+from app.services.model_aliases import resolve_model_alias
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +120,64 @@ class HuntResponse(BaseModel):
     created_by: str | None
     query_generation_mode: Literal["ai", "fallback"] = "ai"
     warnings: str | None = None
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# LLM query generation helper
+# ────────────────────────────────────────────────────────────────────────────
+
+_HUNT_SYSTEM = """You are a senior threat hunter. Given a threat hypothesis, generate
+detection queries for the listed platforms.
+
+Return ONLY valid JSON with this structure:
+{
+  "esql": "<ES|QL query string>",
+  "spl": "<Splunk SPL string>",
+  "kql": "<KQL string>"
+}
+No prose. Just JSON."""
+
+
+async def _generate_queries(hypothesis: str, mitre: str | None) -> dict[str, str] | None:
+    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY")
+    if not api_key:
+        return None
+    base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
+    model = os.getenv("LLM_MODEL") or resolve_model_alias("nl")
+    user_msg = f"HYPOTHESIS: {hypothesis}"
+    if mitre:
+        user_msg += f"\nMITRE TECHNIQUE: {mitre}"
+    user_msg += "\nGenerate ES|QL, SPL, and KQL hunt queries."
+    completions_url = f"{base_url}/chat/completions"
+    enforce_airgap_for_url(completions_url)
+    try:
+        async with httpx.AsyncClient(timeout=45) as client:
+            resp = await client.post(
+                completions_url,
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": _HUNT_SYSTEM},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    "temperature": 0.2,
+                    "response_format": {"type": "json_object"},
+                },
+            )
+        resp.raise_for_status()
+        return json.loads(resp.json()["choices"][0]["message"]["content"])
+    except Exception:
+        return None
+
+
+def _fallback_queries(hypothesis: str) -> dict[str, str]:
+    escaped = hypothesis.replace('"', '\\"')
+    return {
+        "esql": f'FROM logs-* | WHERE message LIKE "%{escaped[:60]}%" | LIMIT 100',
+        "spl": f'index=* "{escaped[:60]}" | head 100',
+        "kql": f'// KQL hunt — adapt field names\nSecurityEvent\n| where Activity has "{escaped[:60]}"\n| limit 100',
+    }
 
 
 # ────────────────────────────────────────────────────────────────────────────

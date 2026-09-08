@@ -304,7 +304,6 @@ async def main() -> None:
                     log(f"transient error while polling (will retry): {exc}")
                 await asyncio.sleep(3)
             raise SystemExit(f"detection alert {DETECTION_ALERT_TITLE!r} never appeared within {timeout_s}s")
-        return
 
     if args.post_event or args.await_alert:
         if not args.title:

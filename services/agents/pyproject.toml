@@ -7,8 +7,8 @@ license = "MIT"
 
 [tool.poetry.dependencies]
 python = "^3.11"
-fastapi = ">=0.109,<0.140"
-uvicorn = {extras = ["standard"], version = ">=0.27,<0.52"}
+fastapi = ">=0.109,<0.142"
+uvicorn = {extras = ["standard"], version = ">=0.27,<0.53"}
 pydantic = "^2.5.0"
 pydantic-settings = "^2.1.0"
 langchain = ">=0.3.0,<0.4.0"
@@ -23,7 +23,7 @@ openai = ">=1.12,<3.0"
 redis = {extras = ["hiredis"], version = ">=5.0.1,<9.0.0"}
 httpx = ">=0.26,<0.29"
 structlog = ">=24.1,<27.0"
-prometheus-client = ">=0.19,<0.26"
+prometheus-client = ">=0.19,<0.27"
 python-dateutil = "^2.8.2"
 aiokafka = ">=0.10,<0.15"
 qdrant-client = {extras = ["fastembed"], version = "^1.9.0"}
@@ -36,8 +36,10 @@ asyncpg = ">=0.29,<0.32"
 sqlalchemy = {extras = ["asyncio"], version = "^2.0.25"}
 apscheduler = "^3.10.4"
 pyyaml = "^6.0.1"
-cryptography = ">=44.0.1,<49"
 cffi = ">=1.16.0,<2"
+# Imported by app.security.credential_vault. This must be a direct runtime
+# dependency rather than an accidental dependency of Poetry itself.
+cryptography = ">=46,<50"
 # jsonschema is consumed by the NL → playbook drafter (T3.7) to validate
 # every drafted playbook against schemas/playbook.schema.json before the
 # editor loads it, and by scripts/lint_playbooks.py. Pinned to the
@@ -47,6 +49,7 @@ jsonschema = ">=4.21,<5.0"
 [tool.poetry.group.dev.dependencies]
 pytest = ">=7.4,<10.0"
 pytest-asyncio = ">=0.23,<1.5"
+respx = ">=0.22,<0.24"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

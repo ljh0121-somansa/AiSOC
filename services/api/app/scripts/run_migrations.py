@@ -114,9 +114,13 @@ async def _connect() -> asyncpg.Connection:
     """
     dsn, kwargs = _asyncpg_dsn(str(settings.DATABASE_URL))
     last_exc: Exception | None = None
-    for attempt in range(1, 7):  # ~30 s total at the back-off schedule below
+    # ~3 min total window (see the back-off below). On the Fly demo, the
+    # release_command machine is often the *first* thing to touch the Postgres
+    # app after autostop, so it must wait out a full autostart + cold boot — a
+    # 30 s window let migrations soft-fail and ship code against a stale schema.
+    for attempt in range(1, 11):
         try:
-            return await asyncpg.connect(dsn, **kwargs)
+            return await asyncpg.connect(dsn, timeout=10, **kwargs)
         except (
             asyncpg.exceptions.ConnectionDoesNotExistError,
             asyncpg.exceptions.CannotConnectNowError,
@@ -124,7 +128,7 @@ async def _connect() -> asyncpg.Connection:
             OSError,
         ) as exc:
             last_exc = exc
-            delay = min(2 ** (attempt - 1), 8)
+            delay = min(2 ** (attempt - 1), 12)
             logger.warning(
                 "asyncpg.connect failed on attempt %d (%s: %s); retrying in %ds",
                 attempt,

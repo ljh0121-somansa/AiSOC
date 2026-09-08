@@ -7,6 +7,315 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.7.0] — 2026-08-04
+
+### Added
+
+- **Self-service data lifecycle (Wave 5).** (1) **Configurable retention**
+  (`/data-lifecycle/retention`): per-tenant windows (days) for `raw_events`
+  (lake) / `alerts` / `audit`, clamped to `[1, 3650]`, with a bounded
+  **tenant-scoped** ClickHouse purge and a parameterised Postgres purge (W5.1).
+  (2) A **field-extraction / transform DSL** (`pipeline_transforms`): a safe,
+  whitelisted, no-`eval` pipeline (`rename` / `copy` / `set` / `set_default` /
+  `drop` / `lowercase` / `uppercase` / `coalesce` / grok-style `extract` with
+  dotted paths + named captures) that reshapes events onto OCSF; the `extract`
+  op compiles a `%{TOKEN:name}` template from `re.escape`d literals + a fixed
+  linear-time token map, so it is ReDoS-proof by construction (no raw user
+  regex); validation rejects unknown ops/tokens and oversized pipelines;
+  runtime is fail-open per op and never mutates the input (W5.3). (3) **Runtime custom parsers**
+  (`/data-lifecycle/parsers` + `/parsers/test`): a parser is a named,
+  tenant-scoped, validated transform pipeline you can register and dry-run
+  against a sample event (W5.2). Gated by `test_retention.py` +
+  `test_pipeline_transforms.py`.
+- **Customizable dashboard / report builder (Wave 7).** A declarative report is
+  a list of widgets (whitelisted `type` × data `source`), validated for unknown
+  types/sources, duplicate ids, and bounded size, then rendered by resolving
+  each widget's data server-side — resilient to a failing/missing resolver (one
+  bad widget renders an `error`, never breaks the report). `POST
+  /report-builder/validate` + `/render` (the latter wires the real tenant-scoped
+  `alerts_by_severity` resolver). The same definition can drive the live
+  dashboard and an exported report. Gated by `test_report_builder.py` (8 cases).
+- **Compliance mapping + agentless CSPM + destinations (Wave 6).** (1) An
+  **agentless CSPM scan engine** (`cspm.scan_resources` + `POST /posture/scan`):
+  evaluates a read-only cloud-resource snapshot against misconfiguration checks
+  (public/unencrypted S3, world-open security groups on sensitive ports, IAM
+  users without MFA / stale keys, public/unencrypted RDS, unencrypted EBS),
+  emitting findings with severity + control refs (W6.2). (2) **Compliance
+  control mapping with auto-evidence** (`compliance_mapping`): CSPM findings and
+  fired detections (via MITRE) map to CIS / SOC 2 controls and mint dated
+  evidence records automatically (W6.1). (3) **Notification/SOAR destinations**
+  (`destinations` + `POST /posture/destinations/preview`): Opsgenie, email, and
+  a generic `aisoc.handoff.v1` external-SOAR webhook, with an SSRF guard on
+  outbound targets (W6.3). Gated by `test_compliance_cspm.py` (14 cases).
+- **Invoking-identity scoping for response actions (Wave 4).** An
+  `ActionPrincipal` (user id + tenant + roles + permissions) now rides on every
+  `ActionRequest` (W4.1). The actions service enforces **least-privilege**: an
+  action only runs if its principal holds the permission its blast radius
+  demands (`actions:execute:{low,medium,high}`, higher tiers granting lower;
+  `actions:*` granting all), with tenant binding (W4.2). The mutating action
+  routes require a service bearer token and **fail closed** in production when
+  unconfigured (W4.3). Approvals are **bound**: an approver must hold the
+  action's permission and cannot approve their own request (separation of
+  duties, W4.4). Gated by `test_authz.py` (10 cases).
+- **Three detection-authoring modes (Wave 3).** (1) A **Python detection
+  framework** (`packages/aisoc-detections`): write detections as
+  `def rule(event) -> bool` + metadata + inline positive/negative `TESTS`,
+  complementing the YAML/Sigma corpus; a fixture harness fails a blind rule
+  (misses a positive) or a noisy one (fires on a negative), `evaluate()` is
+  fail-closed, and a CI gate (`python-detections.yml`) runs it. Ships a CLI
+  (`aisoc-detections`) + example detections. (2) An **AI Detection Builder**
+  (`POST /nl-detection/propose`): a plain-English threat description becomes a
+  Sigma rule with **auto-generated** positive/negative fixtures **derived from
+  the rule's own selection** (not invented by the LLM), run through the
+  non-circular eval-gate, and opened as a governed DRAFT proposal. (3) A
+  **no-code / simple detection builder** (`SimpleRuleBuilder`): a form
+  (field/operator/value rows) compiles to a valid Sigma rule dropped into the
+  governed editor. Also fixes a real bug: `detection_loop` / the Wave-1 tuner +
+  hunt bridge inserted into a non-existent `aisoc_detection_rule_proposals`
+  table (the real table is `detection_rule_proposals`).
+- **Detection backtesting over the event lake (Wave 2).** New
+  `POST /api/v1/rules/{rule_id}/backtest` runs a candidate detection rule against
+  REAL historical events in the tenant-scoped ClickHouse lake
+  (`aisoc.raw_events`) over a bounded window and reports exactly how many events
+  would have fired (`would_fire`), the `hit_rate`, and sample matches — so an
+  engineer can see a rule's noise on real history before promoting it, instead of
+  only testing against hand-crafted fixtures. The source filter is
+  injection-sanitised and the SELECT is tenant-rewritten via
+  `lake_sql.rewrite_for_tenant`. Read-only (`rules:read`). Gate: `test_backtest.py`.
+  Also `POST /detection-proposals/{id}/backtest` attaches the result to the
+  proposal's `eval_result["backtest"]` as a third promotion signal, with an
+  opt-in `AISOC_BACKTEST_MAX_HIT_RATE` gate that blocks `/decide` approval for
+  rules too noisy over history (W2.2, `test_backtest_gate.py`), and the rule
+  editor gains a "Backtest over history" panel (W2.3).
+- **Closed loop: outcomes compound, repeat alerts auto-suppress (Wave 1).** Every
+  durable auto-triage outcome is now written back as a per-signature institutional
+  prior (`services/agents/app/memory/outcomes.py`), and a later alert matching a
+  trusted prior benign/false-positive disposition is auto-resolved WITHOUT
+  re-triage — human priors are trusted immediately, AI priors require corroboration
+  (repeat count + high confidence), and a prior true-positive never auto-closes a
+  future alert. Suppressions are recorded to `aisoc_outcome_suppressions`
+  (migration 048) and surfaced as a measured `repeat_alerts_suppressed` /
+  `repeat_suppression_rate` on `GET /metrics/funnel`. Fusion now applies a bounded
+  (±0.10), per-tenant institutional-memory nudge to fuse-time confidence
+  (`MemoryPriorProvider` distils disposition history; refreshed on a cadence),
+  scheduled hunt findings open governed DRAFT `DetectionRuleProposal`s
+  (`hunt-finding` source), and the previously-orphaned disposition-history tuner is
+  wired via `POST /detection/tuning/auto-suggest`. Gates: `test_outcome_memory.py`,
+  `test_memory_nudge.py`, `test_wave1_loop_edges.py`; claim-to-gate matrix +4.
+- **LLM gateway (LiteLLM) — task-based model routing + observability
+  ([#478](https://github.com/beenuar/AiSOC/issues/478), PR1).** New `litellm`
+  service in `docker-compose.yml` as the single entry point for live LLM calls.
+  AiSOC requests a **logical task alias** (`aisoc-triage`, `aisoc-recon`,
+  `aisoc-investigation`, `aisoc-copilot`, `aisoc-summary`, `aisoc-report`,
+  `aisoc-nl`); the alias → real-model mapping lives entirely in
+  `infra/litellm/config.yaml`, so operators assign different local or hosted
+  models per task — and swap them — without any AiSOC code change (commented
+  Ollama/vLLM/Anthropic examples ship in the config). Per-task latency, tokens,
+  cost, errors, retries, and fallbacks are exported on `/metrics` and scraped by
+  the bundled Prometheus (new `aisoc-litellm` job; the third-party image is
+  allowlisted in `scripts/audit_prometheus_targets.py`). Opt-in and
+  non-breaking: unset `OPENAI_BASE_URL` keeps calls going direct to the provider,
+  and the deterministic offline path is unaffected. Docs:
+  `apps/docs/docs/operations/llm-gateway.md`; config test
+  `services/agents/tests/test_litellm_config.py`. (A follow-up PR wires the ~10
+  in-code callsites to request these aliases via `model_pins` and removes the
+  hardcoded `gpt-4o-mini` default, closing #478.)
+- **LLM task-alias routing — no more shipped default model
+  ([#478](https://github.com/beenuar/AiSOC/issues/478), PR2).** Every live LLM
+  call now asks for a **logical task alias** instead of a hardcoded model. New
+  `services/agents/app/llm/factory.py` (`make_chat_model` / `resolve_model_alias`)
+  resolves a task role to its `aisoc-<role>` alias + the gateway base URL;
+  `model_pins.py` now pins all seven roles (triage, recon, investigation, copilot,
+  summary, report, nl) to aliases with a `deterministic` floor. The ~10 scattered
+  `os.getenv("AISOC_LLM_MODEL"/"OPENAI_MODEL","gpt-4o-mini")` + `ChatOpenAI(...)` /
+  raw-HTTP callsites across the agents (auto-triage, cloud/identity/insider/
+  phishing, recon/forensic/responder/report-writer, copilot, contextual, NL
+  translator) and the API endpoints (translation, hunts, knowledge base, phishing;
+  via new `services/api/app/services/model_aliases.py`) now request aliases; the
+  hardcoded `gpt-4o-mini` default is gone. **Behaviour change:** live LLM now runs
+  through the gateway (`OPENAI_BASE_URL`), or pin a concrete model per role via
+  `AISOC_MODEL_PIN_<ROLE>` (escape hatch; the slim demo does this so keyed demos
+  keep working); with neither, the deterministic offline path is used. Tests:
+  `services/agents/tests/test_llm_factory.py` + tightened `test_litellm_config.py`.
+  Closes #478.
+- **v8 P4 — Compounding Memory (verdicts that measurably improve).** New
+  `services/fusion/app/memory/`: a nightly-distillable institutional memory that
+  makes verdicts more accurate the longer an instance runs. **Distillation**
+  (`distill.py`) compresses analyst overrides + verdict history into two
+  versioned (content-hashed), ledger-referenceable outputs — per-signature
+  priors (FP rate + prior) and a top-N few-shot exemplar bank per category.
+  **Memory verdict stage** (`stage.py`) turns a signature's prior into a
+  **bounded** verdict delta capped at ±0.10 (nudge, never dominate; cap +
+  direction unit-tested). **Improvement telemetry** (`improvement.py`) computes
+  verdict precision over time + the lift from install to latest ("N% more
+  accurate than at install") — measured 0.60→0.90 on a simulated (clearly
+  labelled synthetic) 90-day override history. **Portable signed memory packs**
+  (`pack.py`) — `aisoc memory export` (`pnpm aisoc:memory:export -- --demo`)
+  distills + **Ed25519-signs** a pack so an MSSP can bootstrap a child tenant
+  from a curated baseline; import verifies the signature and rejects a tampered
+  pack + can pin the publisher key (round-trip + tamper-rejection tests). The
+  `aisoc-memory-pack` format is the marketplace memory-pack artifact type. 9
+  tests (auto-run in the fusion CI job); docs
+  `apps/docs/docs/concepts/compounding-memory.md`. (Nightly distill scheduling,
+  the dashboard improvement chart, and live-path consumption of the memory stage
+  are the documented remaining integration steps.)
+- **v8 P3 — Investigation Swarm (parallel hypothesis agents).** New
+  `services/agents/app/swarm/`: for hard cases, fan out 3–5 competing hypothesis
+  agents in parallel, then run a structured debate node that ranks them.
+  **Complexity gate** (`complexity.py`) fires the swarm only above an
+  entity/technique-spread threshold (defaults ≥3/≥3); simple alerts stay on the
+  cheaper single-agent path. **Hypotheses** (`hypotheses.py`) — ransomware
+  staging, insider exfil, lateral movement, C2 beacon, and a benign
+  backup/maintenance FP — each with supporting/contradicting signal +
+  corroborating techniques. **Swarm** (`swarm.py`) runs the agents concurrently
+  (`asyncio.gather`) each under a per-agent token budget, so total spend is
+  bounded. **Debate** (`debate.py`) scores hypotheses on explicit criteria
+  (evidence coverage, contradiction count, institutional-memory prior) and emits
+  a ranked list with margin-based confidence, recorded as a first-class new
+  `debate` ledger step type (the public replay UI colors + renders it). **Eval
+  gate** `tests/test_swarm_vs_single.py` publishes both numbers and asserts the
+  swarm beats single-agent on the investigation-completeness macro by ≥10% under
+  a cost ceiling (measured lift +0.556 on the synthetic set) — added to the
+  agents CI job. Completeness is a **substrate self-consistency** macro (breadth
+  of hypotheses considered), explicitly not a live-LLM accuracy claim; the
+  incident set is labelled synthetic. Docs:
+  `apps/docs/docs/concepts/investigation-swarm.md`. 9 tests.
+- **v8 P2 — Self-Play Purple Team (the SOC that attacks itself).** New
+  `services/purple-team/app/adversary/`: turns the purple-team service from a
+  test runner into a continuous adversary. **Hard scope guard**
+  (`scope_guard.py`) — a SOC that attacks itself must never touch production, so
+  this is enforced in **code** (raises `ScopeViolation` before any step) not as
+  a prompt: every target must carry an allowlisted lab tag AND no forbidden
+  production tag; no force flag. Adversarial tests cover production assets,
+  untagged assets, empty target sets, and a `lab`+`crown-jewel` laundering
+  attempt (all hard-fail). **Planner** (`planner.py`) composes an ordered
+  kill-chain (initial-access → execution → persistence → privesc → exfil),
+  selecting only techniques whose platform exists among the lab targets ("attack
+  what exists"). **Closed loop** (`campaign.py`) emits telemetry per step
+  (pluggable: in-memory for tests/canned, Kafka on the live path), a detection
+  oracle scores detected/missed, and computes detection rate + mean-time-to-
+  verdict. **DAC auto-file** (`dac.py`) files one eval-gated Sigma-scaffold
+  proposal per miss (status `proposed`, low confidence — self-play can only
+  propose, never silently merge). **Scoreboard** (`scoreboard.py` +
+  `apps/docs/static/data/selfplay-scoreboard.json`) with a per-row `synthetic`
+  flag so a canned campaign is never mistaken for a measured live run. Canned
+  5-stage campaign via `pnpm aisoc:selfplay` (offline, deterministic, ~seconds)
+  runs in CI through `test_canned_campaign_runs_end_to_end`. 14 tests total; docs
+  at `apps/docs/docs/concepts/self-play.md`. (Nightly live wiring — Kafka emitter
+  + alert-store oracle + HTTP DAC filer into the scheduler — is the documented
+  remaining integration step.)
+- **v8 P1 — Federated Threat Intel Mesh (the network effect).** New
+  `services/mesh/` (Python/FastAPI, port 8010): opt-in gossip of two
+  privacy-preserving artifact types between self-hosted instances via a
+  lightweight, open-source hub. (1) **IOC sightings** — `SHA-256` of the
+  normalized indicator (never the raw value) + coarse type + severity +
+  first/last-seen; private-set-intersection style, so a peer learns a value only
+  if it already has it. (2) **Verdict signatures** — the institutional-memory
+  signature key (category + connector + technique) + verdict distribution + mean
+  confidence; no entities, tenant data, or free text. **Privacy gates:**
+  k-anonymity (consensus revealed only at `>= k` distinct instances, default 5,
+  `AISOC_MESH_K`), per-instance **Ed25519** signing (verified hub-side, so one
+  actor can't inflate consensus with sock-puppets — tested), tenant/rule-level
+  opt-out, a per-instance outbound-audit receipts log, and a `mesh_preview` that
+  shows the exact outbound payload before sharing is enabled. **Consumption:** a
+  deterministic `consensus.py:mesh_contribution` verdict stage bounded to
+  **±0.10** (the mesh nudges, never dominates; cap unit-tested). Public network
+  stats page at `/mesh` (fetches the hub's `/v1/stats`, graceful when the hub is
+  offline). 11 tests cover the full privacy contract (k-anonymity threshold,
+  sock-puppet resistance, Ed25519 verify, PSI hashing, opt-out, bounded
+  contribution, preview redaction, two-instance exchange, per-instance audit);
+  added to the wave-2 service CI matrix. Threat model:
+  `docs/architecture/mesh.md`; `SECURITY.md` gains a mesh disclosure policy. The
+  measured FP-suppression lift (mesh on vs. off) is explicitly deferred and
+  labelled **simulated-until-measured** on the benchmark/`/mesh` pages — never
+  presented as measured production performance.
+- **v8 G1 — launch kit (ships in-repo with the code).** New `marketing/launch/`:
+  a Show HN draft centered on `npx aisoc triage --demo`, a 90-second demo-video
+  shot list (CLI wow → replay permalink → self-play → mesh stats), Product Hunt
+  assets, six technical blog outlines (one per phase, each ending in a
+  reproducible command), and a **category-level** comparison dossier vs.
+  closed-source AI SOC products — deliberately **without naming any competitor**
+  (per project policy), with every AiSOC-side claim linked to code or a CI gate.
+  Plus a `docs/press/` kit (boilerplate, fast facts, logo kit, naming). All
+  materials are written to two rules — no superlatives, and synthetic-vs-measured
+  always labelled — and are linked from `CONTRIBUTING.md` for community
+  amplification. The launch-kit README points every claim back to the benchmark
+  page + claim-to-gate matrix so nothing ungated gets published.
+- **v8 W4 — GitHub-native distribution (`aisoc-action`).** New
+  `packages/aisoc-action/` (Node20 JS action, **dependency-free** — a
+  hand-rolled Actions runtime + a `fetch`-based GitHub REST client, deliberately
+  no `@actions/*`/octokit so the shipped bundle carries no vulnerable `undici`;
+  the committed bundle is 18 KB): triages the repo's **own**
+  security signals — Dependabot alerts, CodeQL/code-scanning findings, and
+  secret-scanning alerts — with the deterministic AiSOC verdict engine (no LLM,
+  nothing leaves the runner) and posts verdicts + suppression rationale +
+  prioritization as a PR comment (idempotent update-in-place), a job summary, or
+  a weekly `aisoc-digest` posture issue with an A–F grade and week-over-week
+  delta. Runtime-scope Dependabot vulns are prioritized as
+  exploitable-in-your-dependency-graph ("3 of 41 findings are act-now"); sources
+  the token can't read degrade gracefully. Inputs: `mode`, `min-severity`,
+  `fail-on` (gate mode), `sources`. The verdict engine is a byte-for-byte
+  vendored copy of `packages/aisoc-lite/src/verdict/` kept in sync by
+  `scripts/sync_vendored_verdict.py` (CI `--check` gate), bundled into a
+  committed `dist/index.js`. Dogfooded on this repo via
+  `.github/workflows/aisoc-selfscan.yml`. CI (`aisoc-action.yml`): sync-check +
+  typecheck + 6 fixture tests + a dist-freshness gate (committed bundle must
+  match a fresh build). Docs: `apps/docs/docs/integrations/github-action.md`
+  with copy-paste PR + digest workflows. **Fixes a latent workspace defect:** the
+  monorepo root package was also named `aisoc` (colliding with the CLI package),
+  so it was renamed to `aisoc-monorepo` (installer repo-detection sentinels now
+  prefix-match, staying compatible with existing clones).
+- **v8 W2 — standalone free web tools (search-indexed acquisition).** Four
+  login-free, open-source tools under `apps/web/src/app/(tools)/tools/`, each
+  with its own landing page, JSON-LD, OG metadata, and an "open source, part of
+  AiSOC" backlink; **everything runs in the browser — user rules never touch the
+  server** (the deterministic path is pure client-side). (1) **Detection
+  Translator** (`/tools/translate`): paste any rule, get Sigma / SPL / KQL /
+  ES\|QL / YARA-L2 / UDM at once, with per-dialect copy buttons and a stable
+  `?s=` permalink. (2) **NL → Detection** (`/tools/nl2sigma`): plain English →
+  a Sigma scaffold plus the three SIEM dialects, via a deterministic
+  artifact-extraction generator (honest about being a starting point). (3)
+  **ATT&CK Coverage Grader** (`/tools/coverage`): paste Sigma rules / technique
+  IDs → an A–F grade, a per-tactic heatmap, the top-10 highest-prevalence
+  uncovered techniques, and a downloadable shareable grade card (via
+  `@aisoc/report-card`). (4) **Alert Noise Calculator** (`/tools/noise`):
+  project FP suppression + analyst hours/cost saved from the published
+  deterministic-tier suppression rate (methodology linked; labelled as a
+  substrate figure, not a live-LLM claim). SEO plumbing: 30 programmatic
+  format-pair landing pages (`/tools/translate/spl-to-kql`, …) generated from a
+  matrix via `generateStaticParams`, plus sitemap entries for all tool routes.
+  Logic (`apps/web/src/lib/tools/`) is pure and unit-tested (13 tests: translate
+  field-map + permalink round-trip, coverage extraction/grading/top-uncovered,
+  noise projection/clamping, NL→Sigma scaffolding). Production build verified
+  (tools static, pair pages SSG'd).
+- **v8 W3 — shareable investigation artifacts (the screenshot loop).** Public,
+  immutable, redacted investigation-replay permalinks. New
+  `services/api/app/api/v1/endpoints/replay.py`: `POST /ledger/{run_id}/publish/preview`
+  builds a redacted snapshot **and returns the alias map** so the publisher
+  reviews exactly what will be hidden (the pre-publish diff) before confirming;
+  `POST /ledger/{run_id}/publish` (needs `confirm=true`) re-builds server-side
+  and stores an immutable `published_replays` row (migration `045`, with an
+  UPDATE-blocking trigger that only allows the view counter to change); public
+  `GET /r/{slug}` serves the snapshot without auth from a non-RLS session
+  (the data is post-redaction and non-identifying by design). Redaction reuses
+  the reversible `Pseudonymizer` (vendored into the API via
+  `scripts/sync_vendored_redactor.py`): internal IPs / emails / paths / secrets
+  / internal hostnames / usernames become aliases, while public IOCs + ATT&CK
+  techniques are preserved as the shareable value; only the redacted snapshot is
+  persisted, never the alias map (`services/api/app/services/replay_redaction.py`).
+  Web: a public `/r/[slug]` page renders an animated playback (timeline scrubber,
+  evidence cards, growing attack graph, verdict stamp with elapsed time) with a
+  dynamic `next/og` Open Graph image for X/LinkedIn/Slack unfurls;
+  shields.io-compatible badge endpoints at `/api/badge/<kind>`. New shared
+  `packages/@aisoc/report-card` renders triage / coverage-grade / replay share
+  cards (SVG + Markdown) and is now the canonical renderer behind the CLI
+  `--share` flag (bundled into `aisoc` at build time). The seeded LockBit case
+  `INC-RT-001` is published as the canonical demo replay at `/r/demo-lockbit`.
+  Tests: redaction (no raw PII survives, public IOCs preserved), report-card
+  renderers, badge endpoint, and the replay fetch client. `docs/openapi.yaml`
+  regenerated (+284 lines, additions only).
+- **v8 W1 — `npx aisoc` wedge CLI (the 60-second wow).** New `packages/aisoc-lite/` (TypeScript, published to npm as `aisoc`, one runtime dependency): a zero-install front door that triages a batch of alerts to verdicts in under a minute with **no credentials and no LLM key**. `npx aisoc triage --demo` runs a bundled, fully-deterministic 200-alert fixture in ~50 ms and prints a terminal verdict table plus the copy-pasteable headline "AiSOC triaged 200 alerts: 12 TP, 171 FP suppressed (85.5% noise), 17 need review". The verdict engine (`src/verdict/stages.ts`) is a faithful port of the production triage scorer `services/agents/app/confidence/scoring.py` — the weight stack and band thresholds (≥.80 TP, ≥.60 likely-TP, ≥.40 review, else benign; clamp [0.05, 0.95]) are pinned by a parity test so a CLI verdict lands where the full stack would. `--file alerts.jsonl` triages a local export (Splunk / Sentinel / Elastic ECS / CrowdStrike field spellings auto-detected); `--llm` refines only the ambiguous `needs_review` middle using the user's **own** `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` called directly (never proxied); `--share` writes a redacted, aggregate-only report card (Markdown + 1200×630 SVG, no alert content); `translate` is a CLI front for the deterministic detection-rule field-map translator (Sigma/SPL/KQL/ES\|QL/YARA-L2/UDM); `up` boots the full demo stack from a pinned Compose bundle. Telemetry is strictly opt-in (`--telemetry` / `AISOC_TELEMETRY=1`, default off), aggregate counts only, documented in `packages/aisoc-lite/TELEMETRY.md` and asserted content-free by a unit test. 22 vitest tests. New CI: `aisoc-cli.yml` (build + typecheck + tests + a cross-platform cold `triage --demo` e2e asserting the headline and a <60 s bound + a fixture-staleness diff gate) and `publish-cli.yml` (npm publish with build provenance on a `cli-v*` tag; no-ops safely until `NPM_TOKEN` is configured — we never fake a publish). README top fold rewritten around the one-liner (guarded "lands on npm with the v8.0 launch; today it builds from `packages/aisoc-lite/`").
+
 ## [7.6.0] — 2026-07-13
 
 **Fully-Operational AI-SOC release.** Completes the A1–E1 roadmap that wired the three end-to-end paths the reality audit found unwired — the event lake is now populated, the executable detection corpus fires on the live stream, every fused alert is auto-triaged (copilot default), and approved SOAR actions execute against real connector credentials under an autonomy policy — and adds the competitive-parity differentiators (unified Data Explorer, live effective-permissions, fuse-time attack chains, autopilot/copilot scorecard) plus nine new connectors and AI/LLM-usage governance. The claim-to-gate matrix reaches **33 GATED / 7 PARTIAL / 0 NO GATE**: every product claim is backed by a failing test, and the ratchet (`MAX_NO_GATE=0`) forbids regression.
@@ -53,6 +362,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+
+- **Hosted demo API 500s from stale Postgres pool + broken waitlist funnel (QA 2026-07-19).**
+  Live `/health` showed `demo_bootstrap.last_error_type=create_seed:ConnectionDoesNotExistError`
+  after 22 attempts — Fly Postgres autostop closed pooled sockets and every
+  subsequent checkout 500ed (`/api/v1/auth/login`, `/metrics/*`, `/alerts/*`,
+  `/cases` → 503). Fixes: (1) `pool_pre_ping=True` + `pool_recycle=300` on the
+  SQLAlchemy engine; (2) demo self-heal bootstrap now disposes the pool after
+  every disconnect, splits create_all / SQL migrations / seed into separate
+  steps, and surfaces stage-tagged errors on `/health`; (3) demo-mode middleware
+  allowlists `POST /api/v1/waitlist/signup` so the managed-instance conversion
+  funnel on tryaisoc.com is no longer 403ed for every visitor.
+- **Demo bootstrap `create_all` AttributeError (QA follow-up).** After Fly Postgres
+  was restarted, `/health` still reported `create_all:AttributeError` because
+  `AsyncConnection.execution_options(...)` is a coroutine and was chained into
+  `.run_sync` without `await`. Await the options object first; pin in
+  `test_database_pool.py`. Unblocks `published_replays` create + `/r/demo-lockbit`.
+- **Canonical `/r/demo-lockbit` missing after re-seed short-circuit.** When
+  INC-RT-* cases already exist, `_seed_in_flight_investigation` returned early
+  and never created `published_replays`. Now that path still ensures the
+  canonical replay; bootstrap only marks `done` after verifying the slug.
+
+
+- **Out-of-the-box 500 from schema drift on migration-bootstrapped installs (#492).**
+  `docker-compose.yml` mounts `services/api/migrations` into
+  `/docker-entrypoint-initdb.d`, so a fresh compose stack builds Postgres from
+  the `001_init.sql` lineage — which created `detection_rules` in its
+  pre-refactor shape (`rule_type`/`rule_content`/`hit_count`/`last_hit_at`) and
+  `cases` without `resolution`/`lessons_learned`. The current `DetectionRule`
+  and `Case` models query the refactored columns, so every default install
+  served `UndefinedColumnError` 500s (e.g. `GET /api/v1/detection/tuning`) and
+  `seed_demo` failed on `cases.resolution`. New
+  `services/api/migrations/046_detection_rules_cases_schema_drift_fix.sql`
+  reconciles both tables with the models — additive, fully idempotent
+  (`ADD COLUMN IF NOT EXISTS`), and dual-lineage safe (the `create_all` path is
+  a no-op; the legacy path backfills `rule_body`/`rule_language` from the old
+  columns and drops the stale `rule_content NOT NULL` under an
+  `information_schema` guard so ORM inserts succeed). New
+  `services/api/tests/test_schema_drift_046.py` pins the fix and adds a forward
+  guard asserting the migration lineage covers every column both models declare.
 - **Phase 3.1 gates caught two latent bugs before merge** (exactly what the real-container tier is for — both would have shipped invisibly under the previous mock-only CI). (1) **`scripts/restore.sh` never restored anything.** `resolve_timestamp()` ended in a `[[ -z "$TIMESTAMP" ]] && { … }` guard that evaluates *false* once a timestamp is resolved; as the function's last command that non-zero status propagated out and, under `set -e`, aborted the script before the restore began — for **both** `--latest` and `--timestamp`. An untested backup script had been broken the whole time. Converted the guard to an explicit `if` + `return 0`; the backup → destroy → restore gate now restores 500/500 rows with a measured RTO. (2) **`services/fusion` `AlertSink` silently failed to persist every alert.** The dedup fingerprint (`$10`) was used untyped in both the `INSERT … SELECT` target (the `dedup_hash VARCHAR(64)` column) and `WHERE dedup_hash = $10` (varchar comparisons resolve through `text` operators), so asyncpg's prepare raised `inconsistent types deduced for parameter $10: text versus character varying` and the insert threw — the fused alert streamed over Kafka/WebSocket but never reached the alert store, so the spine's `GET /api/v1/alerts` assertion timed out. Pinned both uses to `::text`; the real-container spine gate now observes the alert row end to end.
 
 ### Security

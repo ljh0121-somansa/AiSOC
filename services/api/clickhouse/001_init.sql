@@ -32,10 +32,25 @@ CREATE TABLE IF NOT EXISTS aisoc.raw_events (
     ocsf_json       String CODEC(ZSTD(3)),
     mitre_techniques Array(String),
     mitre_tactics   Array(String),
-    iocs            Array(String)
-) ENGINE = MergeTree()
+    iocs            Array(String),
+    -- Data-skipping (bloom-filter) indexes so hunts over high-cardinality
+    -- needles (file hash, user, host, IOCs) skip granules instead of scanning
+    -- the whole ZSTD blob. GRANULARITY 4 = one index block per 4 * 8192 rows.
+    INDEX idx_hash hash_sha256 TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_user user_name TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_src_host src_hostname TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_iocs iocs TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_techniques mitre_techniques TYPE bloom_filter(0.01) GRANULARITY 4
+)
+-- ReplacingMergeTree collapses rows sharing the ORDER BY key, keeping the row
+-- with the greatest ingest_time. Ingest now stamps a replay-stable event_id
+-- (derived from tenant + connector + vendor id), so overlapping connector
+-- polls / backfills / Kafka replays of the same event dedup on merge instead of
+-- accumulating duplicate lake rows. Queries needing exact-once before a merge
+-- can still use `FINAL` or `LIMIT 1 BY event_id`.
+ENGINE = ReplacingMergeTree(ingest_time)
 PARTITION BY (toYYYYMM(event_time), tenant_id)
-ORDER BY (tenant_id, event_time, class_uid)
+ORDER BY (tenant_id, event_time, class_uid, event_id)
 TTL toDateTime(event_time) + INTERVAL 90 DAY
 SETTINGS index_granularity = 8192;
 

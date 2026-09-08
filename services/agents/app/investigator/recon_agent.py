@@ -13,14 +13,13 @@ from __future__ import annotations
 import asyncio
 import time
 from typing import Any
-import os
 
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
 from app.core.cost_telemetry import record_llm_call
 from app.llm import safe_ainvoke
+from app.llm.factory import make_chat_model, resolve_model_alias
 from app.prompt_serialization import summarize_structure_for_llm
 from app.investigator.utils import safe_parse_agent_json
 
@@ -58,11 +57,13 @@ async def _llm_recon(state: InvestigatorState) -> dict[str, Any]:
     Records the LLM prompt and response into the audit ledger so the
     reasoning trace is replayable.
     """
-
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "2048"))                                                    
-    llm = ChatOpenAI(model=model, temperature=0, max_tokens=max_tokens, response_format={"type":           
- "json_object"})
+    model = resolve_model_alias("recon")
+    llm = make_chat_model(
+        "recon",
+        temperature=0,
+        max_tokens=2048,
+        response_format={"type": "json_object"},
+    )
 
     # Defence-in-depth: every field surfaced here can be attacker-influenced
     # (alert_summary often echoes log lines; raw_alert is verbatim event data).

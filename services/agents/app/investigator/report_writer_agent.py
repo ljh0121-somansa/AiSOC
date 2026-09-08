@@ -9,17 +9,16 @@ Responsibilities:
 
 from __future__ import annotations
 
-import os
 import time
 from datetime import datetime
 from typing import Any
 
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
 from app.core.cost_telemetry import record_llm_call
 from app.llm import safe_ainvoke
+from app.llm.factory import make_chat_model, resolve_model_alias
 from app.prompt_serialization import summarize_structure_for_llm
 
 from .bundle_prompt import format_bundle_prompt_append
@@ -167,9 +166,8 @@ async def run_report_writer(state_dict: dict[str, Any]) -> dict[str, Any]:
 
     logger.info("report_writer.start", case_id=state.case_id)
 
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "4096"))                                                    
-    llm = ChatOpenAI(model=model, temperature=0, max_tokens=max_tokens)
+    model = resolve_model_alias("report")
+    llm = make_chat_model("report", temperature=0)
 
     context = _build_context(state)
     bundle_append = format_bundle_prompt_append(state.context_bundle)

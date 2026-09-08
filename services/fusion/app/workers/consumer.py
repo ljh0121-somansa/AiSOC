@@ -13,7 +13,7 @@ from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
 from app.core.config import settings
 from app.models.alert import FusionDecision, RawAlert
-from app.services.alert_sink import AlertSink
+from app.services.alert_sink import AlertSink, PersistOutcome, PersistResult
 from app.services.detection_engine import DetectionEngine
 from app.services.dlq import DeadLetter, DeadLetterQueue, LoggingDLQ, safe_record
 from app.services.event_schema import validate_event
@@ -21,6 +21,7 @@ from app.services.fusion_engine import FusionEngine
 from app.services.lake_writer import LakeWriter
 from app.services.promoter import promote_normalized_event
 from app.services.ueba_signal import UebaSignalCache
+from app.services.windowed_detection import WindowedDetectionEngine
 
 logger = structlog.get_logger()
 
@@ -32,6 +33,8 @@ _METRICS = {
     "promoted": 0,
     "not_promoted": 0,
     "persisted": 0,
+    "persist_unavailable": 0,
+    "persist_failed": 0,
     "laked": 0,
     "detected": 0,
     "dead_lettered": 0,
@@ -49,12 +52,14 @@ class FusionWorker:
         dlq: DeadLetterQueue | None = None,
         lake: LakeWriter | None = None,
         detector: DetectionEngine | None = None,
+        windowed_detector: WindowedDetectionEngine | None = None,
         ueba_cache: UebaSignalCache | None = None,
     ) -> None:
         self._engine = engine
         self._sink = sink
         self._lake = lake
         self._detector = detector
+        self._windowed = windowed_detector
         self._ueba_cache = ueba_cache
         # A poison message must never vanish silently; default to a structured
         # logging DLQ so persistence-free deployments still get the signal.
@@ -72,7 +77,7 @@ class FusionWorker:
         topics = [settings.kafka_topic_alerts_raw]
         # Subscribe to raw_events when EITHER promotion or lake archival needs
         # it — the lake must fill even if promotion is turned off.
-        if settings.event_promotion_enabled or self._lake is not None or self._detector is not None:
+        if settings.event_promotion_enabled or self._lake is not None or self._detector is not None or self._windowed is not None:
             topics.append(settings.kafka_topic_raw_events)
         # Phase A4 — also consume the UEBA behavioral-anomaly stream so the
         # per-entity signal cache stays warm for fuse-time boosting.
@@ -83,7 +88,10 @@ class FusionWorker:
             bootstrap_servers=settings.kafka_bootstrap_servers,
             group_id=settings.kafka_consumer_group,
             auto_offset_reset="latest",
-            enable_auto_commit=True,
+            # At-least-once: commit offsets only AFTER a message is fully
+            # processed (see _consume_loop), not on a background timer that could
+            # commit an in-flight message before processing finishes.
+            enable_auto_commit=False,
             value_deserializer=lambda m: json.loads(m.decode("utf-8")),
         )
         self._producer = AIOKafkaProducer(
@@ -126,7 +134,7 @@ class FusionWorker:
         if self._flush_task is not None:
             self._flush_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await self._flush_task
+                _ = await self._flush_task  # await the cancellation to settle
             self._flush_task = None
         if self._consumer:
             await self._consumer.stop()
@@ -147,6 +155,15 @@ class FusionWorker:
             except Exception as exc:
                 _METRICS["errors"] += 1
                 logger.error("Failed to process message", error=str(exc), exc_info=True)
+            else:
+                # At-least-once: commit only after the message is handled
+                # (validated + laked + promoted, or dead-lettered). A crash
+                # before this line re-delivers the in-flight message on restart
+                # instead of losing it. Commit failure => reprocess on restart.
+                try:
+                    await self._consumer.commit()
+                except Exception as commit_exc:  # noqa: BLE001
+                    logger.warning("fusion.commit_failed", error=str(commit_exc))
             # Flush any stale lake batch so archival isn't stranded during a
             # low-traffic window (batch fills by size OR age).
             if self._lake is not None:
@@ -222,6 +239,15 @@ class FusionWorker:
                         _METRICS["detected"] += 1
                         await self._fuse_and_persist(det_alert, source_event_id=validation.source_event_id)
 
+            # Wave 2 — stateful/windowed detections (brute force, spray, scans)
+            # count this event into its sliding window and fire once on threshold.
+            if self._windowed is not None:
+                for hit in await self._windowed.evaluate(payload):
+                    win_alert = self._windowed.build_alert(payload, hit)
+                    if win_alert is not None:
+                        _METRICS["detected"] += 1
+                        await self._fuse_and_persist(win_alert, source_event_id=validation.source_event_id)
+
             # Ingest-normalized OCSF event — run the deterministic promotion
             # policy (see app/services/promoter.py). Non-promoted events are
             # dropped here by design; the detect stage (above) owns rule eval.
@@ -249,7 +275,19 @@ class FusionWorker:
         await self._fuse_and_persist(alert, source_event_id=validation.source_event_id)
 
     async def _fuse_and_persist(self, alert: RawAlert, *, source_event_id: str | None = None) -> None:
-        """Run one RawAlert through fusion, publish it, and persist it."""
+        """Run one RawAlert through fusion, persist it, then publish it.
+
+        Issue #568: the canonical, replay-stable alert id and source-event
+        provenance are stamped on the RawAlert *before* fusion, so ``FusedAlert.id``
+        (derived from ``alert.id``) matches the persisted ``alerts.id`` row.
+        Persist runs *before* publish so the published envelope carries the
+        durable row id + a truthful persistence outcome downstream can trust.
+        """
+        # Stamp source-event provenance + canonical id (issue #568).
+        if source_event_id and source_event_id not in alert.source_event_ids:
+            alert.source_event_ids.append(source_event_id)
+        alert.id = alert.deterministic_id()
+
         fused = await self._engine.process(alert)
         _METRICS["processed"] += 1
 
@@ -260,16 +298,27 @@ class FusionWorker:
         else:
             _METRICS["new_incidents"] += 1
 
-        # Publish fused alert (even duplicates, so downstream can track)
+        # Persist FIRST (Phase 3.1 sink). Fail-soft + idempotent — see
+        # app/services/alert_sink.py. Duplicates are handled inside.
+        result = PersistResult(PersistOutcome.UNAVAILABLE, str(fused.id))
+        if self._sink is not None:
+            result = await self._sink.persist(fused)
+            if result.outcome is PersistOutcome.INSERTED:
+                _METRICS["persisted"] += 1
+            elif result.outcome is PersistOutcome.UNAVAILABLE:
+                _METRICS["persist_unavailable"] += 1
+            elif result.outcome is PersistOutcome.FAILED:
+                _METRICS["persist_failed"] += 1
+
+        # Publish fused alert (even duplicates, so downstream can track),
+        # carrying the durable row id + persistence outcome (issue #568).
+        envelope = fused.model_dump(mode="json")
+        envelope["alert_row_id"] = result.alert_id
+        envelope["persist_outcome"] = result.outcome.value
         await self._producer.send(
             settings.kafka_topic_alerts_fused,
-            value=fused.model_dump(mode="json"),
+            value=envelope,
         )
-
-        # Persist to the alert store (Phase 3.1). Fail-soft + idempotent —
-        # see app/services/alert_sink.py. Duplicates are skipped inside.
-        if self._sink is not None and await self._sink.persist(fused) is not None:
-            _METRICS["persisted"] += 1
 
     @staticmethod
     def get_metrics() -> dict:
