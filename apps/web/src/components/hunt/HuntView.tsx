@@ -44,9 +44,14 @@ import { Skeleton } from '@/components/ui/Skeleton';
 import { ErrorState } from '@/components/ui/ErrorState';
 import { EmptyState } from '@/components/ui/EmptyState';
 
+import { initMonacoEnv } from '@/lib/monaco-env';
+
 // Monaco is heavy and SSR-incompatible; load it client-side only.
 const MonacoEditor = dynamic(
-  () => import('@monaco-editor/react').then((mod) => mod.default),
+  () => {
+    initMonacoEnv();
+    return import('@monaco-editor/react').then((mod) => mod.default);
+  },
   { ssr: false, loading: () => <Skeleton className="h-64 w-full rounded-lg" /> },
 );
 

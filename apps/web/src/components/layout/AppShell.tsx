@@ -1,5 +1,6 @@
 'use client';
 
+import '@/lib/monaco-env';
 import { SWRConfig } from 'swr';
 import { Sidebar } from './Sidebar';
 import { TopBar } from './TopBar';

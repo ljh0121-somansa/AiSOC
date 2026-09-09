@@ -20,11 +20,19 @@ import { Skeleton } from '@/components/ui/Skeleton';
 import { ErrorState } from '@/components/ui/ErrorState';
 import { ContextualActions } from '@/components/copilot/ContextualActions';
 import { SimpleRuleBuilder } from '@/components/detections/SimpleRuleBuilder';
+import { initMonacoEnv } from '@/lib/monaco-env';
 
-const MonacoEditor = dynamic(() => import('@monaco-editor/react'), {
-  ssr: false,
-  loading: () => <Skeleton className="h-full w-full" />,
-});
+
+const MonacoEditor = dynamic(
+  () => {
+    initMonacoEnv();
+    return import('@monaco-editor/react');
+  },
+  {
+    ssr: false,
+    loading: () => <Skeleton className="h-full w-full" />,
+  },
+);
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 

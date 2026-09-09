@@ -77,6 +77,11 @@ ENV NEXT_PUBLIC_DEMO_AUTOLOGIN_PASSWORD=${NEXT_PUBLIC_DEMO_AUTOLOGIN_PASSWORD}
 # so tsup/tsc bin shims resolve correctly inside each workspace package.
 RUN pnpm install --no-frozen-lockfile
 
+# Vendor the Monaco 0.55.1 editor bundle for offline/air-gap use so the
+# detail/edit page loads Monaco with zero external egress. Bundled from
+# https://registry.npmjs.org/monaco-editor/-/monaco-editor-0.55.1.tgz.
+COPY apps/web/monaco/0.55.1/vs/ ./apps/web/public/monaco-editor/0.55.1/vs/
+
 # Build workspace packages then the Next.js app. @aisoc/report-card must be
 # built here too — the /tools/coverage page imports it, and without its dist the
 # route silently drops from the build (404 in prod).
