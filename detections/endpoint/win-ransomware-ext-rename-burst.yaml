@@ -1,3 +1,4 @@
+# Cross-ref: native-format rule body mirrored verbatim in services/api/migrations/050_detection_rules_builtin_platform.sql (rule_body). Keep in sync.
 id: det-endpoint-123
 name: Burst Of File Extension Renames To Common Ransom Markers
 description: AiSOC v1 curated detection. Triggers on the endpoint signal described by 'Burst Of File Extension

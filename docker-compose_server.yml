@@ -230,6 +230,7 @@ services:
       - "127.0.0.1:${HOST_API_PORT:-8000}:8000"
     volumes:
       - ./services/api/app:/app/app
+      - ./detections:/app/detections:ro
     environment:
       DATABASE_URL: postgresql+asyncpg://aisoc:${POSTGRES_PASSWORD:-aisoc_dev_secret}@postgres:5432/aisoc
       REDIS_URL: redis://:redis_dev_secret@redis:6379/0

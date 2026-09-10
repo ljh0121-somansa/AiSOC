@@ -329,6 +329,30 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         except Exception as exc:
             logger.warning("SQL migration run failed", error=str(exc))
 
+    # Auto-sync the native detection corpus (detections/<category>/*.yaml) into
+    # the detection_rules table so curated rules surface in the /detection
+    # console without a manual seed. Soft-fail (never blocks readiness) and
+    # idempotent — upserts keyed on a deterministic uuid5 of each native id.
+    if settings.AISOC_AUTO_SYNC_DETECTIONS:
+        try:
+            from app.db.database import AsyncSessionLocal  # noqa: PLC0415
+            from app.services.detections.native_ruleset import (  # noqa: PLC0415
+                seed_native_ruleset,
+            )
+
+            async with AsyncSessionLocal() as session:
+                report = await seed_native_ruleset(session)
+                await session.commit()
+            logger.info(
+                "Native detection corpus synced",
+                inserted=report.rows_inserted,
+                updated=report.rows_updated,
+                skipped=report.rows_skipped,
+                errors=len(report.errors),
+            )
+        except Exception as exc:  # noqa: BLE001 -- soft-fail, never block readiness
+            logger.warning("Native detection corpus sync failed", error=str(exc))
+
     # Initialize Neo4j graph layer
     try:
         await init_neo4j()

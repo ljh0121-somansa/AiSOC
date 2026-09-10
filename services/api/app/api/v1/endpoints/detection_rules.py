@@ -213,20 +213,30 @@ async def update_rule(
     current_user: Annotated[AuthUser, Depends(require_permission("rules:write"))],
     db: DBSession,
 ) -> DetectionRuleResponse:
-    """Update a detection rule (only tenant-owned rules)."""
+    """Update a detection rule."""
     result = await db.execute(
-        select(DetectionRule).where(
-            DetectionRule.id == rule_id,
-            DetectionRule.tenant_id == current_user.tenant_id,
-        )
+        select(DetectionRule).where(DetectionRule.id == rule_id)
     )
     rule = result.scalar_one_or_none()
     if rule is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Rule not found or cannot be modified",
+            detail="Rule not found",
         )
 
+    is_platform_admin = current_user.role == "platform_admin"
+
+    if rule.tenant_id is None:
+        if not is_platform_admin:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Built-in platform detection rules can only be modified by a platform administrator",
+            )
+    elif rule.tenant_id != current_user.tenant_id and not is_platform_admin:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Rule not found or cannot be modified",
+        )
     updates: dict = {}
     for field in ["name", "description", "rule_body", "status", "severity", "confidence", "tags"]:
         val = getattr(request, field, None)
@@ -235,11 +245,12 @@ async def update_rule(
 
     if updates:
         updates["updated_at"] = datetime.now(UTC)
-        updates["version"] = rule.version + 1
+        updates["version"] = (rule.version or 1) + 1
+        for k, v in updates.items():
+            setattr(rule, k, v)
         await db.execute(update(DetectionRule).where(DetectionRule.id == rule_id).values(**updates))
         await db.commit()
         await db.refresh(rule)
-
     return DetectionRuleResponse.model_validate(rule)
 
 
@@ -249,15 +260,26 @@ async def delete_rule(
     current_user: Annotated[AuthUser, Depends(require_permission("rules:write"))],
     db: DBSession,
 ) -> None:
-    """Delete a tenant-owned detection rule."""
+    """Delete a detection rule."""
     result = await db.execute(
-        select(DetectionRule).where(
-            DetectionRule.id == rule_id,
-            DetectionRule.tenant_id == current_user.tenant_id,
-        )
+        select(DetectionRule).where(DetectionRule.id == rule_id)
     )
     rule = result.scalar_one_or_none()
     if rule is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Rule not found",
+        )
+
+    is_platform_admin = current_user.role == "platform_admin"
+
+    if rule.tenant_id is None:
+        if not is_platform_admin:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Built-in platform detection rules can only be modified by a platform administrator",
+            )
+    elif rule.tenant_id != current_user.tenant_id and not is_platform_admin:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Rule not found or cannot be deleted",

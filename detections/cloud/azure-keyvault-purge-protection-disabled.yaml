@@ -1,5 +1,5 @@
 id: det-cloud-126
-name: Azure Key Vault Purge Protection Disabled
+name: Azure Key Vault Purge Protection Disabled (KeyVault Write Event)
 description: AiSOC v1 curated detection. Triggers on the cloud signal described by 'Azure Key Vault Purge
   Protection Disabled'. Watch the 1 documented false-positive case before tuning.
 version: 1.0.0

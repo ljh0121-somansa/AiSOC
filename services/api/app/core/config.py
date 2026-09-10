@@ -220,6 +220,13 @@ class Settings(BaseSettings):
     # loop; a hung provider should not stall the cadence.
     OAUTH_REFRESH_HTTP_TIMEOUT_SECONDS: float = 15.0
 
+    # Auto-sync the native detection corpus (detections/<category>/*.yaml) into
+    # the detection_rules table on boot, so curated rules surface in the
+    # /detection console without a manual seed run. Soft-fail: a crash never
+    # blocks readiness, and it's idempotent (upserts). Operators can turn it off
+    # (e.g. isolated CI) with AISOC_AUTO_SYNC_DETECTIONS=false.
+    AISOC_AUTO_SYNC_DETECTIONS: bool = True
+
     # ------------------------------------------------------------------
     # WS-G2: Weekly Executive Digest auto-generation worker.
     # Author: Beenu <beenu@cyble.com>

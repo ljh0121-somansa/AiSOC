@@ -43,6 +43,13 @@ class DetectionRule(Base):
     is_builtin: Mapped[bool] = mapped_column(Boolean, default=False)  # Platform-provided vs custom
     version: Mapped[int] = mapped_column(Integer, default=1)
 
+    # Provenance for native repo-built rules (from detections/<category>/*.yaml).
+    # 'native' for synced-in corpus rows; 'custom' for console-authored ones.
+    # Mirrors the DEFAULT in migrations/051 so create_all and the SQL agree.
+    rule_type: Mapped[str] = mapped_column(String(20), nullable=False, default="custom")
+    # Relative path under detections/ for native rows; NULL for custom rules.
+    file_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+
     # Provenance for imported rules (Sigma bulk import, etc.).
     # Empty dict for native rules; populated for anything that came in
     # through ``app.services.detections.sigma_import``. See migration
