@@ -129,7 +129,7 @@ function ConfidenceFactorBar({ factor }: { factor: ConfidenceFactor }) {
       <div className="flex items-baseline justify-between gap-3 mb-1">
         <span className="text-sm text-gray-200">{factor.label}</span>
         <span className="text-xs font-mono text-gray-500 shrink-0">
-          +{factor.contribution.toFixed(2)} / {factor.weight.toFixed(2)}
+          {(factor.contribution >= 0 ? "+" : "") + factor.contribution.toFixed(2)} / {factor.weight.toFixed(2)}
         </span>
       </div>
       <div className="h-1.5 bg-gray-800 rounded overflow-hidden">
