@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import useSWR from 'swr';
 import Link from 'next/link';
 import toast from 'react-hot-toast';
@@ -18,10 +18,23 @@ import {
 } from '@/lib/api';
 import { format } from 'date-fns';
 import { clsx } from 'clsx';
+import {
+  HelpCircle,
+  Info,
+  TrendingDown,
+  TrendingUp,
+  Minus,
+  X,
+} from 'lucide-react';
+import {
+  explainFactor,
+  OVERALL_CONFIDENCE_HELP,
+  type FactorExplanation,
+} from '@/components/alerts/confidenceHelp';
 import { ContextualActions } from '@/components/copilot/ContextualActions';
 import { ExplainDrawer } from '@/components/alerts/ExplainDrawer';
 import { CreateCaseModal } from '@/components/alerts/CreateCaseModal';
-
+import { TACTIC_BY_ID, tacticsFor } from '@/lib/mitreTactics';
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const SEVERITY_CONFIG = {
@@ -121,32 +134,284 @@ function ConfidenceChip({ label, score }: { label: ConfidenceLabel; score?: numb
   );
 }
 
-function ConfidenceFactorBar({ factor }: { factor: ConfidenceFactor }) {
-  const pct = Math.max(0, Math.min(1, factor.contribution / Math.max(factor.weight, 0.001)));
-  const widthPct = Math.round(pct * 100);
+function useTooltipState() {
+  const [isHovered, setIsHovered] = useState(false);
+  const [isPinned, setIsPinned] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!isPinned) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setIsPinned(false);
+        setIsHovered(false);
+      }
+    };
+    const handleClickOutside = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        setIsPinned(false);
+        setIsHovered(false);
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [isPinned]);
+
+  return {
+    isOpen: isHovered || isPinned,
+    isPinned,
+    containerRef: ref,
+    open: () => setIsHovered(true),
+    close: () => {
+      setIsHovered(false);
+      setIsPinned(false);
+    },
+    hoverStart: () => setIsHovered(true),
+    hoverEnd: () => setIsHovered(false),
+    togglePin: () => setIsPinned((p) => !p),
+  };
+}
+
+function ConfidenceFactorTooltip({
+  factor,
+  explanation,
+  onClose,
+}: {
+  factor: ConfidenceFactor;
+  explanation: FactorExplanation;
+  onClose?: () => void;
+}) {
+  const { meta, isPenalty, impact, reason, observedText, contributionText, weightText } = explanation;
+
   return (
-    <div>
-      <div className="flex items-baseline justify-between gap-3 mb-1">
-        <span className="text-sm text-gray-200">{factor.label}</span>
-        <span className="text-xs font-mono text-gray-500 shrink-0">
-          {(factor.contribution >= 0 ? "+" : "") + factor.contribution.toFixed(2)} / {factor.weight.toFixed(2)}
-        </span>
+    <div
+      role="tooltip"
+      onMouseEnter={(e) => e.stopPropagation()}
+      className="absolute right-0 bottom-full mb-2 z-50 w-80 sm:w-96 max-h-[85vh] overflow-y-auto max-w-[calc(100vw-2rem)] rounded-lg border border-gray-700 bg-gray-900/98 p-3.5 text-xs text-gray-200 shadow-2xl backdrop-blur-md pointer-events-auto"
+    >
+      <div className="flex items-start justify-between gap-2 pb-2 border-b border-gray-800">
+        <div>
+          <div className="font-semibold text-gray-100 flex items-center gap-1.5">
+            <span>{meta.label}</span>
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 font-mono">
+              Weight {(meta.weight * 100).toFixed(0)}%
+            </span>
+          </div>
+          <p className="text-[11px] text-gray-400 mt-0.5 leading-snug">{meta.description}</p>
+        </div>
+        {onClose && (
+          <button
+            type="button"
+            onClick={onClose}
+            className="p-1 rounded text-gray-400 hover:text-gray-200 hover:bg-gray-800 transition-colors"
+            aria-label="Close tooltip"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        )}
       </div>
-      <div className="h-1.5 bg-gray-800 rounded overflow-hidden">
+
+      <div className="py-2.5 space-y-2">
+        {/* Evaluated Condition & Reason */}
         <div
-          className="h-full bg-emerald-500/70"
-          style={{ width: `${widthPct}%` }}
-          aria-hidden="true"
-        />
-      </div>
-      <div className="text-[10px] text-gray-600 uppercase tracking-wider mt-1 font-mono">
-        {factor.factor}
+          className={clsx(
+            'p-2.5 rounded-md border text-[11px] leading-relaxed',
+            isPenalty
+              ? 'bg-rose-950/40 border-rose-800/60 text-rose-200'
+              : impact === 'boost'
+              ? 'bg-emerald-950/40 border-emerald-800/60 text-emerald-200'
+              : 'bg-gray-800/60 border-gray-700 text-gray-300'
+          )}
+        >
+          <div className="flex items-center gap-1.5 font-medium mb-1">
+            {isPenalty ? (
+              <>
+                <TrendingDown className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                <span className="text-rose-400 font-semibold">Negative Contribution ({contributionText})</span>
+              </>
+            ) : impact === 'boost' ? (
+              <>
+                <TrendingUp className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                <span className="text-emerald-400 font-semibold">Positive Boost ({contributionText})</span>
+              </>
+            ) : (
+              <>
+                <Minus className="w-3.5 h-3.5 text-gray-400 shrink-0" />
+                <span className="text-gray-300 font-semibold">Neutral Baseline (0.00)</span>
+              </>
+            )}
+          </div>
+          <p>{reason}</p>
+        </div>
+
+        {/* Observed Value Callout */}
+        <div className="flex items-center justify-between py-1 px-2 rounded bg-gray-800/50 border border-gray-800 text-[11px]">
+          <span className="text-gray-400">Observed condition:</span>
+          <span className="font-mono text-gray-200 font-medium">{observedText}</span>
+        </div>
+
+        {/* Scoring Rules Matrix */}
+        <div className="pt-1">
+          <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1.5">
+            Scoring Condition Matrix
+          </div>
+          <div className="rounded border border-gray-800 divide-y divide-gray-800/80 overflow-hidden text-[10px]">
+            {meta.rules.map((rule, idx) => (
+              <div
+                key={idx}
+                className={clsx(
+                  'px-2 py-1.5 flex items-center justify-between gap-2',
+                  rule.effect === 'penalty'
+                    ? 'hover:bg-rose-950/20'
+                    : rule.effect === 'boost'
+                    ? 'hover:bg-emerald-950/20'
+                    : 'hover:bg-gray-800/40'
+                )}
+              >
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <span
+                    className={clsx(
+                      'w-1.5 h-1.5 rounded-full shrink-0',
+                      rule.effect === 'penalty'
+                        ? 'bg-rose-400'
+                        : rule.effect === 'boost'
+                        ? 'bg-emerald-400'
+                        : 'bg-gray-500'
+                    )}
+                  />
+                  <span className="text-gray-300 truncate">{rule.condition}</span>
+                </div>
+                <div className="flex items-center gap-2 shrink-0 font-mono">
+                  <span
+                    className={clsx(
+                      'font-medium',
+                      rule.effect === 'penalty'
+                        ? 'text-rose-400'
+                        : rule.effect === 'boost'
+                        ? 'text-emerald-400'
+                        : 'text-gray-400'
+                    )}
+                  >
+                    {rule.contribution}
+                  </span>
+                  {rule.note && <span className="text-[9px] text-gray-500 font-sans hidden sm:inline">({rule.note})</span>}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
       </div>
     </div>
   );
 }
 
-function ConfidenceExplainability({
+export function ConfidenceFactorBar({ factor }: { factor: ConfidenceFactor }) {
+  const {
+    isOpen: showHelp,
+    containerRef,
+    hoverStart,
+    hoverEnd,
+    togglePin,
+    close,
+  } = useTooltipState();
+  const explanation = explainFactor(factor);
+  const isPenalty = explanation.isPenalty;
+  const isBoost = explanation.impact === 'boost';
+
+  const clampedRatio = Math.min(1, Math.abs(factor.contribution) / Math.max(factor.weight, 0.001));
+  const widthPct = Math.round(clampedRatio * 100);
+
+  return (
+    <div ref={containerRef} className="relative">
+      <div className="flex items-center justify-between gap-3 mb-1">
+        <div className="flex items-center gap-1.5 min-w-0">
+          <span className="text-sm text-gray-200 truncate">{factor.label}</span>
+          <button
+            type="button"
+            aria-label={`Show scoring rules and conditions for ${factor.label}`}
+            aria-expanded={showHelp}
+            onClick={togglePin}
+            onMouseEnter={hoverStart}
+            onMouseLeave={hoverEnd}
+            onFocus={hoverStart}
+            onBlur={hoverEnd}
+            className="p-0.5 rounded text-gray-400 hover:text-gray-200 hover:bg-gray-800 transition-colors focus:outline-none focus:ring-1 focus:ring-blue-500 shrink-0"
+            title={`${explanation.meta.label}: ${explanation.observedText} (${explanation.contributionText} contribution)`}
+          >
+            <Info className="w-3.5 h-3.5" />
+          </button>
+        </div>
+
+        <div className="flex items-center gap-1.5 shrink-0 font-mono text-xs">
+          {isPenalty ? (
+            <span className="inline-flex items-center gap-1 text-rose-400 font-medium">
+              <TrendingDown className="w-3 h-3" />
+              {explanation.contributionText}
+            </span>
+          ) : isBoost ? (
+            <span className="inline-flex items-center gap-1 text-emerald-400 font-medium">
+              <TrendingUp className="w-3 h-3" />
+              {explanation.contributionText}
+            </span>
+          ) : (
+            <span className="text-gray-400">
+              {explanation.contributionText}
+            </span>
+          )}
+          <span className="text-gray-600">/</span>
+          <span className="text-gray-400">{explanation.weightText}</span>
+        </div>
+      </div>
+
+      <div className="h-1.5 bg-gray-800 rounded overflow-hidden flex">
+        {isPenalty ? (
+          <div
+            className="h-full bg-rose-500/80 transition-all duration-300"
+            style={{ width: `${widthPct}%` }}
+            aria-hidden="true"
+          />
+        ) : (
+          <div
+            className={clsx(
+              'h-full transition-all duration-300',
+              isBoost ? 'bg-emerald-500/80' : 'bg-gray-600'
+            )}
+            style={{ width: `${widthPct}%` }}
+            aria-hidden="true"
+          />
+        )}
+      </div>
+
+      <div className="flex items-center justify-between text-[10px] mt-1 font-mono">
+        <span className="text-gray-500 truncate">
+          Observed: <span className="text-gray-300">{explanation.observedText}</span>
+        </span>
+        <span
+          className={clsx(
+            'uppercase tracking-wider shrink-0 font-semibold',
+            isPenalty ? 'text-rose-400' : isBoost ? 'text-emerald-400' : 'text-gray-500'
+          )}
+        >
+          {isPenalty ? 'Penalty' : isBoost ? 'Boost' : 'Baseline'}
+        </span>
+      </div>
+
+      {showHelp && (
+        <ConfidenceFactorTooltip
+          factor={factor}
+          explanation={explanation}
+          onClose={close}
+        />
+      )}
+    </div>
+  );
+}
+
+export function ConfidenceExplainability({
   label,
   score,
   rationale,
@@ -157,9 +422,16 @@ function ConfidenceExplainability({
   rationale: ConfidenceFactor[];
   ledgerRunId?: string;
 }) {
+  const {
+    isOpen: showFormulaHelp,
+    containerRef,
+    hoverStart,
+    hoverEnd,
+    togglePin,
+    close,
+  } = useTooltipState();
   const cfg = CONFIDENCE_CONFIG[label];
   const sortedRationale = [...rationale].sort((a, b) => b.contribution - a.contribution);
-
   return (
     <Section title="Detection Confidence">
       <div className="space-y-4">
@@ -180,9 +452,78 @@ function ConfidenceExplainability({
 
         {sortedRationale.length > 0 && (
           <div className="space-y-3 pt-2 border-t border-gray-800/60">
-            <p className="text-xs font-medium text-gray-400">
-              Why this score
-            </p>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-1.5">
+                <p className="text-xs font-medium text-gray-400">
+                  Why this score
+                </p>
+                <div ref={containerRef} className="relative">
+                  <button
+                    type="button"
+                    aria-label="Explain detection confidence formula and scoring conditions"
+                    aria-expanded={showFormulaHelp}
+                    onClick={togglePin}
+                    onMouseEnter={hoverStart}
+                    onMouseLeave={hoverEnd}
+                    onFocus={hoverStart}
+                    onBlur={hoverEnd}
+                    className="p-0.5 rounded text-gray-400 hover:text-gray-200 hover:bg-gray-800 transition-colors focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    title="How is detection confidence calculated?"
+                  >
+                    <HelpCircle className="w-3.5 h-3.5" />
+                  </button>
+
+                  {showFormulaHelp && (
+                    <div
+                      role="tooltip"
+                      onMouseEnter={(e) => e.stopPropagation()}
+                      className="absolute left-0 bottom-full mb-2 z-50 w-80 sm:w-96 max-h-[85vh] overflow-y-auto max-w-[calc(100vw-2rem)] rounded-lg border border-gray-700 bg-gray-900/98 p-3.5 text-xs text-gray-200 shadow-2xl backdrop-blur-md pointer-events-auto"
+                    >
+                      <div className="flex items-center justify-between pb-2 border-b border-gray-800">
+                        <span className="font-semibold text-gray-100">{OVERALL_CONFIDENCE_HELP.title}</span>
+                        <button
+                          type="button"
+                          onClick={close}
+                          className="p-1 rounded text-gray-400 hover:text-gray-200 hover:bg-gray-800 transition-colors"
+                          aria-label="Close formula help"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                      <div className="py-2 space-y-2.5">
+                        <div className="p-2 rounded bg-gray-800/70 border border-gray-700/80 font-mono text-[11px] text-blue-300">
+                          {OVERALL_CONFIDENCE_HELP.formula}
+                        </div>
+                        <p className="text-[11px] text-gray-400 leading-relaxed">
+                          {OVERALL_CONFIDENCE_HELP.summary}
+                        </p>
+                        <div className="p-2.5 rounded bg-amber-950/40 border border-amber-800/50 text-[11px] text-amber-200 leading-relaxed">
+                          <span className="font-semibold text-amber-300 block mb-1">Why can score values be negative?</span>
+                          {OVERALL_CONFIDENCE_HELP.negativeExplanation}
+                        </div>
+                        <div className="pt-1">
+                          <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider block mb-1.5">
+                            Score Bands
+                          </span>
+                          <div className="space-y-1 text-[11px]">
+                            {OVERALL_CONFIDENCE_HELP.bands.map((b) => (
+                              <div key={b.label} className="flex items-start gap-2">
+                                <span className={clsx('font-semibold shrink-0 w-20', b.color)}>{b.label} ({b.range}):</span>
+                                <span className="text-gray-400 leading-tight">{b.desc}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+              <span className="text-[10px] text-gray-500 font-mono">
+                {sortedRationale.length} factors evaluated
+              </span>
+            </div>
+
             <div className="space-y-3">
               {sortedRationale.map((factor) => (
                 <ConfidenceFactorBar key={factor.factor} factor={factor} />
@@ -887,7 +1228,7 @@ export function AlertDetailView({ alertId }: { alertId: string }) {
             />
 
             <Section title="Description">
-              <p className="text-sm text-gray-300 leading-relaxed">{alert.description}</p>
+              <p className="text-sm text-gray-300 leading-relaxed break-words whitespace-pre-wrap overflow-x-auto">{alert.description}</p>
             </Section>
 
             {alert.confidenceLabel && (
@@ -925,15 +1266,19 @@ export function AlertDetailView({ alertId }: { alertId: string }) {
             {alert.mitreAttack && alert.mitreAttack.length > 0 && (
               <Section title="MITRE ATT&CK">
                 <div className="space-y-2">
-                  {alert.mitreAttack.map((m, i) => (
-                    <div key={i} className="flex items-center gap-3 p-3 bg-purple-500/5 border border-purple-500/20 rounded-lg">
-                      <span className="text-xs font-mono text-purple-400 bg-purple-500/10 px-2 py-1 rounded">{m.techniqueId}</span>
-                      <div>
-                        <div className="text-sm text-gray-200">{m.technique}</div>
-                        <div className="text-xs text-gray-500">Tactic: {m.tactic}</div>
+                  {alert.mitreAttack.map((m, i) => {
+                    const tactic = m.tactic ||
+                      (m.techniqueId ? TACTIC_BY_ID.get(tacticsFor(m.techniqueId)?.[0] ?? '')?.name : '');
+                    return (
+                      <div key={i} className="flex items-center gap-3 p-3 bg-purple-500/5 border border-purple-500/20 rounded-lg">
+                        <span className="text-xs font-mono text-purple-400 bg-purple-500/10 px-2 py-1 rounded">{m.techniqueId}</span>
+                        <div>
+                          <div className="text-sm text-gray-200">{m.technique}</div>
+                          <div className="text-xs text-gray-500">Tactic: {tactic || '—'}</div>
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </Section>
             )}

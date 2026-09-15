@@ -349,7 +349,25 @@ export const authApi = {
     if (typeof window === 'undefined') return null;
     try {
       const raw = window.localStorage.getItem(AUTH_USER_KEY);
-      return raw ? (JSON.parse(raw) as AuthUser) : null;
+      if (raw) return JSON.parse(raw) as AuthUser;
+      const token =
+        window.localStorage.getItem('aisoc_access_token') ||
+        window.localStorage.getItem(AUTH_TOKEN_KEY);
+      if (token && token.includes('.')) {
+        const parts = token.split('.');
+        if (parts.length === 3) {
+          const payload = JSON.parse(atob(parts[1]));
+          if (payload) {
+            return {
+              id: payload.sub,
+              email: payload.email,
+              role: payload.role,
+              tenant_id: payload.tenant_id,
+            };
+          }
+        }
+      }
+      return null;
     } catch {
       return null;
     }
@@ -548,7 +566,7 @@ export type ConfidenceLabel = 'high' | 'medium' | 'low';
 export interface ConfidenceFactor {
   factor: string;
   label: string;
-  value: number;
+  value: string | number;
   contribution: number;
   weight: number;
 }
@@ -716,7 +734,7 @@ function normalizeAlert(raw: unknown): Alert {
     ? (rationaleRaw as Array<Record<string, unknown>>).map((f) => ({
         factor: String(f.factor ?? ''),
         label: String(f.label ?? ''),
-        value: Number(f.value ?? 0),
+        value: typeof f.value === 'number' ? f.value : String(f.value ?? ''),
         contribution: Number(f.contribution ?? 0),
         weight: Number(f.weight ?? 0),
       }))
@@ -3535,6 +3553,7 @@ export interface DetectionRule {
   updatedAt: string;
   lastTriggeredAt?: string;
   hitCount?: number;
+  isBuiltin?: boolean;
 }
 
 // ─── Detection management UI (WS-B3) ─────────────────────────────────────────
