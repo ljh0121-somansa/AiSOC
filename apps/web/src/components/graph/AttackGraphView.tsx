@@ -69,6 +69,35 @@ const KIND_SHAPES: Record<GraphNodeKind, string> = {
   alert: 'octagon',
   asset: 'round-rectangle',
 };
+/**
+ * Ingest labels emitted by services/ingest graph writer (labels(n)[0].lower()
+ * on the backend) mapped onto the frontend's small visual vocabulary. Nodes
+ * whose backend kind is unrecognized fall back to `asset` so they still get a
+ * color/shape rather than silently degrading to gray.
+ */
+const INGEST_KIND_MAP: Record<string, GraphNodeKind> = {
+  endpoint: 'host',
+  container: 'host',
+  image: 'host',
+  identity: 'user',
+  serviceaccount: 'user',
+  resource: 'asset',
+  repo: 'asset',
+  saasapp: 'asset',
+  permission: 'asset',
+  role: 'asset',
+  policy: 'asset',
+  configuration: 'asset',
+  networkpath: 'ip',
+  detection: 'technique',
+  alert: 'alert',
+  case: 'alert',
+};
+
+/** Normalize a backend `kind` (ingest label or legacy) to a visual-vocab kind. */
+export function normalizeKind(ingestLabel: string): GraphNodeKind {
+  return INGEST_KIND_MAP[ingestLabel] ?? 'asset';
+}
 
 // ─── Cytoscape canvas ─────────────────────────────────────────────────────────
 
@@ -89,7 +118,7 @@ function GraphCanvas({ graph, onSelect }: GraphCanvasProps) {
         data: {
           id: n.id,
           label: n.label,
-          kind: n.kind,
+          kind: normalizeKind(n.kind),
           color: KIND_COLORS[n.kind] ?? '#94a3b8',
           shape: KIND_SHAPES[n.kind] ?? 'ellipse',
           size: 24 + Math.min(36, (n.riskScore ?? 30) / 2),
@@ -282,33 +311,13 @@ export function AttackGraphView() {
 
   const graphState = useSWR<AttackGraph>(
     'attack-graph',
-    async () => {
-      try {
-        return await graphApi.getOverview({ depth: 3 });
-      } catch (err) {
-        return {
-          nodes: [],
-          edges: [],
-          generatedAt: new Date().toISOString(),
-        };
-      }
-    },
+    async () => await graphApi.getOverview({ depth: 3 }),
     { revalidateOnFocus: false, refreshInterval: 30_000 },
   );
 
   const mitreState = useSWR<MitreCoverage>(
     'mitre-coverage',
-    async () => {
-      try {
-        return await graphApi.getMitreCoverage();
-      } catch {
-        return {
-          tactics: [],
-          cells: [],
-          generatedAt: new Date().toISOString(),
-        };
-      }
-    },
+    async () => await graphApi.getMitreCoverage(),
     { revalidateOnFocus: false, refreshInterval: 60_000 },
   );
 
@@ -326,7 +335,12 @@ export function AttackGraphView() {
               telemetry.
             </p>
           </div>
-          <div className="text-xs text-slate-500" suppressHydrationWarning>
+          <div className="flex items-center gap-2 text-xs text-slate-500" suppressHydrationWarning>
+            {graph && graph.source === 'relational' ? (
+              <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400 font-medium">
+                Relational fallback
+              </span>
+            ) : null}
             {graph
               ? `Generated ${new Date(graph.generatedAt).toLocaleTimeString()}`
               : ''}

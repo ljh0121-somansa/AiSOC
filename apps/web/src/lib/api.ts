@@ -1948,7 +1948,7 @@ export interface FunnelMetrics {
   /** Alerts produced per event-of-interest, clamped to [0, 1]. */
   alert_yield: number;
   mitre_coverage: { covered: number; total: number; ratio: number };
-  /** Period-over-period deltas (fraction, e.g. 0.05 = +5%). */
+  /** Period-over-period deltas in percentage (e.g. 5.0 = +5%, -100.0 = -100%). */
   deltas: {
     events_of_interest: number;
     correlation_instances: number;
@@ -3290,13 +3290,22 @@ export type GraphNodeKind =
   | 'alert'
   | 'asset';
 
+/**
+ * A tenant-level attack-graph node as returned by `graphApi.getOverview`.
+ *
+ * `kind` is one of the small visual-vocabulary set above for the frontend
+ * color/shape maps; when the backend returns an ingest label (e.g. `"endpoint"`)
+ * the consumer normalizes it via `normalizeKind`. `properties` carries the raw
+ * Neo4j node properties (canonical source); `riskScore`/`severity` are
+ * best-effort derived fields.
+ */
 export interface GraphNode {
   id: string;
   label: string;
   kind: GraphNodeKind;
   riskScore?: number;
   severity?: AlertSeverity;
-  attributes?: Record<string, unknown>;
+  properties?: Record<string, unknown>;
 }
 
 export interface GraphEdge {
@@ -3304,14 +3313,14 @@ export interface GraphEdge {
   source: string;
   target: string;
   label: string;
-  weight?: number;
-  attributes?: Record<string, unknown>;
 }
 
 export interface AttackGraph {
   nodes: GraphNode[];
   edges: GraphEdge[];
   generatedAt: string;
+  /** "neo4j" for live ingest data, "relational" for the Postgres fallback. */
+  source?: 'neo4j' | 'relational';
 }
 
 export interface AttackPath {
