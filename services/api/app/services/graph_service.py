@@ -328,17 +328,16 @@ async def _attack_path_fallback(case_id: str, tenant_id: str) -> dict[str, Any]:
 
 async def get_blast_radius(entity_id: str, entity_type: str, tenant_id: str, hops: int = 3) -> dict[str, Any]:
     """
-    Compute blast radius: all entities reachable from an IOC/Host/User within N hops.
+    Compute blast radius: all entities reachable from an entity within N hops.
     Used for impact assessment during incident response.
     """
     label_map = {
-        "host": "Host",
+        "host": "Endpoint",
         "user": "User",
-        "ioc": "IOC",
         "alert": "Alert",
     }
-    label = label_map.get(entity_type.lower(), "Host")
-    id_prop = "value" if label == "IOC" else "id"
+    label = label_map.get(entity_type.lower(), "Endpoint")
+    id_prop = "natural_key"
 
     cypher = f"""
     MATCH (start:{label} {{{id_prop}: $entity_id}})
@@ -352,7 +351,7 @@ async def get_blast_radius(entity_id: str, entity_type: str, tenant_id: str, hop
     WITH nodes(path) AS path_nodes, relationships(path) AS path_rels
     UNWIND path_nodes AS n
     WITH COLLECT(DISTINCT {{
-        id: coalesce(n.id, n.value, n.technique_id),
+        id: coalesce(n.natural_key, n.id),
         label: labels(n)[0],
         properties: properties(n)
     }}) AS all_nodes
@@ -384,17 +383,21 @@ async def get_blast_radius(entity_id: str, entity_type: str, tenant_id: str, hop
 
 
 async def _blast_radius_fallback(entity_id: str, entity_type: str, tenant_id: str, hops: int) -> dict[str, Any]:
-    """Simple 2-hop blast radius without APOC."""
-    label_map = {"host": "Host", "user": "User", "ioc": "IOC", "alert": "Alert"}
-    label = label_map.get(entity_type.lower(), "Host")
-    id_prop = "value" if label == "IOC" else "id"
+    """Simple blast radius without APOC."""
+    label_map = {
+        "host": "Endpoint",
+        "user": "User",
+        "alert": "Alert",
+    }
+    label = label_map.get(entity_type.lower(), "Endpoint")
+    id_prop = "natural_key"
 
     cypher = f"""
     MATCH (start:{label} {{{id_prop}: $entity_id}})
     MATCH (start)-[*1..{hops}]-(n)
     WHERE n.tenant_id = $tenant_id OR n.tenant_id IS NULL
     RETURN COLLECT(DISTINCT {{
-        id: coalesce(n.id, n.value, n.technique_id),
+        id: coalesce(n.natural_key, n.id),
         label: labels(n)[0],
         properties: properties(n)
     }}) AS affected
@@ -423,9 +426,11 @@ async def _blast_radius_fallback(entity_id: str, entity_type: str, tenant_id: st
 def _calc_blast_score(type_counts: dict[str, int]) -> float:
     """
     Heuristic blast-radius severity score 0–100.
-    Weights: Alert=10, Host=5, User=8, IOC=3, Technique=2.
+    Weights (ingest vocabulary): Endpoint=10, Resource=8, User=8,
+    Alert=6, NetworkPath=3, Detection=2.
     """
-    weights = {"Alert": 10, "Host": 5, "User": 8, "IOC": 3, "Technique": 2}
+    weights = {"Alert": 6, "Endpoint": 10, "Resource": 8,
+               "User": 8, "NetworkPath": 3, "Detection": 2}
     raw = sum(weights.get(lbl, 1) * count for lbl, count in type_counts.items())
     return min(round(raw / 10, 1), 100.0)
 
@@ -436,17 +441,21 @@ async def get_entity_neighbors(
     tenant_id: str,
 ) -> dict[str, Any]:
     """Return immediate neighbors of a node (depth 1)."""
-    label_map = {"host": "Host", "user": "User", "ioc": "IOC", "alert": "Alert", "case": "Case"}
-    label = label_map.get(entity_type.lower(), "Host")
-    id_prop = "value" if label == "IOC" else "id"
+    label_map = {
+        "host": "Endpoint",
+        "user": "User",
+        "alert": "Alert",
+    }
+    label = label_map.get(entity_type.lower(), "Endpoint")
+    id_prop = "natural_key"
 
     cypher = f"""
     MATCH (n:{label} {{{id_prop}: $entity_id}})
     MATCH (n)-[r]-(neighbor)
     RETURN
-        {{id: coalesce(n.id, n.value), label: labels(n)[0], properties: properties(n)}} AS source,
+        {{id: coalesce(n.natural_key, n.id), label: labels(n)[0], properties: properties(n)}} AS source,
         COLLECT(DISTINCT {{
-            id: coalesce(neighbor.id, neighbor.value, neighbor.technique_id),
+            id: coalesce(neighbor.natural_key, neighbor.id),
             label: labels(neighbor)[0],
             rel_type: type(r),
             properties: properties(neighbor)
@@ -469,13 +478,17 @@ async def get_entity_neighbors(
 
 
 async def get_mitre_coverage(tenant_id: str) -> list[dict[str, Any]]:
-    """Return MITRE ATT&CK technique coverage: alert counts per technique."""
+    """Return MITRE ATT&CK technique coverage: alert counts per technique.
+
+    Aggregates per-detection counts across the tenant's alerts via the ingest
+    ``TRIGGERED`` edge into ``:Detection`` nodes.
+    """
     cypher = """
-    MATCH (a:Alert {tenant_id: $tenant_id})-[:MAPS_TO]->(t:Technique)
+    MATCH (a:Alert {tenant_id: $tenant_id})-[:TRIGGERED]->(d:Detection)
     RETURN
-        t.technique_id AS technique_id,
-        t.name AS name,
-        t.tactic AS tactic,
+        d.mitre_technique_id AS technique_id,
+        d.mitre_technique_name AS name,
+        d.tactic AS tactic,
         COUNT(a) AS alert_count
     ORDER BY alert_count DESC
     """
@@ -489,138 +502,82 @@ async def get_mitre_coverage(tenant_id: str) -> list[dict[str, Any]]:
 
 async def get_overview_graph(
     tenant_id: str, depth: int = 3, limit: int = 200
-) -> dict[str, Any]:
-    """Fetch the tenant-wide attack graph overview from Neo4j."""
-    cypher = """
-    MATCH (n)
-    WHERE n.tenant_id =  OR n.tenant_id IS NULL
-    OPTIONAL MATCH (n)-[r]-(m)
-    WHERE m.tenant_id =  OR m.tenant_id IS NULL
-    RETURN n, labels(n) AS labels, r, m, labels(m) AS target_labels
-    LIMIT 200
+) -> dict[str, Any] | None:
+    """Fetch the tenant-wide attack graph overview from Neo4j.
+
+    Node ids are derived from ``natural_key`` (the only id the ingest writer
+    persists). Returns ``None`` when no live nodes exist so the endpoint can
+    decide whether to fall back to the relational reconstruction.
     """
-    try:
-        async with get_session() as s:
-            result = await s.run(cypher, tenant_id=tenant_id)
-            records = await result.data()
+    cypher = """
+    MATCH (n) WHERE n.tenant_id = $tenant_id OR n.tenant_id IS NULL
+    OPTIONAL MATCH (n)-[r]-(m) WHERE m.tenant_id = $tenant_id OR m.tenant_id IS NULL
+    RETURN n, labels(n) AS labels, r, m, labels(m) AS target_labels, type(r) AS rel_type
+    LIMIT $limit
+    """
+    async with get_session() as s:
+        result = await s.run(cypher, tenant_id=tenant_id, limit=limit)
+        records = await result.data()
 
-        if not records:
-            return {
-                "nodes": [],
-                "edges": [],
-                "generatedAt": datetime.now(UTC).isoformat(),
-            }
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    seen_nodes: set[str] = set()
 
-        nodes: list[dict[str, Any]] = []
-        edges: list[dict[str, Any]] = []
-        seen_nodes: set[str] = set()
-        seen_edges: set[str] = set()
+    def _node(rec_n, labels) -> dict | None:
+        if not rec_n:
+            return None
+        props = dict(rec_n)
+        nid = (
+            str(props.get("natural_key"))
+            or str(props.get("id"))
+            or f"{labels[0] if labels else 'node'}:{id(props)}"
+        )
+        return {
+            "id": nid,
+            "kind": str(labels[0]).lower() if labels else "asset",
+            "label": str(
+                props.get("name")
+                or props.get("title")
+                or props.get("hostname")
+                or props.get("username")
+                or props.get("value")
+                or nid
+            ),
+            "riskScore": float(props.get("risk_score", 50.0) or 50.0),
+            "severity": str(props.get("severity", "medium")).lower(),
+            "properties": props,
+        }
 
-        for rec in records:
-            n = rec.get("n")
-            node_id = None
-            if n:
-                props = dict(n)
-                node_id = str(
-                    props.get("id")
-                    or props.get("value")
-                    or props.get("hostname")
-                    or props.get("username")
-                    or props.get("technique_id")
-                    or f"node-{len(seen_nodes) + 1}"
-                )
-                if node_id not in seen_nodes:
-                    seen_nodes.add(node_id)
-                    labels = rec.get("labels") or ["Asset"]
-                    kind = str(labels[0]).lower() if labels else "asset"
-                    label_str = str(
-                        props.get("hostname")
-                        or props.get("username")
-                        or props.get("value")
-                        or props.get("title")
-                        or props.get("name")
-                        or node_id
-                    )
-                    nodes.append(
-                        {
-                            "id": node_id,
-                            "label": label_str,
-                            "kind": kind,
-                            "riskScore": float(
-                                props.get("risk_score", 50.0) or 50.0
-                            ),
-                            "severity": str(
-                                props.get("severity", "medium")
-                            ).lower(),
-                            "properties": props,
-                        }
-                    )
+    for rec in records:
+        n = rec.get("n")
+        n_labels = rec.get("labels")
+        n_node = _node(n, n_labels)
+        if n_node and n_node["id"] not in seen_nodes:
+            seen_nodes.add(n_node["id"])
+            nodes.append(n_node)
 
-            m = rec.get("m")
-            m_id = None
-            if m:
-                m_props = dict(m)
-                m_id = str(
-                    m_props.get("id")
-                    or m_props.get("value")
-                    or m_props.get("hostname")
-                    or m_props.get("username")
-                    or m_props.get("technique_id")
-                    or f"node-{len(seen_nodes) + 1}"
-                )
-                if m_id not in seen_nodes:
-                    seen_nodes.add(m_id)
-                    m_labels = rec.get("target_labels") or ["Asset"]
-                    m_kind = str(m_labels[0]).lower() if m_labels else "asset"
-                    m_label_str = str(
-                        m_props.get("hostname")
-                        or m_props.get("username")
-                        or m_props.get("value")
-                        or m_props.get("title")
-                        or m_props.get("name")
-                        or m_id
-                    )
-                    nodes.append(
-                        {
-                            "id": m_id,
-                            "label": m_label_str,
-                            "kind": m_kind,
-                            "riskScore": float(
-                                m_props.get("risk_score", 50.0) or 50.0
-                            ),
-                            "severity": str(
-                                m_props.get("severity", "medium")
-                            ).lower(),
-                            "properties": m_props,
-                        }
-                    )
+        m = rec.get("m")
+        m_labels = rec.get("target_labels")
+        m_node = _node(m, m_labels)
+        if m_node and m_node["id"] not in seen_nodes:
+            seen_nodes.add(m_node["id"])
+            nodes.append(m_node)
 
-            r = rec.get("r")
-            if r and node_id and m_id:
-                edge_id = f"e-{node_id}-{m_id}"
-                if edge_id not in seen_edges:
-                    seen_edges.add(edge_id)
-                    edges.append(
-                        {
-                            "id": edge_id,
-                            "source": node_id,
-                            "target": m_id,
-                            "label": "relates_to",
-                        }
-                    )
+        r = rec.get("r")
+        if r and n_node and m_node:
+            edges.append({
+                "id": f"e-{n_node['id']}-{m_node['id']}",
+                "source": n_node["id"],
+                "target": m_node["id"],
+                "label": "relates_to",
+            })
 
-        if nodes:
-            return {
-                "nodes": nodes,
-                "edges": edges,
-                "generatedAt": datetime.now(UTC).isoformat(),
-            }
-
-    except Exception as exc:
-        logger.warning("Neo4j overview graph query failed", error=str(exc))
+    if not nodes:
+        return None
 
     return {
-        "nodes": [],
-        "edges": [],
+        "source": "neo4j",
+        "nodes": nodes,
+        "edges": edges,
         "generatedAt": datetime.now(UTC).isoformat(),
     }
