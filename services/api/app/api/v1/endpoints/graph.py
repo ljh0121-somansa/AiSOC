@@ -175,6 +175,7 @@ class OverviewGraphResponse(BaseModel):
     nodes: list[OverviewGraphNode]
     edges: list[OverviewGraphEdge]
     generatedAt: str
+    source: str = "relational"   # "neo4j" | "relational" (fallback)
 
 
 async def _graph_overview_from_relational(
@@ -313,20 +314,26 @@ async def get_overview(
     depth: Annotated[int, Query(ge=1, le=10)] = 3,
     current_user: CurrentUser = Depends(get_current_user),
 ) -> OverviewGraphResponse:
-    """Return tenant-level attack graph overview from Neo4j or Relational DB."""
-    data: dict[str, Any] | None = None
-    try:
-        data = await graph_service.get_overview_graph(
-            tenant_id=str(current_user.tenant_id),
-            depth=depth,
-        )
-    except Exception as exc:
-        logger.info("Graph overview Neo4j query failed", error=str(exc))
+    """Return tenant-level attack graph overview from Neo4j, with relational fallback.
+
+    The Neo4j overview is authoritative; ``source`` records whether the response
+    came from live ingest data ("neo4j") or from the Postgres relational
+    reconstruction ("relational"). When Neo4j returns no nodes the relational
+    fallback is used as an explicit degraded path, not silently substituted for
+    live data.
+    """
+    data = await graph_service.get_overview_graph(
+        tenant_id=str(current_user.tenant_id),
+        depth=depth,
+    )
 
     if not data or not data.get("nodes"):
         data = await _graph_overview_from_relational(
             db, str(current_user.tenant_id)
         )
+        data["source"] = "relational"
+    else:
+        data.setdefault("source", "neo4j")
 
     return OverviewGraphResponse(**data)
 
