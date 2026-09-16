@@ -77,30 +77,33 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def _create_schema() -> None:
-    """Create constraints and indexes for the graph schema."""
-    constraints = [
-        # Uniqueness constraints
-        "CREATE CONSTRAINT IF NOT EXISTS FOR (h:Host) REQUIRE h.id IS UNIQUE",
-        "CREATE CONSTRAINT IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE",
-        "CREATE CONSTRAINT IF NOT EXISTS FOR (a:Alert) REQUIRE a.id IS UNIQUE",
-        "CREATE CONSTRAINT IF NOT EXISTS FOR (i:IOC) REQUIRE i.value IS UNIQUE",
-        "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Technique) REQUIRE t.technique_id IS UNIQUE",
-        "CREATE CONSTRAINT IF NOT EXISTS FOR (c:Case) REQUIRE c.id IS UNIQUE",
-        "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Process) REQUIRE p.id IS UNIQUE",
-        # Indexes for common lookups
-        "CREATE INDEX IF NOT EXISTS FOR (h:Host) ON (h.hostname)",
-        "CREATE INDEX IF NOT EXISTS FOR (h:Host) ON (h.tenant_id)",
-        "CREATE INDEX IF NOT EXISTS FOR (u:User) ON (u.username)",
-        "CREATE INDEX IF NOT EXISTS FOR (u:User) ON (u.tenant_id)",
-        "CREATE INDEX IF NOT EXISTS FOR (a:Alert) ON (a.tenant_id)",
-        "CREATE INDEX IF NOT EXISTS FOR (a:Alert) ON (a.severity)",
-        "CREATE INDEX IF NOT EXISTS FOR (i:IOC) ON (i.ioc_type)",
-        "CREATE INDEX IF NOT EXISTS FOR (i:IOC) ON (i.tenant_id)",
-        "CREATE INDEX IF NOT EXISTS FOR (t:Technique) ON (t.tactic)",
-    ]
+    """Create constraints and indexes for the graph schema.
+
+    The live ingest writer is the single source of truth for graph vocabulary
+    (see services/ingest/internal/graph). These labels must mirror its label
+    set; the query layer only consumes nodes the writer produces.
+    """
+    # Ingest label set — the writer never creates Host/IOC/Technique/Process.
+    _GRAPH_LABELS: tuple[str, ...] = (
+        "User", "Endpoint", "NetworkPath", "Resource", "Alert", "Detection",
+        "Repo", "Identity", "ServiceAccount", "SaaSApp", "Permission",
+        "Role", "Policy", "Container", "Image", "Case",
+    )
+
+    # Per invariant: uniqueness is keyed on natural_key (the only id the writer
+    # persists); a per-label tenant_id index covers tenant-scoped lookups.
+    statements: list[str] = []
+    for label in _GRAPH_LABELS:
+        statements.append(
+            f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label}) "
+            f"REQUIRE n.natural_key IS UNIQUE"
+        )
+        statements.append(
+            f"CREATE INDEX IF NOT EXISTS FOR (n:{label}) REQUIRE (n.tenant_id)"
+        )
 
     async with get_session() as session:
-        for cypher in constraints:
+        for cypher in statements:
             try:
                 await session.run(cypher)
             except Exception as exc:
