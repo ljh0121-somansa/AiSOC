@@ -88,9 +88,13 @@ function formatValue(tile: InsightTile): string {
 }
 
 function formatDelta(delta: number | null): string {
-  if (delta === null) return '—';
-  const sign = delta > 0 ? '+' : '';
-  return `${sign}${delta.toFixed(1)}%`;
+  if (delta === null || !Number.isFinite(delta)) return '—';
+  // Baseline-artifact clamp mirroring FunnelKpiBar: a near-zero prior window
+  // makes period-over-period % explode past any meaningful bound, so cap the
+  // magnitude at ±999.9% instead of rendering "−10000.0%".
+  const clamped = Math.max(-999.9, Math.min(999.9, delta));
+  const sign = clamped > 0 ? '+' : '';
+  return `${sign}${clamped.toFixed(1)}%`;
 }
 
 /**
@@ -104,6 +108,7 @@ function formatDelta(delta: number | null): string {
 function deltaDirection(tile: InsightTile): 'up' | 'down' | 'flat' {
   if (tile.delta_pct === null || tile.delta_pct === 0) return 'flat';
   const positive = tile.delta_pct > 0;
-  const goodWhenUp = tile.key === 'analyst_hours_saved';
+  const goodWhenUp =
+    tile.key === 'analyst_hours_saved' || tile.key === 'cases_per_day';
   return positive === goodWhenUp ? 'up' : 'down';
 }

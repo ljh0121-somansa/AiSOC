@@ -71,12 +71,12 @@ const SAMPLE_FUNNEL = {
   alert_yield: 0.034,
   mitre_coverage: { covered: 42, total: 201, ratio: 0.209 },
   deltas: {
-    events_of_interest: 0.12,
-    correlation_instances: 0.05,
-    alerts_generated: -0.08,
-    signal_to_noise: 0.02,
-    mttd_seconds: -0.15,
-    analyst_queue_depth: 0.2,
+    events_of_interest: 12,
+    correlation_instances: 5,
+    alerts_generated: -8,
+    signal_to_noise: 2,
+    mttd_seconds: -15,
+    analyst_queue_depth: 20,
   },
   generated_at: '2026-05-13T10:00:00Z',
 };
@@ -116,6 +116,20 @@ describe('FunnelKpiBar', () => {
     // Positive Δ on EOI / alerts means up; negative on alerts is shown with a minus.
     expect(screen.getByText('+12%')).toBeInTheDocument();
     expect(screen.getByText('−8%')).toBeInTheDocument();
+  });
+
+  it('renders −100% delta correctly when a metric drops to zero (not −10000%)', () => {
+    const funnelWithZeroDrop = {
+      ...SAMPLE_FUNNEL,
+      deltas: {
+        ...SAMPLE_FUNNEL.deltas,
+        alerts_generated: -100,
+      },
+    };
+    swrData.set(FUNNEL_KEY, funnelWithZeroDrop);
+    render(<FunnelKpiBar period="24h" />);
+    expect(screen.getByText('−100%')).toBeInTheDocument();
+    expect(screen.queryByText(/10000%/)).not.toBeInTheDocument();
   });
 
   it('shows skeleton tiles while loading', () => {

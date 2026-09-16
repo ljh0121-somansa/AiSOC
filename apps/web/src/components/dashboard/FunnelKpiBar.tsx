@@ -69,10 +69,16 @@ function formatPercent(ratio: number): string {
 
 function formatDelta(delta: number | null): string {
   if (delta === null || !Number.isFinite(delta)) return '—';
-  const pct = delta * 100;
-  const rounded = Math.abs(pct) >= 10 ? Math.round(pct) : pct.toFixed(1);
-  const sign = pct > 0 ? '+' : pct < 0 ? '−' : '';
-  return `${sign}${Math.abs(Number(rounded))}%`;
+  // Period-over-period change is bounded to [−100%, +∞) for non-negative
+  // counts. A magnitude above that means the prior window had a near-zero
+  // baseline — a baseline artifact, not signal — so cap the displayed
+  // magnitude at 999.9% (a tiny-baseline spike then reads as a huge-but-
+  // honest swing rather than "−10000%").
+  const abs = Math.abs(delta);
+  let n = abs >= 10 ? Math.round(abs) : abs.toFixed(1);
+  n = Math.min(Number(n), 999.9);
+  const sign = delta > 0 ? '+' : delta < 0 ? '−' : '';
+  return `${sign}${n}%`;
 }
 
 function Tile({ label, value, delta, lowerIsBetter = false, unit }: TileProps) {
