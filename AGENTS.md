@@ -6,7 +6,6 @@
 - Before pushing to GitHub, ensure no secrets, API keys, tokens, or sensitive data are present in any public repo files.
 - Host codebase on GitHub once fully built out; keep documentation in sync.
 - Never edit plan files directly — implement the plan as specified without modifying the plan document itself.
-- After every significant change, push code and update documentation on GitHub immediately — don't wait to be asked.
 - Benchmark data and documentation must be transparent about what is synthetic vs. real; never present fabricated metrics as actual measured performance.
 - When the task is clear, act autonomously — don't ask unnecessary clarifying questions.
 - Standing repo-maintenance loop is the default when no other task is queued: review open PRs at the canonical repo, resolve CI/conflicts, merge them, close issues those PRs resolved, and keep `main` green.
@@ -20,7 +19,7 @@
 - **Single source of truth (as of 2026-06-27):** `https://github.com/beenuar/AiSOC` is the only canonical repo. The previous private staging repo `beenuar/AISOC-Cyble` was archived (read-only, `archived: true`) and its full history was merged into this monorepo under `plans/cyble-aisoc/` via `git subtree add --prefix=plans/cyble-aisoc` ([PR #324](https://github.com/beenuar/AiSOC/pull/324)). The archive notice (`DEPRECATED.md`) was subsequently subtree-pulled into `plans/cyble-aisoc/DEPRECATED.md` ([PR #325](https://github.com/beenuar/AiSOC/pull/325)).
 - **Spec + historical prototype location:** the north-star design doc lives at `plans/cyble-aisoc/cyble-aisoc-plan.md`; the historical FastAPI/static prototype + early architecture notes + 12-month roadmap live under `plans/cyble-aisoc/{platform,architecture,roadmap}/`. Treat that subtree as historical reference only — the canonical deployable code is at the monorepo root (`services/`, `apps/`, `infra/`, `packages/`).
 - **CodeQL scoping:** `.github/workflows/codeql.yml` carries `paths-ignore: 'plans/cyble-aisoc/**'` so prototype findings don't appear as actionable security alerts. The same `paths-ignore` is documented inline in the workflow.
-- Monorepo managed with pnpm (pnpm@8.15.1) and Turborepo; workspaces defined in `apps/*` and `packages/*`.
+- Monorepo managed with pnpm (pnpm@8.1 and Turborepo; workspaces defined in `apps/*` and `packages/*`.
 - Apps: `apps/web` (Next.js frontend), `apps/docs` (documentation site).
 - Backend services in `services/`: `api` (FastAPI/Python 3.11), `agents`, `alert-fusion`, `connectors`, `demo-producer`, `enrichment`, `fusion`, `ingest`, `realtime`, `threatintel`, `ocsf`.
 - API service stack: FastAPI, Uvicorn, SQLAlchemy (async), asyncpg (PostgreSQL), Alembic (migrations), Redis, python-jose (JWT), Pydantic v2.
@@ -53,7 +52,7 @@
   - WS-G: Slack Bolt service at `services/slack-bot/` with `/aisoc` ChatOps commands (WS-G1); executive digest with auto-generated PDF + weekly scheduler in `services/api/app/services/digest_pdf.py` and `services/api/app/api/v1/endpoints/reports.py` (WS-G2).
   - WS-H: LLM cost dashboard (`services/api/app/services/cost_dashboard.py` + `apps/web/src/app/(admin)/costs/page.tsx` — WS-H1); BYOK per-tenant LLM credentials vault-encrypted via `CredentialVault`, model `TenantLlmCredential`, settings UI in `apps/web/src/components/settings/SettingsView.tsx` (WS-H2); compliance audit export CSV + HTML bundles at `services/api/app/services/audit_export.py` (WS-H3); air-gapped / local-LLM mode via Ollama/LiteLLM overlay + zero-external-call demo seed (WS-H4).
   - Threat actor attribution engine v0 at `services/threatintel/` (rebased, hardened, open as PR #43).
-- **v8.0 wave-1 (tagged as `v7.5.0` on 2026-06-29):** Architectural foundation for the v8.0 line shipped as the `v7.5.0` release. `VERSION` is `7.5.0` (also reflected in `apps/web/package.json`); wave-2 work accumulates under `[Unreleased]` in `CHANGELOG.md` until the next tag. Tracking doc: `docs/roadmap/v8-progress.md`. Key shipped pieces:
+- **v8.0 wave-1 (tagged as `v7. on 2026-06-29):** Architectural foundation for the v8.0 line shipped as the `v7. release. `VERSION` is `7. (also reflected in `apps/web/package.json`); wave-2 work accumulates under `[Unreleased]` in `CHANGELOG.md` until the next tag. Tracking doc: `docs/roadmap/v8-progress.md`. Key shipped pieces:
   - **Graph at ingest (T1.1).** `services/ingest/internal/graph/` writes a Neo4j entity graph (`User`, `Asset`, `Process`, `IP`, `Domain`, `Alert`, 17 node labels / 14 edge types total) inline with Kafka consumption. Batched UNWIND upserts + fire-and-forget retry queue keep the ingest latency budget unchanged. Schema doc: `apps/docs/docs/architecture/graph-schema.md`. Anchor post: `apps/web/content/blog/graph-at-ingest.mdx`.
   - **Four-agent rebrand (T2.1).** `DetectAgent`, `TriageAgent`, `HuntAgent`, `RespondAgent` in `services/agents/app/agents/`. Back-compat aliases preserve existing imports. Each owns one funnel stage; funnel KPI doc at `apps/docs/docs/console/funnel-kpis.md`.
   - **`/hunt` natural-language surface (T2.2).** `apps/web/src/app/(app)/hunt/` + `services/api/app/api/v1/endpoints/saved_hunts.py`. NL prompt → ES|QL / SPL / KQL template (HuntAgent never writes raw queries). Saved hunts have `pivotPath` deep-links into the Investigation Rail.
@@ -74,7 +73,7 @@
   - **`py/request-without-cert-validation` — accepted-risk for on-prem appliance clients.** The Splunk / FortiGate / PAN-OS / osctrl / FleetDM / MISP clients default to `verify=True` and only disable TLS verification on an explicit operator opt-in (required for self-signed / internal-CA appliances), so these ~20 alerts are dismissed `won't fix` with a comment recommending CA-bundle pinning as the future alternative. Related one-liners from the Jul-2026 pass: a count var named `secret*` trips the alert heuristic (rename to e.g. `vaulted`); `py/ineffectual-statement` on Protocol/abstract `...` bodies → use a docstring body; `py/empty-except` → add an explanatory comment. Zero open alerts re-confirmed on `main` (Jul 2026), now across Python + Go (`go vet` / `go build`).
   - Docs anchor: `apps/docs/docs/operations/security.md#static-analysis-codeql`.
 - **UEBA env-var convention (PR #135, first community contribution, closes Issue #134):** `services/ueba/app/core/config.py` uses Pydantic `BaseSettings` with `populate_by_name=True` and `Field(default=..., validation_alias=AliasChoices("UNPREFIXED", "UEBA_PREFIXED"))` per field. Both forms work; unprefixed wins when both are set. `services/ueba/alembic/env.py` follows the same rule: `os.environ.get("DATABASE_URL") or os.environ.get("UEBA_DATABASE_URL", default)`. Same pattern as `services/fusion/app/core/config.py`. Test coverage: `services/ueba/tests/test_config.py` asserts four cases (unprefixed-only / prefixed-only / both-with-unprefixed-winning / default-fallback). Doc anchor: `apps/docs/docs/deployment/env-vars.md#ueba-service-servicesueba`.
-- **Release flow is tag-driven (CHANGELOG-extraction).** `.github/workflows/release.yml` watches for `v*` tags, extracts the matching `[X.Y.Z]` section from `CHANGELOG.md` (Keep-a-Changelog format) via an awk script, then publishes via `softprops/action-gh-release` and pushes 12 service images to GHCR with the version tag. To cut a release: (1) promote `[Unreleased]` → `[X.Y.Z]` in `CHANGELOG.md` (leaving a fresh empty `[Unreleased]`), (2) bump `VERSION` and `apps/web/package.json`, (3) refresh the README version badge / headline / roadmap entry, (4) commit `chore(release): vX.Y.Z`, (5) `git tag vX.Y.Z && git push --tags`. Do NOT create the GitHub release manually — the workflow does it. v7.5.0 (2026-06-29) is the canonical reference example.
+- **Release flow is tag-driven (CHANGELOG-extraction).** `.github/workflows/release.yml` watches for `v*` tags, extracts the matching `[X.Y.Z]` section from `CHANGELOG.md` (Keep-a-Changelog format) via an awk script, then publishes via `softprops/action-gh-release` and pushes 12 service images to GHCR with the version tag. To cut a release: (1) promote `[Unreleased]` → `[X.Y.Z]` in `CHANGELOG.md` (leaving a fresh empty `[Unreleased]`), (2) bump `VERSION` and `apps/web/package.json`, (3) refresh the README version badge / headline / roadmap entry, (4) commit `chore(release): vX.Y.Z`, (5) `git tag vX.Y.Z && git push --tags`. Do NOT create the GitHub release manually — the workflow does it. v7.(2026-06-29) is the canonical reference example.
 - **Marketing shell is unified.** `apps/web/src/app/(marketing)/layout.tsx` renders the canonical `StickyNav` + `apps/web/src/components/landing/sections/Footer` ONCE for every marketing subpage; subpages must NOT re-import or re-render their own nav/footer. Standalone pages outside the route group (`not-found.tsx`, `why-open-source/page.tsx`, `benchmark/page.tsx`) import the shell directly. The deprecated `LandingNav` and `landing/Footer` were deleted. `StickyNav` anchor links use absolute paths (`/#solution`, `/#pillars`) so they work on subpages too. JSX whitespace pitfall (PR #337): when an interpolation like `{CONNECTOR_COUNT}` and adjacent text wrap to separate source lines, React injects `<!-- -->` comment markers and DROPS the leading whitespace — always use an explicit `{' '}` between expression and following text. The connector-count source of truth is `apps/web/src/lib/connector-count.ts` (`CONNECTOR_COUNT`); `scripts/generate_connector_count.py --check` is a CI gate that asserts the README contains the `**N click-and-connect data connectors**` phrase.
 - **`packages/aisoc-sandbox` — offline 30-second on-ramp.** Standalone simulator wrapping the agent graph with in-memory SQLite + deterministic LLM mode, designed so `pip install aisoc-sandbox && aisoc-sandbox demo` completes in <30 s with zero external deps. Ships five bundled scenarios (lateral-movement + four added in PR #368). Distinct from the full production LangGraph stack — keep it lightweight on purpose. Tested via `packages/aisoc-sandbox/tests/`.
 - **README + onramp CI gates.** `README.md` is capped at ≤250 lines (current target after PR #368 was 1,102 → 234). Heavy content lives in `RELEASES.md`, `ROADMAP.md`, `docs/architecture/overview.md`, and the docs portal. `.github/workflows/onramp-gates.yml` enforces four gates on every PR: (1) every CLI command shown in README either runs in CI or is explicitly marked "coming in v8.0", (2) `demo/hero.gif` + screencast assets exist on `main`, (3) README line count ≤250, (4) `aisoc-sandbox demo` cold-start. The matching local script lets contributors run the same checks. Advertised packages (`@aisoc/mcp`, `@aisoc/sdk`, `@aisoc/plugin-sdk`, `aisoc-cli`, `aisoc-sdk`, `aisoc-plugin-sdk`) are NOT yet published — README and docs use monorepo-local invocations and flag future commands as "coming in v8.0".
@@ -84,3 +83,61 @@
 - **Stateful stores + per-store tenant isolation.** Beyond Postgres/Redis the platform runs Kafka (Redpanda-compatible in CI: KRaft, no ZooKeeper), ClickHouse (event lake, table `aisoc.raw_events`), Neo4j (entity graph), and Qdrant (vector store in `services/threatintel` via `QdrantStore`, for IOC/actor embeddings). This complements the query-layer Postgres isolation on `/hunts` + `/cases`: ClickHouse scopes via `lake_sql.rewrite_for_tenant()` injecting a `tenant_id` predicate into user SQL; Neo4j via a `tenant_id` node-property filter; Redis via a `tenant:{tid}:` key-prefix; Kafka via the `X-Tenant-ID` header / `tenant_id` envelope with per-tenant downstream filtering; Qdrant via `tenant_id` in point payloads + a mandatory query filter (public feed intel is intentionally global, so scoping targets tenant-private data). Offline assertions live in `tests/isolation/`; a CI live-container replay seeds two tenants and asserts cross-tenant reads never leak (skips gracefully when containers are absent).
 - **Production event-flow spine + response posture.** The CI-gated production path is: Connectors → `services/ingest` (OCSF normalize) → Kafka `raw_events` → `services/fusion` (promote + fuse) → Postgres alerts + `services/realtime` WS; the fusion consumer validates event schema and routes poison events to a dead-letter queue (they were previously dropped silently). Default response/autonomy posture is **copilot / dry-run** (human approval required); SOAR executors return `simulated` results unless real vendor credentials are plumbed. Populating the ClickHouse lake and running the detection corpus against the live stream are tracked roadmap items (a lake-writer / detect worker), so live-stream detection may not be wired in a given checkout — verify before assuming it runs.
 - **Standing repo-maintenance loop — Dependabot + CodeQL gotchas.** The canonical repo carries frequent Dependabot PRs touching both `poetry.lock` (Python services) and `pnpm-lock.yaml` (JS workspaces); merging lockfile PRs one-by-one re-conflicts the siblings, so consolidate them into a few **re-locked batch PRs** (regenerate the locks locally, verify exact target versions, merge once) instead of dozens of serial rebases. CodeQL requires `codeql-action` `init` / `autobuild` / `analyze` to all run on the **same** version — when Dependabot splits a `codeql-action` bump across separate PRs the CodeQL gate fails, so combine all legs of that bump into one PR.
+
+## Code Development Principles
+
+### Organic Integration
+
+- Do not develop in isolation; integrate organically with existing code.
+- Reuse existing parameters, functions, variables, and modules whenever possible.
+- Keep the overall structure as consistent as possible with existing code patterns.
+
+### Sensitive Data Handling
+
+- Never hardcode sensitive data (e.g., API keys, secrets, passwords, or personal identifiable information).
+- Use environment variables or secure storage mechanisms.
+- Ensure sensitive data is properly sanitized/masked in logs and outputs.
+
+### Test Placement
+
+- New C++ test programs go in `test-app/`; register the target in `test-app/CMakeLists.txt` (executable + version + link libs, same pattern as existing targets).
+- Functional verification: `tools/reader_many.py`; smoke test: `build-*/bin/reader` with raw `.onnx` models (see §2).
+
+### Logging Conventions
+
+- Library code (`src/`): use the project logger (`spdlog::info/error/debug` with `{0}` placeholders); `std::cout` / `print` are for test apps only.
+- Log file path is config-driven (`log_file_path` in the JSON config), not hardcoded.
+
+### Core Architecture Principles (KISS, YAGNI, DRY, SOLID, SRP)
+
+- **KISS (Keep It Simple, Stupid)**: Keep designs and implementations as simple and straightforward as possible. Avoid unnecessary complexity or over-engineering.
+- **YAGNI (You Ain't Gonna Need It)**: Do not implement functionality or speculative abstractions until they are actually needed. Focus strictly on current requirements.
+- **SOLID & SRP**: Follow SOLID; keep components single-responsibility (DRY is enforced by §s reuse rule).
+
+### Parameter Type Specification
+
+- In **Python code only**, do not add explicit parameter type annotations to function signatures; document parameter meaning and behavior in the docstring instead. (C++ signatures keep their existing type declarations — this rule does not apply to C++ code.)
+
+### Concise Comments
+
+- Keep comments as brief, clear, and concise as possible.
+- Do not arbitrarily delete comments; updating them to reflect current code behavior is permitted (주석 임의로 삭제 금지, 단 최신화는 가능).
+
+### Strict Design Approval and Naming Confirmation
+
+- **Design Approval**: Perform design work before starting development or modifying features. Present the proposed design and obtain explicit user approval before proceeding with implementation. If requirements or implementation details change during development, present the revised design and receive explicit approval again before editing any code.
+
+  - **Required presentation template** (all sections mandatory):
+
+    ```text
+    [TARGET]      files / functions affected
+    [API/ARGS]    public API or parameter changes
+    [LOGIC]       execution-logic changes (before → after)
+    [STRUCT]       structural / architectural changes (if any)
+    [RISK]         anticipated failure modes / regression risks
+    ```
+- **Naming Confirmation**: Do not arbitrarily change or rename existing or user-modified variables, functions, constants, or parameters. If a name change is judged to be necessary or more appropriate, present the proposed name along with a clear explanation and reasoning, and obtain explicit user confirmation before making any code modifications.
+
+### Documentation
+
+- Document all changes and record details upon completion of development.

@@ -4,9 +4,9 @@ The repo ships ~870 curated rules under ``detections/<category>/*.yaml`` (cloud,
 identity, endpoint, network, application, data-exfil). Each is a plain native-
 format YAML file with an ``id: det-<category>-NNN`` key. This module walks the
 tree and upserts one row per rule so the corpus is visible and manageable from
-the web console at ``/detection`` — **without** touching the live fusion
-pipeline, which evaluates events against ``detection_ruleset.json`` and is not
-reconfigured by this sync.
+the web console at ``/detection``. The compiled ``match_when`` rules this sync
+writes are the single source of truth the live fusion pipeline evaluates, seeded
+into memory at fusion boot and kept in step via hot-reload events.
 
 Key design points (see the plan for the full rationale):
 
@@ -29,6 +29,7 @@ Nothing here is a new dependency; PyYAML is already pinned in ``services/api``.
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -40,6 +41,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.detection_rule import DetectionRule
+from app.services.detections.native_match_when import compile_native_to_match_when
 
 # Fixed namespace so the same native id always maps to the same UUIDv5 on any
 # machine / any re-run. It's a plain opaque seed — no security meaning.
@@ -195,6 +197,9 @@ class NativeRulesetReport:
     rows_inserted: int = 0
     rows_updated: int = 0
     rows_skipped: int = 0
+    compiled: int = 0
+    unsupported_stateful: int = 0
+    error: int = 0
     errors: list[NativeRuleError] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -203,8 +208,51 @@ class NativeRulesetReport:
             "rows_inserted": self.rows_inserted,
             "rows_updated": self.rows_updated,
             "rows_skipped": self.rows_skipped,
+            "compiled": self.compiled,
+            "unsupported_stateful": self.unsupported_stateful,
+            "error": self.error,
             "errors": [dict(e) for e in self.errors],
         }
+
+
+def _record_compile(
+    rule: DetectionRule,
+    raw: Any,
+    report: NativeRulesetReport,
+    rel: str,
+) -> None:
+    """Compile ``raw`` once and record the outcome on ``rule`` (per-file isolated).
+
+    Compilable rules get ``compiled_spec`` + ``compile_status='compiled'``.
+    Stateful / unsupported / parse-error rules get a ``compile_status`` +
+    ``compile_error`` and a per-file error entry so the operator sees the rule
+    is not live; the exception is swallowed so one bad native rule never aborts
+    the whole seed.
+    """
+    try:
+        if getattr(rule, "rule_type", None) == "native":
+            result = compile_native_to_match_when(raw)
+        else:
+            result = compile_sigma_to_match_when(raw)
+    except Exception:  # noqa: BLE001 -- per-file failure isolation
+        rule.compile_status = "unsupported_stateful"
+        rule.compile_error = "compile failed"
+        report.errors.append(NativeRuleError(path=rel, error="compile failed"))
+        return
+    rule.compile_status = result.status
+    rule.compile_error = result.error
+    if result.status == "compiled":
+        rule.compiled_spec = result.match_when
+    # Compile outcome is a metadata side-effect (not a structural row change,
+    # so ``rows_updated`` stays 0) but it must be reported so an operator can
+    # see how many rows are live vs quarantined.
+    if result.status == "compiled":
+        report.compiled += 1
+    elif result.status == "unsupported_stateful":
+        report.unsupported_stateful += 1
+    elif result.status == "error":
+        report.error += 1
+
 
 
 _NATIVE_CATEGORY_DIRS: frozenset[str] = frozenset(_NATIVE_CATEGORIES)
@@ -420,11 +468,35 @@ async def seed_native_ruleset(
             existing.mitre_techniques = _extract_mitre_techniques(data.get("tags"))
             existing.tags = list(data.get("tags") or [])
             existing.file_path = rel
-            existing.version = new_rule.version
+            # Read the prior body hash before the provenance block below is
+            # reset, so change-detection works across re-seeds.
+            prev_hash = (existing.provenance or {}).get("body_hash")
             existing.provenance = dict(new_rule.provenance)
             existing.rule_type = "native"
-            # ``status`` intentionally preserved.
+            # Refresh the verbatim on-disk body so the native compiler always
+            # runs against current text (a YAML edit on disk is reflected).
+            existing.rule_body = raw
+            # ``status`` intentionally preserved (operator ON/OFF toggle).
             report.rows_updated += 1
+            if not dry_run:
+                body_changed = prev_hash is None or prev_hash != hashlib.md5(raw.encode("utf-8")).hexdigest()
+                needs_recompile = (
+                    existing.compiled_spec is None
+                    or existing.compile_status in ("error", "pending", "unsupported_stateful")
+                    or prev_hash is None
+                    or body_changed
+                )
+                if needs_recompile:
+                    _record_compile(existing, raw, report, rel)
+                # Bump version + timestamp only when the on-disk body actually
+                # changed, so a re-seed that only recomputes an error/pending
+                # rule (same text) doesn't fabricate a new revision.
+                if body_changed:
+                    existing.version = (existing.version or 1) + 1
+                    existing.updated_at = datetime.now(UTC)
+                # Always persist the current body hash so the next re-seed can
+                # detect further changes, even when text is unchanged this run.
+                existing.provenance = {**(existing.provenance or {}), "body_hash": hashlib.md5(raw.encode("utf-8")).hexdigest()}
         else:
             new_rule.severity = _coerce_severity(data.get("severity"))
             new_rule.mitre_tactics = _extract_mitre_tactics(_extract_mitre_techniques(data.get("tags")))
@@ -432,6 +504,11 @@ async def seed_native_ruleset(
             new_rule.tags = list(data.get("tags") or [])
             new_rule.file_path = rel
             new_rule.rule_type = "native"
+            # Compile in memory so --dry-run surfaces compiled /
+            # unsupported_stateful / error counts too. The DB write stays guarded
+            # so dry-run never persists a row; fail-soft so one uncompilable rule
+            # is recorded (unsupported_stateful) rather than aborting the seed.
+            _record_compile(new_rule, raw, report, rel)
             if not dry_run:
                 session.add(new_rule)
             report.rows_inserted += 1

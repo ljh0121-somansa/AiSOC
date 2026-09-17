@@ -45,7 +45,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query, Response, status, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import text
+from sqlalchemy import ARRAY, UUID, bindparam, text
 
 from app.api.v1.deps import AuthUser, DBSession
 from app.core.logging import safe_log_value
@@ -1480,10 +1480,15 @@ async def auto_create_case(body: AutoCreateCaseRequest, request: Request, db: DB
                 SELECT * FROM aisoc_cases
                 WHERE tenant_id = :tenant_id
                   AND status IN ('open', 'investigating', 'in_progress', 'pending')
-                  AND (:aid = ANY(alert_ids) OR alert_ids ?| :aids)
+                  AND (:aid = ANY(alert_ids) OR alert_ids && :aids)
                 ORDER BY created_at DESC LIMIT 1
-            """).bindparams(tenant_id=tenant_uuid, aid=uuid.UUID(alert_ids[0]), aids=alert_ids)
+            """).bindparams(
+                bindparam("tenant_id", value=tenant_uuid),
+                bindparam("aid", value=aid),
+                bindparam("aids", value=[uuid.UUID(x) for x in alert_ids], type_=ARRAY(UUID)),
+            )
         )).fetchone()
+
         if existing_open_case:
             cid = existing_open_case.id
             curr_aids = [str(x) for x in (existing_open_case.alert_ids or [])]

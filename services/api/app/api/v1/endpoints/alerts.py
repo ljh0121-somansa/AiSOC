@@ -125,6 +125,11 @@ class AlertDetailResponse(AlertResponse):
     related_entities: list[RelatedEntity] = []
     mini_timeline: list[MiniTimelineEvent] = []
     recommended_actions: list[RecommendedAction] = []
+    # Raw OCSF event payload, persisted on the ``Alert`` row as a JSONB
+    # column. Surfaced on the detail DTO only (never the list DTO) so the
+    # Investigation Rail "Raw" tab renders the full event while paginated
+    # list payloads stay light.
+    raw_event: dict | None = None
 
 
 class AlertSnoozeRequest(BaseModel):

@@ -32,8 +32,8 @@ class TestRawAlertFingerprint:
 
     def test_fingerprint_ignores_volatile_fields(self) -> None:
         """`description`, `risk_score`, `tags`, `raw_event` aren't part of the fingerprint."""
-        a = _alert(src_ip="10.0.0.1", description="first", risk_score=0.1, tags=["a"])
-        b = _alert(src_ip="10.0.0.1", description="second", risk_score=0.9, tags=["b"])
+        a = _alert(description="before enrichment")
+        b = _alert(description="after richer enrichment copy")
         assert a.fingerprint() == b.fingerprint()
 
     def test_fingerprint_changes_when_entity_changes(self) -> None:

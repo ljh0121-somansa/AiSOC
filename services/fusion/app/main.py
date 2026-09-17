@@ -1,6 +1,7 @@
 import asyncio
 import os
 from contextlib import asynccontextmanager
+from typing import Any
 
 import redis.asyncio as aioredis
 from fastapi import FastAPI
@@ -17,12 +18,30 @@ from app.services.confidence import ConfidenceScorer
 from app.services.correlator import Correlator
 from app.services.deduplicator import Deduplicator
 from app.services.detection_engine import DetectionEngine
+from app.services.detection_reload import CHANNEL, listen_detection_reload, reconcile_from_postgres
 from app.services.entity_risk import EntityRiskEngine
 from app.services.fusion_engine import FusionEngine
 from app.services.lake_writer import LakeWriter
 from app.services.ueba_signal import UebaSignalCache
 from app.services.windowed_detection import WindowedDetectionEngine
 from app.workers.consumer import FusionWorker
+
+
+async def _start_detection_reload(
+    redis_client: Any,
+    detector: DetectionEngine | None,
+) -> None:
+    """Reconcile from PostgreSQL once, then stream hot-reload events forever.
+
+    If the detection engine is disabled or Postgres never comes up, the
+    reconciliation is skipped and only the Pub/Sub listener runs (best-effort —
+    one missing upstream must never wedge the service). Runs until cancelled.
+    """
+    if detector is None:
+        await listen_detection_reload(redis_client, detector)
+        return
+    await reconcile_from_postgres(settings.database_url, detector)
+    await listen_detection_reload(redis_client, detector)
 
 
 @asynccontextmanager
@@ -102,10 +121,26 @@ async def lifespan(app: FastAPI):
     )
     set_worker(worker)
 
+    # Phase 2 — live detection hot-reload. Load every compiled rule from the
+    # PostgreSQL source of truth *before* Kafka consumes, so the first events are
+    # evaluated against the populated map (fixes the boot race). Best-effort,
+    # bounded retries (see reconcile_from_postgres): Postgres unreachable after
+    # the budget raises to crash-restart rather than boot silent with 0 rules.
+    if detector is not None:
+        await reconcile_from_postgres(settings.database_url, detector)
+
     # Start Kafka worker as a background task
     worker_task = asyncio.create_task(worker.start())
     app.state.worker_task = worker_task
     app.state.redis = redis_client
+
+    # The listener then owns ongoing changes: the API publishes ``rules:reload``
+    # events that swap the rule in/out/up via the engine's Copy-on-Write
+    # registry with zero downtime and zero lock on the Kafka evaluate path.
+    detection_reload_task = asyncio.create_task(
+        _start_detection_reload(redis_client, detector)
+    )
+    app.state.detection_reload_task = detection_reload_task
 
     # Wave 1 — periodically distil disposition history into memory priors so
     # the confidence nudge stays current (default every 6h). Best-effort.
@@ -141,6 +176,8 @@ async def lifespan(app: FastAPI):
     worker_task.cancel()
     if memory_task is not None:
         memory_task.cancel()
+    if getattr(app.state, "detection_reload_task", None) is not None:
+        app.state.detection_reload_task.cancel()
     await redis_client.aclose()
     logger.info("Alert Fusion Service stopped")
 

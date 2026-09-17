@@ -116,9 +116,16 @@ function IOCBadge({ type, value, malicious }: { type: string; value: string; mal
 
 // ─── Detection Confidence ─────────────────────────────────────────────────────
 
+function formatConfidence(score: number): { pct: number; decimal: string } {
+  const isFraction = score <= 1 && score >= 0;
+  const pct = Math.round(isFraction ? score * 100 : score);
+  const decimal = (isFraction ? score : score / 100).toFixed(2);
+  return { pct, decimal };
+}
+
 function ConfidenceChip({ label, score }: { label: ConfidenceLabel; score?: number }) {
   const cfg = CONFIDENCE_CONFIG[label];
-  const pct = typeof score === 'number' ? Math.round(score * 100) : null;
+  const pct = typeof score === 'number' ? formatConfidence(score).pct : null;
   return (
     <span
       className={clsx(
@@ -440,11 +447,14 @@ export function ConfidenceExplainability({
           <div className="flex-1">
             <div className="flex items-baseline gap-3">
               <span className="text-sm font-semibold text-gray-100">{cfg.label}</span>
-              {typeof score === 'number' && (
-                <span className="text-xs font-mono text-gray-500">
-                  score {score.toFixed(2)} ({Math.round(score * 100)}%)
-                </span>
-              )}
+              {typeof score === 'number' && (() => {
+                const { pct, decimal } = formatConfidence(score);
+                return (
+                  <span className="text-xs font-mono text-gray-500">
+                    score {decimal} ({pct}%)
+                  </span>
+                );
+              })()}
             </div>
             <p className="text-xs text-gray-500 mt-0.5">{cfg.description}</p>
           </div>

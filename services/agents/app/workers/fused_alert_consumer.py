@@ -443,7 +443,7 @@ class FusedAlertTriageWorker:
                 ctx = {
                     "alert": state.raw_alert,
                     "severity": normalize_severity(state.raw_alert.get("severity")),
-                    "confidence": conf_val,
+                    "confidence": confidence,
                 }
                 matching_playbooks = PlaybookStore.default().find_matching("alert", ctx)
                 engine = PlaybookEngine()

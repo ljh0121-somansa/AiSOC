@@ -8,6 +8,8 @@ import useSWR from 'swr';
 import { clsx } from 'clsx';
 import toast from 'react-hot-toast';
 import {
+  ApiError,
+  authApi,
   detectionApi,
   detectionProposalsApi,
   type DetectionLanguage,
@@ -21,6 +23,7 @@ import { ErrorState } from '@/components/ui/ErrorState';
 import { ContextualActions } from '@/components/copilot/ContextualActions';
 import { SimpleRuleBuilder } from '@/components/detections/SimpleRuleBuilder';
 import { initMonacoEnv } from '@/lib/monaco-env';
+import { useTenant } from '@/components/layout/TenantProvider';
 
 
 const MonacoEditor = dynamic(
@@ -33,6 +36,26 @@ const MonacoEditor = dynamic(
     loading: () => <Skeleton className="h-full w-full" />,
   },
 );
+function getErrorMessage(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) {
+    if (err.body) {
+      try {
+        const parsed = JSON.parse(err.body);
+        if (parsed?.detail && typeof parsed.detail === 'string') {
+          return parsed.detail;
+        }
+      } catch {
+        /* not json */
+      }
+    }
+    return err.message || fallback;
+  }
+  if (err instanceof Error && err.message) {
+    return err.message;
+  }
+  return fallback;
+}
+
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -121,6 +144,15 @@ export function RuleEditor({ mode, ruleId }: RuleEditorProps) {
     () => (ruleId ? detectionApi.get(ruleId) : null),
     { revalidateOnFocus: false, shouldRetryOnError: false },
   );
+  // Authorization & built-in rule mutation restrictions
+  const { userRole } = useTenant();
+  const currentUser = authApi.currentUser();
+  const isPlatformAdmin =
+    userRole === 'platform_admin' || currentUser?.role === 'platform_admin';
+  const isBuiltinRestricted = Boolean(
+    mode === 'edit' && data?.isBuiltin && !isPlatformAdmin,
+  );
+
 
   // Form state
   const [name, setName] = useState('');
@@ -351,7 +383,12 @@ export function RuleEditor({ mode, ruleId }: RuleEditorProps) {
       }
     } catch (err) {
       console.error('Save failed', err);
-      toast.error('Backend unavailable — your changes were not persisted.');
+      toast.error(
+        getErrorMessage(
+          err,
+          'Backend unavailable — your changes were not persisted.',
+        ),
+      );
     } finally {
       setSaving(false);
     }
@@ -366,7 +403,7 @@ export function RuleEditor({ mode, ruleId }: RuleEditorProps) {
       router.push('/detection');
     } catch (err) {
       console.error('Delete failed', err);
-      toast.error('Could not delete rule');
+      toast.error(getErrorMessage(err, 'Could not delete rule'));
     }
   };
 
@@ -500,13 +537,29 @@ export function RuleEditor({ mode, ruleId }: RuleEditorProps) {
           <h1 className="truncate text-xl font-semibold text-gray-100">
             {mode === 'create' ? 'New rule' : (data?.name ?? 'Editing…')}
           </h1>
+          {data?.isBuiltin && (
+            <span className="rounded-md px-2 py-0.5 text-xs font-medium uppercase tracking-wide bg-purple-500/10 text-purple-400 border border-purple-500/20">
+              Built-in
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-2">
           {mode === 'edit' && (
             <button
               onClick={handleDelete}
-              className="rounded-md border border-red-500/30 bg-red-500/5 px-3 py-1.5 text-sm text-red-300 transition-colors hover:bg-red-500/10"
+              disabled={isBuiltinRestricted}
+              title={
+                isBuiltinRestricted
+                  ? 'Built-in platform rules can only be deleted by platform administrators'
+                  : undefined
+              }
+              className={clsx(
+                'rounded-md border border-red-500/30 bg-red-500/5 px-3 py-1.5 text-sm text-red-300 transition-colors',
+                isBuiltinRestricted
+                  ? 'cursor-not-allowed opacity-50'
+                  : 'hover:bg-red-500/10',
+              )}
             >
               Delete
             </button>
@@ -536,16 +589,44 @@ export function RuleEditor({ mode, ruleId }: RuleEditorProps) {
           </button>
           <button
             onClick={handleSave}
-            disabled={saving}
+            disabled={saving || isBuiltinRestricted}
+            title={
+              isBuiltinRestricted
+                ? 'Built-in platform rules can only be modified by platform administrators'
+                : undefined
+            }
             className={clsx(
               'inline-flex items-center gap-2 rounded-md bg-blue-500 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors',
-              saving ? 'opacity-60' : 'hover:bg-blue-600',
+              saving || isBuiltinRestricted
+                ? 'cursor-not-allowed opacity-50'
+                : 'hover:bg-blue-600',
             )}
           >
             {saving ? 'Saving…' : mode === 'create' ? 'Create rule' : 'Save'}
           </button>
         </div>
       </div>
+
+      {isBuiltinRestricted && (
+        <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+          <div className="flex items-center gap-2">
+            <svg
+              className="h-4 w-4 shrink-0 text-amber-400"
+              viewBox="0 0 20 20"
+              fill="currentColor"
+            >
+              <path
+                fillRule="evenodd"
+                d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z"
+                clipRule="evenodd"
+              />
+            </svg>
+            <span>
+              This is a platform built-in rule. Only platform administrators can modify it directly. Use <strong>&quot;Propose for review&quot;</strong> to suggest updates.
+            </span>
+          </div>
+        </div>
+      )}
 
       {/*
         Eval verdict card — surfaces the outcome of the most recent

@@ -37,7 +37,7 @@ bin/
 !terraform.tfvars.example
 
 # Python
-.venv/
+.venv*/
 venv/
 .eval-test-venv/
 .mypy_cache/
@@ -131,3 +131,16 @@ services/api/marketplace/
 # `-current.yaml` file is a runtime artefact that varies by environment.
 schemas/graph-schema-current.yaml
 
+# Local harness / agent config (per-machine, never committed)
+.pi/
+.harness/
+
+# Hypercortex design docs (local, not part of the product)
+hypercortex/
+
+# Local harness / agent config (per-machine, never committed)
+.pi/
+.harness/
+
+# Hypercortex design docs (local, not part of the product)
+hypercortex/

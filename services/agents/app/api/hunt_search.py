@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 import structlog
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 logger = structlog.get_logger(__name__)
 
@@ -42,6 +42,20 @@ class HuntQuery(BaseModel):
     timeRange: str | None = "24h"
     indices: list[str] | None = None
     limit: int = 100
+    startTime: str | None = None
+    endTime: str | None = None
+
+    @field_validator("startTime", "endTime")
+    @classmethod
+    def validate_iso_timestamp(cls, v):
+        """Accept only ISO-8601 strings; reject malformed input at request time."""
+        if v is None:
+            return None
+        try:
+            datetime.fromisoformat(v.rstrip("Z"))
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Invalid ISO-8601 timestamp: {v}") from exc
+        return v
 
 
 class HuntHit(BaseModel):
@@ -129,9 +143,14 @@ def _synthetic_hits(query: str, limit: int) -> list[dict[str, Any]]:
 
 # ---------------------------------------------------------------------------
 
-def _build_clickhouse_query_for_non_sql(query_str: str, limit: int) -> str:
+def _build_clickhouse_query_for_non_sql(query_str, limit, start_iso=None, end_iso=None):
     """Extract search terms from non-SQL queries (ES|QL, KQL, SPL)
-    and filter ClickHouse raw_payload.
+    and filter ClickHouse raw_payload with optional time-range bounds.
+
+    :param query_str: Raw non-SQL query string.
+    :param limit: Maximum number of rows to return.
+    :param start_iso: Validated ISO-8601 string for the lower event_time bound.
+    :param end_iso: Validated ISO-8601 string for the upper event_time bound.
     """
     raw_quotes = re.findall(r'["\']([^"\']+)["\']', query_str)
     search_terms = []
@@ -186,13 +205,29 @@ def _build_clickhouse_query_for_non_sql(query_str: str, limit: int) -> str:
 
     where_clauses = []
     for term in search_terms[:5]:
-        escaped_term = term.replace("'", "\'")
+        escaped_term = term.replace("\\", "\\\\").replace("'", "\\'")
         where_clauses.append(f"raw_payload ILIKE '%{escaped_term}%'")
 
-    where_str = ""
+    time_conditions = []
+    if start_iso:
+        time_conditions.append(
+            f"event_time >= parseDateTime64BestEffort('{start_iso}', 3, 'UTC')"
+        )
+    if end_iso:
+        time_conditions.append(
+            f"event_time <= parseDateTime64BestEffort('{end_iso}', 3, 'UTC')"
+        )
+
+    where_parts = []
     if where_clauses:
-        op = " OR " if " or " in query_str.lower() else " AND "
-        where_str = f"WHERE {op.join(where_clauses)} "
+        # Word-boundary match: "or" must be a standalone token, not a substring
+        # of words like "corporate" or "error".
+        is_or = bool(re.search(r"\bor\b", query_str, re.IGNORECASE))
+        op = " OR " if is_or else " AND "
+        where_parts.append(f"({op.join(where_clauses)})")
+    where_parts.extend(time_conditions)
+
+    where_str = f"WHERE {' AND '.join(where_parts)} " if where_parts else ""
 
     return (
         f"SELECT event_id, event_time, connector_type, user_name, "
@@ -283,7 +318,59 @@ async def _execute_clickhouse_query(
             "ClickHouse query failed or returned no results",
             error=str(exc),
         )
-        return []
+
+
+def _prepare_sql_query(sql_query, start_iso=None, end_iso=None):
+    """Rewrite user SQL against aisoc.raw_events with a time-bounded 'events' CTE.
+
+    :param sql_query: Raw SQL query string from the user.
+    :param start_iso: Validated ISO-8601 lower event_time bound.
+    :param end_iso: Validated ISO-8601 upper event_time bound.
+    """
+    clean_sql = sql_query.strip().rstrip(";")
+
+    # If the user already constrains event_time, respect their intent: keep
+    # their bounds and just fix the alias. The frontend preset cannot supersede
+    # an explicit in-query window.
+    if re.search(r"\bevent_time\b", clean_sql, re.IGNORECASE):
+        return re.sub(
+            r"\bFROM\s+events\b",
+            "FROM aisoc.raw_events",
+            clean_sql,
+            flags=re.IGNORECASE,
+        )
+
+    time_conditions = []
+    if start_iso:
+        time_conditions.append(
+            f"event_time >= parseDateTime64BestEffort('{start_iso}', 3, 'UTC')"
+        )
+    if end_iso:
+        time_conditions.append(
+            f"event_time <= parseDateTime64BestEffort('{end_iso}', 3, 'UTC')"
+        )
+
+    where_clause = (
+        f"WHERE {' AND '.join(time_conditions)}" if time_conditions else ""
+    )
+
+    # Map the 'events' alias to the real table and add the two column names
+    # STARTERS.sql selects, so both host_name and command_line resolve.
+    cte_body = (
+        "events AS (\n"
+        "  SELECT *,\n"
+        "    src_hostname AS host_name,\n"
+        "    JSONExtractString(raw_payload, 'command_line') AS command_line\n"
+        "  FROM aisoc.raw_events\n"
+        f"  {where_clause}\n"
+        ")"
+    )
+    # The user may have already written their own CTE (WITH ... AS). Preserve it
+    # and re-join with a comma instead of a second WITH to avoid a syntax error.
+    if re.match(r"^WITH\s+", clean_sql, re.IGNORECASE):
+        with_stripped = re.sub(r"^WITH\s+", "", clean_sql, flags=re.IGNORECASE).strip()
+        return f"WITH {cte_body},\n {with_stripped}"
+    return f"WITH {cte_body}\n{clean_sql}"
 
 
 # ---------------------------------------------------------------------------
@@ -300,12 +387,21 @@ async def hunt_search(query: HuntQuery) -> HuntResponse:
 
     lang = query.language.lower()
     if lang == "sql":
-        hits_list = await _execute_clickhouse_query(query.query, query.limit)
+        sql = _prepare_sql_query(
+            query.query,
+            start_iso=query.startTime,
+            end_iso=query.endTime,
+        )
+        hits_list = await _execute_clickhouse_query(sql, query.limit)
     else:
         # Non-SQL dialects (esql, kql, spl, lucene): extract terms & filter ClickHouse
-        sql = _build_clickhouse_query_for_non_sql(query.query, query.limit)
+        sql = _build_clickhouse_query_for_non_sql(
+            query.query,
+            query.limit,
+            start_iso=query.startTime,
+            end_iso=query.endTime,
+        )
         hits_list = await _execute_clickhouse_query(sql, query.limit)
-
     hits_list = [HuntHit(**h) for h in (hits_list or [])]
 
     took_ms = int((time.monotonic() - start) * 1000)

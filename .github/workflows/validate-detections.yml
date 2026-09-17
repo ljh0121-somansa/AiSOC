@@ -40,12 +40,11 @@ jobs:
         # diverge from what the engine actually runs.
         run: python3 scripts/detection_truth_table.py --check
 
-      - name: Verify exported detection ruleset is current (Phase A2)
-        # The fusion live-detection engine loads
-        # services/fusion/app/data/detection_ruleset.json (native match_when
-        # specs). Fails if the specs changed without re-exporting, so the live
-        # worker can't silently drift from the committed corpus.
-        run: python3 scripts/export_detection_ruleset.py --check
+      # NOTE: the exported detection_ruleset.json artifact was removed as part of
+      # unifying the live detection ruleset to the PostgreSQL source of truth.
+      # Matcher parity over the canonical spec table is verified by the vendored
+      # matcher parity test (services/fusion/tests/test_detection_matcher_parity.py)
+      # instead of the now-deleted export-detection-ruleset drift check.
 
       - name: Count rules by severity
         if: always()

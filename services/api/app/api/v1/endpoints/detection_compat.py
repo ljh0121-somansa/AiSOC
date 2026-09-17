@@ -34,6 +34,7 @@ from sqlalchemy import and_, or_, select, update
 
 from app.api.v1.deps import AuthUser, DBSession, require_permission
 from app.models.detection_rule import DetectionRule
+from app.services.detections.compiler import apply_compile_and_reload
 from app.services.rule_engine import execute_rule
 from app.core.mitre import resolve_tactic
 from app.core.mitre import total_techniques_count
@@ -240,6 +241,7 @@ async def create_rule_compat(
     db.add(rule)
     await db.commit()
     await db.refresh(rule)
+    await apply_compile_and_reload(rule, db)
     return _to_frontend(rule)
 
 
@@ -293,6 +295,11 @@ async def update_rule_compat(
             detail="Rule not found or cannot be modified",
         )
 
+    # Capture the pre-update state before the setattr loop below mutates
+    # `rule` (the compile hook runs after db.refresh() and would otherwise
+    # only see the new values).
+    prev_status = rule.status
+    prev_body = rule.rule_body
     updates: dict[str, Any] = {}
     if body.name is not None:
         updates["name"] = body.name
@@ -319,6 +326,12 @@ async def update_rule_compat(
         await db.execute(update(DetectionRule).where(DetectionRule.id == rule_id).values(**updates))
         await db.commit()
         await db.refresh(rule)
+        await apply_compile_and_reload(
+            rule,
+            db,
+            prev_status=prev_status,
+            prev_body_changed=(body.body is not None and body.body != prev_body),
+        )
     return _to_frontend(rule)
 
 

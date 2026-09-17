@@ -9,7 +9,7 @@
 
 # 도커 컴포즈 파일 경로 지정
 # COMPOSE_PATH="infra/compose/docker-compose.dev.yml"
-COMPOSE_PATH="docker-compose.yml"
+COMPOSE_PATH="docker-compose_server.yml"
 CONTAINER_PREFIX="aisoc-dev1"
 
 # TTY 지원 여부에 따라 Docker 실행 옵션 동적 선택 (스크립트 및 자동화 대응)

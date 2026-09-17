@@ -165,3 +165,70 @@ func TestCanonicalEnvelopeIdpMapsToAuthentication(t *testing.T) {
 		t.Errorf("okta canonical class_uid = %v, want 3002 (Authentication)", ev.OcsfEvent["class_uid"])
 	}
 }
+
+// Elastic Search pulls raw ECS firewall/network logs. Their canonical OCSF model
+// is Network Activity (4001, category 4), not a Security Finding (2001). Keeping
+// low/medium events out of the finding auto-promoter (class_uid//1000==2) lets the
+// AiSOC detection ruleset own the gate; genuine high/critical events still promote
+// via the severity_id>=4 gate. The connector's flat fields must be re-keyed onto
+// proper OCSF Network Activity nested objects (src_endpoint.dst_endpoint.port,
+// connection_info.protocol_name), per the elasticFieldMap.
+func TestCanonicalEnvelopeElasticSearchMapsToNetworkActivity(t *testing.T) {
+	n := newTestNormalizer()
+	ev, err := n.Normalize(&RawEvent{
+		ConnectorID: "elastic_search", ConnectorType: "elastic_search",
+		TenantID: "11111111-1111-1111-1111-111111111111", ReceivedAt: "2026-08-02T00:00:00Z",
+		Payload: map[string]interface{}{
+			"source": "elastic_search",
+			"external_id": "FW-4471",
+			"title": "Blocked DNS To Foreign Resolver",
+			"severity": "medium",
+			"src_ip": "203.0.113.42",
+			"dst_ip": "10.1.1.5",
+			"dst_port": 53,
+			"src_geo": "RU",
+			"network_protocol": "dns",
+			"hostname": "fw-perimeter-01",
+			"raw_event": map[string]interface{}{},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Normalize error: %v", err)
+	}
+	ocsf := ev.OcsfEvent
+	if ocsf["class_uid"] != 4001 {
+		t.Errorf("class_uid = %v, want 4001 (Network Activity)", ocsf["class_uid"])
+	}
+	if ocsf["category_uid"] != 4 {
+		t.Errorf("category_uid = %v, want 4 (network)", ocsf["category_uid"])
+	}
+	if ocsf["class_name"] != "Network Activity" {
+		t.Errorf("class_name = %v, want Network Activity", ocsf["class_name"])
+	}
+	// Nested endpoint mapping (elasticFieldMap), not flat top-level keys.
+	if se, ok := ocsf["src_endpoint"].(map[string]interface{}); !ok || se["ip"] != "203.0.113.42" {
+		t.Errorf("src_endpoint.ip not mapped: %v", ocsf["src_endpoint"])
+	}
+	if de, ok := ocsf["dst_endpoint"].(map[string]interface{}); !ok || de["ip"] != "10.1.1.5" || de["port"] != 53 {
+		t.Errorf("dst_endpoint.ip/port not mapped: %v", ocsf["dst_endpoint"])
+	}
+	if loc, ok := ocsf["src_endpoint"].(map[string]interface{})["location"].(map[string]interface{}); !ok || loc["country"] != "RU" {
+		t.Errorf("src_endpoint.location.country not mapped: %v", ocsf["src_endpoint"])
+	}
+	if ci, ok := ocsf["connection_info"].(map[string]interface{}); !ok || ci["protocol_name"] != "dns" {
+		t.Errorf("connection_info.protocol_name not mapped: %v", ocsf["connection_info"])
+	}
+	// Native severity preserved (medium -> severity_id 3).
+	if ocsf["severity_id"] != 3 {
+		t.Errorf("severity_id = %v, want 3 (medium preserved)", ocsf["severity_id"])
+	}
+	if ocsf["severity"] != "medium" {
+		t.Errorf("severity = %v, want medium", ocsf["severity"])
+	}
+	// Flat field keys must NOT be left at the top level (they are re-keyed).
+	for _, k := range []string{"src_ip", "dst_ip", "dst_port", "network_protocol", "src_geo"} {
+		if _, present := ocsf[k]; present {
+			t.Errorf("flat key %q leaked into OCSF top level; expected nested mapping", k)
+		}
+	}
+}

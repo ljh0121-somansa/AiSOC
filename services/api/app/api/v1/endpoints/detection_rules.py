@@ -12,6 +12,7 @@ from app.api.v1.deps import AuthUser, DBSession, require_permission
 from app.models.detection_rule import DetectionRule
 from app.services.backtest import backtest_rule, build_backtest_sql, rows_to_events
 from app.services.mssp_rule_resolver import resolve_effective_rules
+from app.services.detections.compiler import apply_compile_and_reload, broadcast_rule_reload
 from app.services.rule_engine import execute_rule, run_hunt
 
 router = APIRouter(prefix="/rules", tags=["detection_rules"])
@@ -181,6 +182,7 @@ async def create_rule(
     db.add(rule)
     await db.commit()
     await db.refresh(rule)
+    await apply_compile_and_reload(rule, db)
     return DetectionRuleResponse.model_validate(rule)
 
 
@@ -237,6 +239,11 @@ async def update_rule(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Rule not found or cannot be modified",
         )
+    # Capture the pre-update state before the setattr loop below mutates
+    # `rule` (the compile hook runs after db.refresh() and would otherwise
+    # only see the new values).
+    prev_status = rule.status
+    prev_body = rule.rule_body
     updates: dict = {}
     for field in ["name", "description", "rule_body", "status", "severity", "confidence", "tags"]:
         val = getattr(request, field, None)
@@ -251,6 +258,12 @@ async def update_rule(
         await db.execute(update(DetectionRule).where(DetectionRule.id == rule_id).values(**updates))
         await db.commit()
         await db.refresh(rule)
+        await apply_compile_and_reload(
+            rule,
+            db,
+            prev_status=prev_status,
+            prev_body_changed=(request.rule_body is not None and request.rule_body != prev_body),
+        )
     return DetectionRuleResponse.model_validate(rule)
 
 
@@ -286,6 +299,9 @@ async def delete_rule(
         )
     await db.delete(rule)
     await db.commit()
+    # Remove the rule from Fusion's live map so deletion is effective now,
+    # not only after the next reconcile pass.
+    await broadcast_rule_reload(rule, "DISABLE")
 
 
 # ─── Rule Execution Endpoint ──────────────────────────────────────────────────

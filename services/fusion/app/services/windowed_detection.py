@@ -29,7 +29,7 @@ import structlog
 
 from app.models.alert import AlertSeverity, RawAlert
 from app.services.detection_engine import DetectionHit
-from app.services.detection_matcher import matches
+from app.services.detection_matcher import format_match_condition, matches
 from app.services.provenance import extract_provenance
 
 logger = structlog.get_logger()
@@ -56,6 +56,12 @@ class WindowRule:
     group_by: str
     threshold: int
     window_seconds: int
+    # Distinct-value cardinality gate. For each named field, the count of distinct
+    # values seen in-window must reach distinct_threshold before the rule fires.
+    # Guards against single-category floods (e.g. SSH brute-force = one dst_port)
+    # masquerading as multi-target scans. Empty tuple => no gate.
+    cardinality_fields: tuple[str, ...] = ()
+    distinct_threshold: int = 0
 
 
 # Built-in windowed rules. Intentionally small + high-signal; the corpus can grow
@@ -90,9 +96,33 @@ _BUILTIN_RULES: tuple[WindowRule, ...] = (
         severity="medium",
         category="network",
         mitre=["T1046"],
+        # Un-suffixed fields are plain-equality clauses in the matcher DSL.
         match_when={"event_type": "network"},
         group_by="src_ip",
         threshold=50,
+        window_seconds=120,
+        # Only fire when the traffic spans many distinct ports. Repeated hits on a
+        # single port (e.g. SSH brute-force) share one dst_port and must NOT be
+        # labelled a scan; that is caught by wd-firewall-ssh-abuse instead.
+        cardinality_fields=("dst_port",),
+        distinct_threshold=15,
+    ),
+    WindowRule(
+        id="wd-firewall-ssh-abuse",
+        name="Repetitive firewall SSH drops: SSH brute-force / abuse",
+        severity="high",
+        category="firewall",
+        mitre=["T1110.001", "T1078"],
+        # Firewall logs preserve L4 packet semantics (event_type=network), not an
+        # authentication failure, so a single-port flood of SSH drop events matches
+        # here instead of wd-bruteforce (which requires event_type=authentication).
+        match_when={
+            "event_type": "network",
+            "dst_port": 22,
+            "event_action": "drop",
+        },
+        group_by="src_ip",
+        threshold=30,
         window_seconds=120,
     ),
 )
@@ -143,35 +173,67 @@ class WindowedDetectionEngine:
                 entity = fields.get(rule.group_by)
                 if not entity:
                     continue
-                if await self._observe_and_check(rule, tenant, str(entity), now):
-                    hits.append(
-                        DetectionHit(
-                            rule_id=rule.id,
-                            name=rule.name,
-                            severity=rule.severity,
-                            category=rule.category,
-                            mitre=list(rule.mitre),
-                        )
+                fired, count = await self._observe_and_check(rule, tenant, str(entity), now, fields)
+                if not fired:
+                    continue
+                hits.append(
+                    DetectionHit(
+                        rule_id=rule.id,
+                        name=rule.name,
+                        severity=rule.severity,
+                        category=rule.category,
+                        mitre=list(rule.mitre),
+                        match_count=count,
+                        entity_key=str(entity),
                     )
+                )
             except Exception as exc:  # noqa: BLE001 — one rule/Redis error must not wedge detection
                 logger.debug("windowed_detection.rule_error", rule=rule.id, error=str(exc))
         return hits
 
-    async def _observe_and_check(self, rule: WindowRule, tenant: str, entity: str, now: float) -> bool:
+    async def _observe_and_check(
+        self,
+        rule: WindowRule,
+        tenant: str,
+        entity: str,
+        now: float,
+        fields: dict[str, Any],
+    ) -> tuple[bool, int]:
         key = f"{self._prefix}:{tenant}:{rule.id}:{entity}"
         member = uuid.uuid4().hex
         await self._redis.zadd(key, {member: now})
-        await self._redis.zremrangebyscore(key, 0, now - rule.window_seconds)
-        # Expire the key a window after the last event so idle entities are reaped.
+        # Track distinct values of each cardinality field as a sorted set:
+        # member=value, score=now. Re-adding the same value refreshes its score
+        # (single dedup) while keeping the latest in-window timestamp.
+        for cfield in rule.cardinality_fields:
+            value = fields.get(cfield)
+            if value is None:
+                continue
+            ckey = f"{key}:card:{cfield}"
+            await self._redis.zadd(ckey, {str(value): now})
+            await self._redis.zremrangebyscore(
+                ckey, 0, now - rule.window_seconds,
+            )
+        # Expire member and per-cardinality sets a window after their last event.
         await self._redis.expire(key, rule.window_seconds + 60)
+        for cfield in rule.cardinality_fields:
+            await self._redis.expire(
+                f"{key}:card:{cfield}", rule.window_seconds + 60,
+            )
         count = await self._redis.zcard(key)
+        # Cardinality gate: distinct window-count per field. Members outside the
+        # window were pruned above, so ZCARD equals distinct values in-window.
+        for cfield in rule.cardinality_fields:
+            distinct = await self._redis.zcard(f"{key}:card:{cfield}")
+            if distinct < rule.distinct_threshold:
+                return False, count
         if count < rule.threshold:
-            return False
+            return False, count
         # Fire once per window: a short-lived marker suppresses re-firing on every
         # subsequent event until the window rolls.
         fired_key = f"{key}:fired"
         already = await self._redis.set(fired_key, "1", nx=True, ex=rule.window_seconds)
-        return bool(already)
+        return bool(already), count
 
     def build_alert(self, message: dict[str, Any], hit: DetectionHit) -> RawAlert | None:
         ocsf = message.get("ocsf_event") or {}
@@ -181,12 +243,34 @@ class WindowedDetectionEngine:
         except (ValueError, TypeError):
             return None
         fields = self._fields(message)
+        matched_rule = next(
+            (r for r in self._rules if r.id == hit.rule_id), None
+        )
+        cond = format_match_condition(
+            matched_rule.match_when if matched_rule is not None else {}, fields
+        )
+        # Resolve rule attributes statically, dynamic metrics at runtime (defensive).
+        if matched_rule is not None:
+            threshold = matched_rule.threshold
+            window = matched_rule.window_seconds
+            group_by = matched_rule.group_by
+        else:
+            threshold = "N"
+            window = "N"
+            group_by = "entity"
+        count = getattr(hit, "match_count", None) or getattr(hit, "count", None) or f">={threshold}"
+        entity = getattr(hit, "entity_key", None) or getattr(hit, "group_key", None) or group_by
+        description = (
+            f"{hit.name} ({hit.severity}): "
+            f"{entity} exceeded threshold ({count}/{threshold} in {window}s). "
+            f"Condition: {cond}."
+        )
         connector_id, connector_type, class_uid = extract_provenance(message, ocsf)
         return RawAlert(
             tenant_id=tenant_id,
             source=f"detection:{hit.rule_id}",
             title=hit.name,
-            description=f"Windowed detection {hit.rule_id} ({hit.category}) crossed its threshold.",
+            description=description,
             severity=_SEVERITY_MAP.get(hit.severity, AlertSeverity.MEDIUM),
             src_ip=fields.get("src_ip"),
             hostname=fields.get("hostname") or fields.get("host"),

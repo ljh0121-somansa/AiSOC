@@ -104,7 +104,7 @@ async def run_investigation(state: InvestigationState) -> InvestigationState:
                 action_type="capture_forensics",
                 description="Initiate memory and disk forensic acquisition",
                 risk_level=ActionRisk.LOW,
-                target=state.raw_alert.get("hostname", "unknown"),
+                target=state.raw_alert.get("hostname") or "unknown",
                 requires_approval=True,
                 rationale="Exfiltration/C2 stage detected — preserve evidence",
             )

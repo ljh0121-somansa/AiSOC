@@ -77,11 +77,14 @@ async def _run(args: argparse.Namespace) -> None:
 
     print(f"[seed] mode={'dry-run' if args.dry_run else 'write'}")
     print(f"[seed] categories={categories or 'all six native'}")
-    print(f"[seed] rows_read:     {report.rows_read}")
-    print(f"[seed] rows_inserted: {report.rows_inserted}")
-    print(f"[seed] rows_updated:  {report.rows_updated}")
-    print(f"[seed] rows_skipped:  {report.rows_skipped}")
-    print(f"[seed] errors:        {len(report.errors)}")
+    print(f"[seed] rows_read:        {report.rows_read}")
+    print(f"[seed] rows_inserted:    {report.rows_inserted}")
+    print(f"[seed] rows_updated:     {report.rows_updated}")
+    print(f"[seed] rows_skipped:     {report.rows_skipped}")
+    print(f"[seed] compiled:         {report.compiled}")
+    print(f"[seed] unsupported_stateful: {report.unsupported_stateful}")
+    print(f"[seed] error:           {report.error}")
+    print(f"[seed] errors:          {len(report.errors)}")
     for err in report.errors:
         print(f"[seed]   ! {err.path}: {err.error}")
     verb = "would update" if args.dry_run else "updated"

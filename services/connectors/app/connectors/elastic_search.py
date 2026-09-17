@@ -28,6 +28,31 @@ from app.federated.translators import to_esql
 logger = structlog.get_logger()
 
 
+_EVENT_TYPE_MAP = {
+    "firewall": "network",
+    "auth": "authentication",
+    "authentication": "authentication",
+    "dns": "network",
+    "process": "process",
+    "login": "authentication",
+}
+
+
+def _event_type(event: dict[str, Any], raw: dict[str, Any]) -> str | None:
+    """Normalized event_type for windowed detection rules.
+
+    Falls back to ``event.category`` / a flat ``event_type`` key so a payload
+    that names its category still maps onto the field rules key on (e.g. a
+    ``firewall`` category becomes ``network`` for the port-scan rule).
+    """
+    if isinstance(event.get("type"), str) and event.get("type"):
+        return event["type"]
+    cat = str(event.get("category") or raw.get("event.category") or "").lower()
+    if cat in _EVENT_TYPE_MAP:
+        return _EVENT_TYPE_MAP[cat]
+    return cat or None
+
+
 class ElasticSearchConnector(BaseConnector):
     connector_id = "elastic_search"
     connector_name = "Elastic Search"
@@ -58,7 +83,7 @@ class ElasticSearchConnector(BaseConnector):
                     "string",
                     "Default Index Pattern",
                     required=False,
-                    default="*",
+                    default="firewall-logs",
                 ),
                 Field(
                     "ssl_verify",
@@ -91,11 +116,12 @@ class ElasticSearchConnector(BaseConnector):
         api_key: str | None = None,
         username: str | None = None,
         password: str | None = None,
-        index: str = "logs-*",
+        index: str = "firewall-logs",
         ssl_verify: bool = True,
     ):
         if not api_key and not (username and password):
             raise ValueError("Elastic Search connector requires either api_key or username+password")
+
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._username = username
@@ -133,8 +159,8 @@ class ElasticSearchConnector(BaseConnector):
                 return {"success": False, "connector": self.connector_id, "error": "Connection failed"}
 
     async def fetch_alerts(self, since_seconds: int = 300) -> list[dict[str, Any]]:
-        # Elastic Security stores detection rule alerts in this hidden index pattern.
-        esql = f"FROM * | WHERE @timestamp > NOW() - {since_seconds} seconds | LIMIT 100"
+        # Poll the configured index (default: firewall-logs) for recent events.
+        esql = f"FROM {self._index} | WHERE @timestamp > NOW() - {since_seconds} seconds | LIMIT 200"
         async with httpx.AsyncClient(timeout=60.0, verify=self._ssl_verify) as client:
             resp = await client.post(
                 f"{self._base_url}/_query",
@@ -183,39 +209,75 @@ class ElasticSearchConnector(BaseConnector):
         return [dict(zip(columns, row, strict=False)) for row in values]
 
     def normalize(self, raw: dict[str, Any]) -> dict[str, Any]:
-        
+
         severity_map = {
             "trace": "info", "debug": "info", "info": "info", "informational": "info", "notice": "info",
             "warn": "medium", "warning": "medium", "low": "low", "medium": "medium",
             "err": "high", "error": "high", "high": "high",
             "crit": "critical", "critical": "critical", "alert": "critical", "emerg": "critical", "fatal": "critical",
         }
-        # 1. ES|QL 결과에서 평탄화(Flat)된 키값 가져오기
+        # ECS telemetry arrives nested (source.ip, destination.port, event.action, ...),
+        # but the AiSOC detection matcher only sees flat top-level keys, so re-key every
+        # nested ECS field into a top-level alert field. Fall back to a flat dotted key
+        # for deployments that already emit a flat shape.
+
+        def _nested(*keys):
+            cur = raw
+            for k in keys:
+                if not isinstance(cur, dict):
+                    return None
+                cur = cur.get(k)
+
+        def _flat(*keys):
+            # Same precedence as `_nested`, but reading a flat dotted key
+            # (``source.ip``) for deployments that already emit a flat shape.
+            for k in keys:
+                if k in raw and raw.get(k) is not None:
+                    return raw.get(k)
+            return None
+
+        event = raw.get("event") if isinstance(raw.get("event"), dict) else {}
+        source = raw.get("source") if isinstance(raw.get("source"), dict) else {}
+        destination = raw.get("destination") if isinstance(raw.get("destination"), dict) else {}
+        network = raw.get("network") if isinstance(raw.get("network"), dict) else {}
+        rule = raw.get("rule") if isinstance(raw.get("rule"), dict) else {}
+        host = raw.get("host") if isinstance(raw.get("host"), dict) else {}
+        log = raw.get("log") if isinstance(raw.get("log"), dict) else {}
+
         raw_severity = str(
-            raw.get("log.level") or raw.get("level") or raw.get("severity") or "info"
+            raw.get("log.level") or log.get("level") or event.get("severity_label") or _flat("event.severity_label") or raw.get("level") or event.get("severity") or _flat("event.severity") or "info"
         ).lower()
 
-        external_id = str(raw.get("event.id") or raw.get("_id") or "")
-        title = str(raw.get("message") or raw.get("event.action") or "Elasticsearch Event")
-
-        # 3. 위협 분석 정보
-        mitre_techniques = raw.get("threat.technique.id") or []
+        mitre_techniques = event.get("threat_technique_ids") or event.get("threat.technique.id") or raw.get("threat.technique.id") or []
 
         return {
             "source": self.connector_id,
-            "external_id": external_id,
-            "title": title[:100],
-            "description": str(raw.get("log.original") or raw.get("message") or ""),
-            "severity":severity_map.get(raw_severity, "medium"),
-            "src_ip": raw.get("source.ip") or raw.get("client.ip"),
-            "dst_ip": raw.get("destination.ip") or raw.get("server.ip"),
-            "hostname": raw.get("host.hostname") or raw.get("host.name"),
-            "username": raw.get("user.name") or raw.get("username"),
-            "file_hash": raw.get("file.hash.sha256") or raw.get("process.hash.sha256"),
-            "domain": raw.get("url.domain") or raw.get("destination.domain"),
-            "url": raw.get("url.full") or raw.get("url.original"),
+            "external_id": str(event.get("id") or raw.get("_id") or f"{rule.get('id') or ''}@{raw.get('@timestamp') or ''}"),
+            "title": str(raw.get("message") or event.get("action") or "Elasticsearch Event")[:100],
+            "description": str(log.get("original") or raw.get("message") or ""),
+            # Native severity preserved (no forced low): genuine high/critical
+            # firewall events auto-promote via the severity_id>=4 gate;
+            # low/medium fall through to the AiSOC detection ruleset.
+            "severity": severity_map.get(raw_severity, "medium"),
+            "src_ip": source.get("ip") or _nested("client", "ip") or _flat("source.ip", "client.ip"),
+            "dst_ip": destination.get("ip") or _nested("server", "ip") or _flat("destination.ip", "server.ip"),
+            "dst_port": destination.get("port") or _flat("destination.port"),
+            "src_geo": source.get("country_iso_code"),
+            "hostname": host.get("name") or host.get("hostname") or _flat("host.name"),
+            "network_transport": network.get("transport") or _flat("network.transport"),
+            "network_protocol": network.get("protocol") or _flat("network.protocol"),
+            "rule_id": rule.get("id") or _flat("rule.id"),
+            "rule_name": rule.get("name") or _flat("rule.name"),
+            "event_action": event.get("action") or _flat("event.action"),
+            "event_dataset": event.get("dataset") or _flat("event.dataset"),
+            # Windowed detection rules (brute-force, spray, port-scan) key on
+            # these top-level keys, so publish a normalized event_type/outcome
+            # even when the raw payload lacks them.
+            "event_type": _event_type(event, raw),
+            "outcome": event.get("outcome") or None,
+            "user": event.get("actor", {}).get("name") or source.get("user"),
             "mitre_techniques": mitre_techniques if isinstance(mitre_techniques, list) else [mitre_techniques],
-            "risk_score": raw.get("event.risk_score") or 0,
+            "risk_score": event.get("risk_score") or 0,
             "raw_event": raw,
-            "created_at": raw.get("@timestamp") or raw.get("event.ingested"),
+            "created_at": raw.get("@timestamp") or event.get("ingested"),
         }

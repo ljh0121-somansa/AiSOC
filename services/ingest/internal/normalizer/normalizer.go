@@ -126,7 +126,7 @@ var connectorProfiles = map[string]connectorProfile{
 	},
 	"splunk": {
 		product:   OcsfProduct{Name: "Splunk Enterprise", VendorName: "Splunk"},
-		classUID:  4001,
+		classUID:  2001,
 		className: "Security Finding",
 		fieldMap: map[string]string{
 			"_time":                          "time",
@@ -167,52 +167,14 @@ var connectorProfiles = map[string]connectorProfile{
 			"urgency":                        "severity",
 			"raw_event.severity":             "severity",
 			"raw_event.raw_event.severity":   "severity",
+			"title":       "message",
+			"external_id": "finding.uid",
+			"src_ip":      "src_endpoint.ip",
+			"hostname":    "device.name",
 		},
 		severityMap: map[string]int{
 			"critical": 5, "high": 4, "medium": 3, "low": 2, "informational": 1, "info": 1,
 			"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFORMATIONAL": 1, "INFO": 1,
-		},
-	},
-	// splunk — connector type emitted by SplunkConnector (#528). Its
-	// fetch_alerts already returns a canonical envelope (external_id / title /
-	// severity / src_ip / hostname / created_at + the original row under
-	// raw_event), so the field map reads those lowercase canonical keys, NOT
-	// raw Splunk fields. Class 2001 (Security Finding, category 2) means the
-	// fusion promoter promotes a notable as a vendor-asserted finding
-	// regardless of severity, so a Medium notable is never silently dropped.
-	"splunk": {
-		product:   OcsfProduct{Name: "Splunk", VendorName: "Splunk"},
-		classUID:  2001,
-		className: "Security Finding",
-		fieldMap: map[string]string{
-			"title":       "message",
-			"external_id": "finding.uid",
-			"src_ip":      "src_endpoint.ip",
-			"hostname":    "device.name",
-		},
-		severityMap: map[string]int{
-			"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "informational": 1,
-		},
-	},
-	// splunk — connector type emitted by SplunkConnector (#528). Its
-	// fetch_alerts already returns a canonical envelope (external_id / title /
-	// severity / src_ip / hostname / created_at + the original row under
-	// raw_event), so the field map reads those lowercase canonical keys, NOT
-	// raw Splunk fields. Class 2001 (Security Finding, category 2) means the
-	// fusion promoter promotes a notable as a vendor-asserted finding
-	// regardless of severity, so a Medium notable is never silently dropped.
-	"splunk": {
-		product:   OcsfProduct{Name: "Splunk", VendorName: "Splunk"},
-		classUID:  2001,
-		className: "Security Finding",
-		fieldMap: map[string]string{
-			"title":       "message",
-			"external_id": "finding.uid",
-			"src_ip":      "src_endpoint.ip",
-			"hostname":    "device.name",
-		},
-		severityMap: map[string]int{
-			"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "informational": 1,
 		},
 	},
 	"okta_system_log": {
@@ -274,74 +236,6 @@ var connectorProfiles = map[string]connectorProfile{
 		},
 		severityMap: map[string]int{
 			"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "informational": 1,
-		},
-	},
-	"elastic_search": {
-		product:   OcsfProduct{Name: "Elasticsearch", VendorName: "Elastic"},
-		classUID:  2001, // Security Finding
-		className: "Security Finding",
-		fieldMap: map[string]string{
-			// 1. 식별자 및 시간 (finding.uid ➔ external_id / event_id 로 변경)
-			"external_id":           "external_id",
-			"raw_event.external_id": "external_id",
-			"raw_event.event.id":    "external_id",
-			"raw_event._id":         "external_id",
-			"created_at":            "time",
-			"raw_event.created_at":  "time",
-			"raw_event.@timestamp":  "time",
-
-			// 2. 제목 및 본문
-			"title":                  "message",
-			"raw_event.title":        "message",
-			"raw_event.message":      "message",
-			"description":            "raw_data",
-			"raw_event.description":  "raw_data",
-			"raw_event.log.original": "raw_data",
-
-			// 3. 네트워크 IP 정보
-			"src_ip":                   "src_endpoint.ip",
-			"raw_event.src_ip":         "src_endpoint.ip",
-			"raw_event.source.ip":      "src_endpoint.ip",
-			"raw_event.client.ip":      "src_endpoint.ip",
-			"dst_ip":                   "dst_endpoint.ip",
-			"raw_event.dst_ip":         "dst_endpoint.ip",
-			"raw_event.destination.ip": "dst_endpoint.ip",
-
-			// 4. 호스트 및 계정 정보
-			"hostname":            "device.name",
-			"raw_event.hostname":   "device.name",
-			"raw_event.host.name":  "device.name",
-			"username":            "actor.user.name",
-			"raw_event.username":  "actor.user.name",
-			"raw_event.user.name": "actor.user.name",
-
-			// 5. 파일, 도메인, URL
-			"file_hash":                 "file.hash",
-			"raw_event.file_hash":        "file.hash",
-			"raw_event.file.hash.sha256": "file.hash",
-			"domain":                    "url.hostname",
-			"raw_event.domain":          "url.hostname",
-			"url":                       "url.url_string",
-			"raw_event.url":             "url.url_string",
-
-			// 6. 심도 및 리스크
-			"severity":             "severity",
-			"raw_event.severity":   "severity",
-			"risk_score":           "risk_score",
-			"raw_event.risk_score": "risk_score",
-
-			// 7. 프로세스 및 파일 상세
-			"raw_event.process.name":       "process.name",
-			"raw_event.process.executable": "process.file.path",
-			"raw_event.file.name":         "file.name",
-			"raw_event.file.path":         "file.path",
-		},
-		severityMap: map[string]int{
-			"fatal": 6, "critical": 5, "crit": 5, "high": 4, "error": 4, "err": 4,
-			"medium": 3, "warn": 3, "warning": 3, "low": 2, "info": 1, "informational": 1,
-			"debug": 1, "trace": 1,
-			"FATAL": 6, "CRITICAL": 5, "CRIT": 5, "HIGH": 4, "ERROR": 4, "ERR": 4,
-			"MEDIUM": 3, "WARN": 3, "WARNING": 3, "LOW": 2, "INFO": 1, "INFORMATIONAL": 1,
 		},
 	},
 }
@@ -410,6 +304,21 @@ var _canonicalFieldMap = map[string]string{
 	"actor":       "actor.user.name",
 }
 
+// elasticFieldMap maps the flat fields the elastic_search connector emits
+// (see ElasticSearchConnector.normalize) onto proper OCSF Network Activity
+// (class 4001) nested objects, using the field names defined by schema.ocsf.io
+// — the shared _canonicalFieldMap above is the finding-oriented subset and
+// does not express network endpoints / connection_info / firewall_rule.
+var elasticFieldMap = map[string]string{
+	"title":            "message",
+	"src_ip":           "src_endpoint.ip",
+	"src_geo":          "src_endpoint.location.country",
+	"dst_ip":           "dst_endpoint.ip",
+	"dst_port":         "dst_endpoint.port",
+	"network_protocol": "connection_info.protocol_name",
+	"hostname":         "device.name",
+}
+
 // canonicalClassByConnector overrides the default Security Finding class for
 // connector types whose canonical alerts are better modeled as another OCSF
 // class (identity providers -> Authentication 3002).
@@ -422,6 +331,12 @@ var canonicalClassByConnector = map[string]struct {
 	"auth0":        {3002, "Authentication"},
 	"duo_security": {3002, "Authentication"},
 	"onepassword":  {3002, "Authentication"},
+	// elastic_search pulls raw ECS firewall/network logs. Their canonical OCSF
+	// model is Network Activity (4001), not a Security Finding (2001).
+	// Keeps low/medium firewall events out of the finding auto-promoter
+	// (class_uid//1000==2) so the AiSOC detection ruleset owns the gate;
+	// genuine high/critical events still promote via the severity_id>=4 gate.
+	"elastic_search": {4001, "Network Activity"},
 }
 
 func isCanonicalEnvelope(p map[string]interface{}) bool {
@@ -442,11 +357,15 @@ func canonicalProfile(connectorType string) connectorProfile {
 	if name == "" {
 		name = "Connector"
 	}
+	fieldMap := _canonicalFieldMap
+	if connectorType == "elastic_search" {
+		fieldMap = elasticFieldMap
+	}
 	return connectorProfile{
 		product:     OcsfProduct{Name: name, VendorName: name},
 		classUID:    classUID,
 		className:   className,
-		fieldMap:    _canonicalFieldMap,
+		fieldMap:    fieldMap,
 		severityMap: _canonicalSeverityMap,
 	}
 }

@@ -201,6 +201,15 @@ jobs:
       # locally if this check fails.
       - name: Verify vendored narrative builder is in sync
         run: python scripts/sync_vendored_narrative.py --check
+      # Same story for the live detection matcher. It lives canonically under
+      # services/fusion/app/services/detection_matcher.py and is mirrored into
+      # services/api/app/_vendor/detection_matcher.py so the api-service transpiler
+      # sigma_match_when.py compiles against the exact operator set it must run
+      # under — a drift would silently emit grammar the matcher rejects. This
+      # guardrail keeps the two in lockstep. Re-run
+      # `python scripts/sync_vendored_detection_matcher.py` locally if it fails.
+      - name: Verify vendored match_when matcher is in sync
+        run: python scripts/sync_vendored_detection_matcher.py --check
       # Phase 1.1 — the registry at
       # `services/connectors/app/connectors/__init__.py` is the single source
       # of truth for the "N connectors" claim. The check verifies that:

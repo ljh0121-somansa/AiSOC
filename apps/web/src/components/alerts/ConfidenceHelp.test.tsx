@@ -255,6 +255,18 @@ describe('ConfidenceFactorBar and ConfidenceExplainability UI Components', () =>
     expect(screen.getByText('no TI match')).toBeInTheDocument();
   });
 
+  it('formats integer confidence score (e.g. 78 from API) as 78% without 100x magnification', () => {
+    render(
+      <ConfidenceExplainability
+        label="high"
+        score={78}
+        rationale={sampleFactors}
+      />
+    );
+    expect(screen.getByText(/score 0\.78 \(78%\)/)).toBeInTheDocument();
+    expect(screen.queryByText(/7800%/)).not.toBeInTheDocument();
+  });
+
   it('opens factor tooltip with scoring rules and reason on click', async () => {
     const user = userEvent.setup();
     render(<ConfidenceFactorBar factor={sampleFactors[0]} />);

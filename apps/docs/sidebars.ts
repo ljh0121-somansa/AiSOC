@@ -104,6 +104,7 @@ const sidebars: SidebarsConfig = {
         "connectors/zeek_suricata",
         "connectors/syslog_cef",
         "connectors/llm_usage",
+        "connectors/elastic_search",
       ],
     },
     {

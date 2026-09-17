@@ -640,6 +640,11 @@ function RuleCard({ rule, selected, onSelect, onToggle }: RuleCardProps) {
             <h3 className="truncate text-sm font-semibold text-gray-100 group-hover:text-blue-300">
               {rule.name}
             </h3>
+            {rule.isBuiltin && (
+              <span className="rounded-md px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide bg-purple-500/10 text-purple-400 border border-purple-500/20">
+                Built-in
+              </span>
+            )}
             <span
               className={clsx(
                 'rounded-md px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ring-1',

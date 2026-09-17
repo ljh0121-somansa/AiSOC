@@ -863,10 +863,10 @@ function RuleLineageSection({ lineage }: { lineage: RuleLineage }) {
           {lineage.rule_language && (
             <Tag label="Language" value={lineage.rule_language} />
           )}
-          {lineage.rule_confidence !== null && (
+          {lineage.rule_confidence !== null && typeof lineage.rule_confidence === 'number' && (
             <Tag
               label="Rule confidence"
-              value={`${lineage.rule_confidence}%`}
+              value={`${lineage.rule_confidence <= 1 && lineage.rule_confidence > 0 ? Math.round(lineage.rule_confidence * 100) : Math.round(lineage.rule_confidence)}%`}
             />
           )}
           <Tag

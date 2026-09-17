@@ -5,9 +5,11 @@ but only ran in CI fixture-replay — **nothing evaluated them against the live
 event stream**, so telemetry that wasn't a vendor-asserted finding (the
 promoter's job) never became an alert.
 
-This engine closes that. It loads the exported native ruleset
-(``app/data/detection_ruleset.json``, produced by
-``scripts/export_detection_ruleset.py``) and evaluates each ingested event's
+This engine closes that. At fusion boot the engine is seeded from the PostgreSQL
+``detection_rules`` table (the single source of truth; see
+:func:`app.services.detection_reload.reconcile_from_postgres`), and live edits
+from the web console are applied afterwards via
+:meth:`DetectionEngine.apply_reload`. It then evaluates each ingested event's
 recovered raw fields against every relevant rule's ``match_when`` (via the
 vendored :func:`app.services.detection_matcher.matches`). A match becomes a
 :class:`DetectionHit` that the fusion consumer turns into a ``RawAlert`` and
@@ -30,19 +32,16 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import structlog
 
 from app.models.alert import AlertSeverity, RawAlert
-from app.services.detection_matcher import matches
+from app.services.detection_matcher import matches, format_match_condition
 from app.services.provenance import extract_provenance
 
 logger = structlog.get_logger()
-
-_RULESET_PATH = Path(__file__).resolve().parent.parent / "data" / "detection_ruleset.json"
 
 _SEVERITY_MAP = {
     "critical": AlertSeverity.CRITICAL,
@@ -60,6 +59,10 @@ class DetectionHit:
     severity: str
     category: str
     mitre: list[str]
+    # Windowed-engine only: the runtime count that crossed threshold and the
+    # entity key it was grouped under (populated by windowed_detection.evaluate).
+    match_count: int | None = None
+    entity_key: str | None = None
 
 
 def _get(obj: Any, *path: str) -> Any:
@@ -75,11 +78,21 @@ class DetectionEngine:
     """Evaluates the native executable corpus against live events."""
 
     def __init__(self, rules: list[dict[str, Any]] | None = None) -> None:
-        self._rules: list[dict[str, Any]] = rules if rules is not None else _load_ruleset()
+        # Rule registry is a dict keyed by rule["id"] with Copy-on-Write swap
+        # (see apply_reload): the worker's evaluate() path reads the map
+        # pointer, the hot-reload listener mutates a fresh copy, so no lock is
+        # needed and evaluation stays pure and synchronous.
+        #
+        # The Postgres ``detection_rules`` table is the single source of truth:
+        # the map starts empty here and is populated at startup by
+        # :func:`app.services.detection_reload.reconcile_from_postgres`, so fusion
+        # never re-reads the deleted JSON artifact. ``rules`` is accepted only for
+        # tests that want to inject a corpus directly.
+        self._rules_map: dict[str, dict[str, Any]] = {r["id"]: r for r in (rules or [])}
 
     @property
     def rule_count(self) -> int:
-        return len(self._rules)
+        return len(self._rules_map)
 
     def _candidates(self, product: str) -> list[dict[str, Any]]:
         # Correctness-first routing: evaluate the whole corpus against every
@@ -88,8 +101,9 @@ class DetectionEngine:
         # any product-based pre-filter risks silently dropping a real match.
         # The matcher short-circuits on the first absent field, so a full pass
         # over ~800 rules is cheap in practice (a benign event touches almost
-        # none of them past the first clause).
-        return self._rules
+        # none of them past the first clause). Reads the *current* map pointer,
+        # so a hot-reload swap is visible to this event stream on the next event.
+        return list(self._rules_map.values())
 
     @staticmethod
     def _raw_fields(ocsf: dict[str, Any]) -> dict[str, Any]:
@@ -129,8 +143,50 @@ class DetectionEngine:
                 logger.debug("detection_engine.rule_error", rule=rule.get("id"), error=str(exc))
         return hits
 
+    def apply_reload(self, action: str, rule_id: str, match_when: dict[str, Any] | None = None, metadata: dict | None = None) -> None:
+        """Hot-reload one rule with Copy-on-Write semantics.
+
+        A fresh dict is built with the requested mutation, then the instance
+        pointer is atomically reassigned. The Kafka consumer only ever holds a
+        reference to the map it resolved at event dispatch, so an in-flight
+        evaluate() is never affected, and no lock is needed: the next event
+        resolves the newest map. Unknown actions/ids are rejected so the
+        broadcaster can't silently drop or corrupt a rule.
+
+        ``match_when`` is required for CREATE/UPDATE (the new spec) and
+        ignored for DISABLE (which just removes the id).
+        """
+        if action not in ("CREATE", "UPDATE", "DISABLE"):
+            raise ValueError(f"unknown reload action: {action!r}")
+        if action == "DISABLE":
+            new_map = dict(self._rules_map)
+            new_map.pop(rule_id, None)
+        else:
+            if match_when is None:
+                raise ValueError(f"{action} requires match_when")
+            meta = (metadata or {}).copy()
+            meta.setdefault("name", rule_id)
+            meta.setdefault("severity", "medium")
+            meta.setdefault("category", "custom")
+            new_map = dict(self._rules_map)
+            new_map[rule_id] = {
+                "id": rule_id,
+                "name": meta["name"],
+                "severity": meta["severity"],
+                "category": meta["category"],
+                "match_when": match_when,
+            }
+        self._rules_map = new_map
+
     def build_alert(self, message: dict[str, Any], hit: DetectionHit) -> RawAlert | None:
-        """Turn a detection hit into a RawAlert for the fusion pipeline."""
+        """Turn a detection hit into a RawAlert for the fusion pipeline.
+
+        The description names the rule, its severity, the MITRE technique
+        count, and the actual field/values that matched the rule's
+        ``match_when`` (recovered from the event's raw fields), so an analyst
+        opening the alert sees *why* it fired instead of the generic
+        "fired on ingested telemetry" placeholder.
+        """
         ocsf = message.get("ocsf_event") or {}
         tenant_raw = message.get("tenant_id") or ocsf.get("tenant_uid")
         try:
@@ -138,17 +194,59 @@ class DetectionEngine:
         except (ValueError, TypeError):
             return None
         connector_id, connector_type, class_uid = extract_provenance(message, ocsf)
+        fields = self._raw_fields(ocsf)
+        rule_spec = self._rules_map.get(hit.rule_id, {})
+        cond = format_match_condition(rule_spec.get("match_when") or {}, fields)
+        # MITRE ID resolution: handle both list and string types defensively.
+        if isinstance(hit.mitre, list):
+            mitre_str = ", ".join(hit.mitre) if hit.mitre else hit.category
+        elif isinstance(hit.mitre, str) and hit.mitre.strip():
+            mitre_str = hit.mitre.strip()
+        else:
+            mitre_str = hit.category
+
+        # Entity context recovered from the raw event for SOC-facing descriptions.
+        host = (
+            _get(ocsf, "device", "name")
+            or _get(ocsf, "device", "hostname")
+            or _get(ocsf, "hostname")
+        )
+        src = _get(ocsf, "src_endpoint", "ip")
+        dst = _get(ocsf, "dst_endpoint", "ip")
+        user = _get(ocsf, "actor", "user", "name")
+
+        network_str = None
+        if src and dst:
+            network_str = f"src={src} -> dst={dst}"
+        elif src:
+            network_str = f"src={src}"
+        elif dst:
+            network_str = f"dst={dst}"
+
+        entities = []
+        if host:
+            entities.append(f"host={host}")
+        if network_str:
+            entities.append(network_str)
+        if user:
+            entities.append(f"user={user}")
+
+        entity_str = f"Entity: {', '.join(entities)}" if entities else ""
+
+        description = f"{hit.name} ({hit.severity}, {mitre_str}): {cond}."
+        if entity_str:
+            description = f"{description} {entity_str}"
         return RawAlert(
             tenant_id=tenant_id,
             source=f"detection:{hit.rule_id}",
             title=hit.name,
-            description=f"Detection rule {hit.rule_id} ({hit.category}) fired on ingested telemetry.",
+            description=description,
             severity=_SEVERITY_MAP.get(hit.severity, AlertSeverity.MEDIUM),
             src_ip=_get(ocsf, "src_endpoint", "ip"),
             dst_ip=_get(ocsf, "dst_endpoint", "ip"),
             hostname=_get(ocsf, "device", "name"),
             username=_get(ocsf, "actor", "user", "name"),
-            mitre_techniques=hit.mitre,
+            mitre_techniques=list(hit.mitre) if isinstance(hit.mitre, list) else [hit.mitre],
             raw_event=ocsf,
             connector_id=connector_id,
             connector_type=connector_type,
@@ -158,16 +256,3 @@ class DetectionEngine:
         )
 
 
-@lru_cache(maxsize=1)
-def _load_ruleset() -> list[dict[str, Any]]:
-    if not _RULESET_PATH.exists():
-        logger.warning("detection_engine.ruleset_missing", path=str(_RULESET_PATH))
-        return []
-    try:
-        data = json.loads(_RULESET_PATH.read_text(encoding="utf-8"))
-        rules = data.get("rules") or []
-        logger.info("detection_engine.ruleset_loaded", count=len(rules))
-        return rules
-    except (ValueError, OSError) as exc:
-        logger.error("detection_engine.ruleset_load_failed", error=str(exc))
-        return []
