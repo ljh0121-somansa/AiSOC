@@ -100,6 +100,7 @@ async def _get_openai_reply(
 
     try:
         from app.llm.contract import safe_chat_completions_request
+        from app.llm.factory import chat_completions_url, resolve_model_alias
 
         messages: list[dict[str, str]] = [
             {
@@ -120,9 +121,10 @@ async def _get_openai_reply(
 
         body = await safe_chat_completions_request(
             api_key=api_key,
-            model=os.getenv("OPENAI_MODEL_NAME",""),
+            model=os.getenv("OPENAI_MODEL_NAME") or resolve_model_alias("copilot"),
             messages=messages,
-            max_tokens=4000,
+            url=chat_completions_url(),
+            max_tokens=int(os.getenv("AISOC_COPILOT_MAX_TOKENS", "4000")),
         )
         raw_content = body["choices"][0]["message"]["content"]
         clean_content = raw_content.split("</think>", 1)[-1]

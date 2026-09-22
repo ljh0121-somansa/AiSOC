@@ -677,7 +677,7 @@ ensure_repo() {
   # Verify candidate is actually AiSOC and not some other repo that
   # happened to ship an install.sh.
   if [ -n "$candidate" ] \
-     && grep -q '"name": "aisoc"' "$candidate/package.json" 2>/dev/null; then
+     && grep -q '"name": "aisoc' "$candidate/package.json" 2>/dev/null; then
     REPO_ROOT="$candidate"
     ok "Using existing AiSOC clone at $REPO_ROOT"
     return 0
@@ -685,7 +685,7 @@ ensure_repo() {
 
   # Mode B: clone fresh.
   if [ -d "$CLONE_DIR" ]; then
-    if [ -d "$CLONE_DIR/.git" ] && grep -q '"name": "aisoc"' "$CLONE_DIR/package.json" 2>/dev/null; then
+    if [ -d "$CLONE_DIR/.git" ] && grep -q '"name": "aisoc' "$CLONE_DIR/package.json" 2>/dev/null; then
       info "Updating existing clone at $CLONE_DIR..."
       ( cd "$CLONE_DIR" && git fetch --quiet origin && git checkout --quiet "$BRANCH" && git pull --ff-only --quiet ) \
         || warn "git pull failed; using whatever's on disk."

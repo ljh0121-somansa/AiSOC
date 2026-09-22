@@ -1,8 +1,8 @@
 {
-  "name": "aisoc",
+  "name": "aisoc-monorepo",
   "version": "1.0.0",
   "private": true,
-  "description": "AiSOC — Open-source AI-powered Security Operations Center",
+  "description": "AiSOC — Open-source AI-powered Security Operations Center (monorepo root). The publishable CLI package `aisoc` lives at packages/aisoc-lite.",
   "license": "MIT",
   "author": "AiSOC contributors",
   "workspaces": [
@@ -41,15 +41,18 @@
     "aisoc:demo:logs": "docker compose -f infra/compose/docker-compose.demo.yml logs -f",
     "aisoc:acceptance": "tsx scripts/aisoc-acceptance.ts",
     "aisoc:acceptance:cold": "tsx scripts/aisoc-acceptance.ts --cold",
+    "aisoc:selfplay": "cd services/purple-team && python3 -m app.adversary.canned",
+    "aisoc:selfplay:json": "cd services/purple-team && python3 -m app.adversary.canned --json",
+    "aisoc:memory:export": "cd services/fusion && python3 -m app.memory.cli",
     "demo:public": "bash scripts/demo-public.sh",
     "demo:public:tunnel-only": "bash scripts/demo-public.sh --skip-stack",
     "demo:public:setup": "bash infra/cloudflare/tunnel.sh"
   },
   "devDependencies": {
-    "@types/node": "^25.9.2",
+    "@types/node": "^26.1.1",
     "prettier": "^3.9.5",
     "tsx": "^4.23.1",
-    "turbo": "^2.10.4",
+    "turbo": "^2.10.7",
     "typescript": "^6.0.3"
   },
   "engines": {

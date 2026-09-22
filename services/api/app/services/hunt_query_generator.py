@@ -119,7 +119,8 @@ async def generate_queries_tiered(
                         "response_format": {"type": "json_object"},
                     },
                 )
-            resp.raise_for_status()
+            if resp.is_error:
+                resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"]
 
             # Defensive cleaning of potential markdown wrapping inside content

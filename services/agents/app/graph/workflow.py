@@ -14,7 +14,7 @@ import structlog
 from langgraph.graph import END, StateGraph
 
 from app.agents.attack_path_agent import run_attack_path
-from app.agents.auto_triage_agent import run_auto_triage
+from app.agents.auto_triage_agent import AutoTriageError, run_auto_triage
 from app.agents.enrichment_agent import run_enrichment
 from app.agents.investigation_agent import run_investigation
 from app.agents.triage_agent import run_triage
@@ -36,7 +36,15 @@ def _from_dict(d: dict) -> InvestigationState:
 
 async def auto_triage_node(state: dict) -> dict:
     s = _from_dict(state)
-    s = await run_auto_triage(s)
+    try:
+        s = await run_auto_triage(s)
+    except AutoTriageError as exc:
+        # LLM/parse failure (issue #571): never terminate on a null verdict —
+        # escalate through the full pipeline (deterministic triage runs next).
+        logger.warning("graph.auto_triage_failed_escalating", error=str(exc), incident_id=str(s.incident_id))
+        s.add_finding(f"Auto-triage LLM unavailable ({exc}) — escalating to full pipeline")
+        if s.status is AgentStatus.COMPLETED:
+            s.status = AgentStatus.RUNNING
     return s.to_dict()
 
 
@@ -113,5 +121,30 @@ def build_investigation_graph() -> StateGraph:
     return graph.compile()
 
 
-# Module-level compiled graph (singleton)
+def build_escalation_graph() -> StateGraph:
+    """The post-triage escalation pipeline (issue #569).
+
+    Shares the SAME node implementations as the full graph but skips the
+    auto-triage entry node — used by the Kafka auto-triage worker, which has
+    already produced a governed verdict, to route escalated alerts (TP /
+    low-confidence / needs_review) through enrichment → investigation →
+    attack-path without re-triaging.
+
+    Flow: triage ──► enrichment ──► investigation ──► attack_path ──► END
+    """
+    graph = StateGraph(dict)
+    graph.add_node("triage", triage_node)
+    graph.add_node("enrichment", enrichment_node)
+    graph.add_node("investigation", investigation_node)
+    graph.add_node("attack_path", attack_path_node)
+    graph.set_entry_point("triage")
+    graph.add_edge("triage", "enrichment")
+    graph.add_edge("enrichment", "investigation")
+    graph.add_edge("investigation", "attack_path")
+    graph.add_edge("attack_path", END)
+    return graph.compile()
+
+
+# Module-level compiled graphs (singletons)
 investigation_graph = build_investigation_graph()
+escalation_graph = build_escalation_graph()

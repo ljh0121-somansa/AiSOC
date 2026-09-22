@@ -64,6 +64,10 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
+      // @aisoc/report-card ships dist-based exports (built in the Docker image
+      // + turbo ^build). vitest runs without a prior build, so resolve it from
+      // source here — the package is pure TS with no build-time transform.
+      '@aisoc/report-card': path.resolve(__dirname, '../../packages/report-card/src/index.ts'),
     },
   },
 });

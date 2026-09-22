@@ -84,6 +84,11 @@ services:
     latency_p95_ms: 2000
     golden_signals: [traffic, errors]
     description: Atomic/Caldera adversary emulation + coverage.
+  mesh:
+    availability_target: 0.99
+    latency_p95_ms: 500
+    golden_signals: [latency, traffic, errors]
+    description: Federated threat-intel mesh hub (hashed IOC sightings + verdict signatures, k-anonymity enforced).
   mcp:
     availability_target: 0.99
     latency_p95_ms: 2000

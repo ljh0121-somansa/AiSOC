@@ -63,6 +63,23 @@ If you operate AiSOC, please review:
 - [`services/api/app/core/security.py`](services/api/app/core/security.py) and [`services/api/app/auth/`](services/api/app/auth/) for our auth, RBAC, and SSO primitives
 - [`services/api/app/middleware/`](services/api/app/middleware/) for rate limiting, audit logging, and request hardening
 
+## Federated Threat Intel Mesh disclosure
+
+The mesh (`services/mesh/`) is **opt-in** and privacy-preserving by design. It
+shares only hashed IOC sightings (`SHA-256` of the normalized indicator — never
+the raw value) and aggregate verdict signatures (category + connector +
+technique + verdict distribution — never entities, tenant data, or free text).
+Privacy is enforced by k-anonymity (consensus revealed only at `>= k` distinct
+instances, default 5), per-instance Ed25519 signing (so one actor can't inflate
+consensus), tenant/rule-level opt-out, and an outbound audit log; `mesh preview`
+shows the exact payload before sharing is enabled. The full threat model is in
+[`docs/architecture/mesh.md`](docs/architecture/mesh.md).
+
+If you believe the mesh leaks more than the above (e.g. a raw IOC or entity is
+recoverable from a shared artifact, k-anonymity can be bypassed, or a signature
+can be forged), please treat it as a **high-severity** report and use private
+vulnerability reporting — do not open a public issue.
+
 ## Bounty
 
 AiSOC is an open-source project and does not currently operate a paid bounty program. We deeply appreciate responsible reports and will credit researchers in advisories and the hall of fame.

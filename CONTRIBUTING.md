@@ -324,6 +324,17 @@ Please use the GitHub issue tracker. Include:
 - Expected vs actual behavior
 - Relevant logs
 
+## Help spread the word
+
+Amplification is a contribution too. The in-repo [launch kit](marketing/launch/)
+has ready-to-use materials — a Show HN draft, a demo-video shot list, Product
+Hunt copy, six technical blog outlines (each ending in a reproducible command),
+and a category-level comparison dossier — plus a [press kit](docs/press/) with
+boilerplate and the logo kit. Everything is written to two rules: no
+superlatives, and synthetic-vs-measured is always labelled. If you write about
+AiSOC, verify each claim against the [benchmark page](apps/docs/docs/benchmark.md)
+first.
+
 ## License
 
 By contributing, you agree that your contributions will be licensed under the MIT License.

@@ -115,7 +115,7 @@ function Find-RepoRoot {
         (Test-Path (Join-Path $selfDir 'infra/compose/docker-compose.demo.yml')) -and
         (Test-Path (Join-Path $selfDir 'package.json'))) {
         $pkg = Get-Content (Join-Path $selfDir 'package.json') -Raw -ErrorAction SilentlyContinue
-        if ($pkg -match '"name"\s*:\s*"aisoc"') {
+        if ($pkg -match '"name"\s*:\s*"aisoc') {
             return $selfDir
         }
     }
@@ -128,7 +128,7 @@ function Find-RepoRoot {
     if ((Test-Path (Join-Path (Get-Location) 'infra/compose/docker-compose.demo.yml')) -and
         (Test-Path (Join-Path (Get-Location) 'package.json'))) {
         $pkg = Get-Content (Join-Path (Get-Location) 'package.json') -Raw -ErrorAction SilentlyContinue
-        if ($pkg -match '"name"\s*:\s*"aisoc"') {
+        if ($pkg -match '"name"\s*:\s*"aisoc') {
             return (Get-Location).Path
         }
     }
@@ -288,7 +288,7 @@ function Remove-RepoClone {
     $looksLikeAiSOC = $false
     if ((Test-Path $composeFile) -and (Test-Path $pkgFile)) {
         $pkgContent = Get-Content $pkgFile -Raw -ErrorAction SilentlyContinue
-        if ($pkgContent -and $pkgContent -match '"name"\s*:\s*"aisoc"') {
+        if ($pkgContent -and $pkgContent -match '"name"\s*:\s*"aisoc') {
             $looksLikeAiSOC = $true
         }
     }

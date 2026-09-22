@@ -77,9 +77,12 @@ ENV NEXT_PUBLIC_DEMO_AUTOLOGIN_PASSWORD=${NEXT_PUBLIC_DEMO_AUTOLOGIN_PASSWORD}
 # so tsup/tsc bin shims resolve correctly inside each workspace package.
 RUN pnpm install --no-frozen-lockfile
 
-# Build workspace packages then the Next.js app.
+# Build workspace packages then the Next.js app. @aisoc/report-card must be
+# built here too — the /tools/coverage page imports it, and without its dist the
+# route silently drops from the build (404 in prod).
 RUN pnpm --filter @aisoc/types build && \
     pnpm --filter @aisoc/ui build && \
+    pnpm --filter @aisoc/report-card build && \
     pnpm --filter @aisoc/web build
 
 # ─── Runner ───────────────────────────────────────────────────────────────────

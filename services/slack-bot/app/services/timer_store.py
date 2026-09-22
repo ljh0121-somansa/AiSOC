@@ -41,9 +41,16 @@ class TimerRecord:
 
 @runtime_checkable
 class TimerStore(Protocol):
-    async def put(self, record: TimerRecord) -> None: ...
-    async def delete(self, action_id: str) -> None: ...
-    async def list_pending(self) -> list[TimerRecord]: ...
+    """Durable store for pending approval timers."""
+
+    async def put(self, record: TimerRecord) -> None:
+        """Persist (or overwrite) a pending timer record."""
+
+    async def delete(self, action_id: str) -> None:
+        """Remove the timer record for ``action_id`` if present."""
+
+    async def list_pending(self) -> list[TimerRecord]:
+        """Return all currently pending timer records."""
 
 
 class InMemoryTimerStore:

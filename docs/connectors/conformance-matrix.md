@@ -6,7 +6,7 @@
 > async coroutines, valid capabilities, secret fields marked `secret`).
 > Live-vendor sandbox smoke is a separate wave; this gates the contract.
 
-**78 / 78 connectors conform** to the runtime contract.
+**83 / 83 connectors conform** to the runtime contract.
 
 | connector | category | fields | vaulted | caps | test_connection | fetch_alerts | normalize |
 |-----------|----------|-------:|--------:|-----:|:---------------:|:------------:|:---------:|
@@ -27,9 +27,10 @@
 | cloudflare | saas | 2 | 1 | 1 | ✅ | ✅ | ✅ |
 | cloudflare_zt | network | 4 | 1 | 3 | ✅ | ✅ | ✅ |
 | confluence_audit | saas | 3 | 1 | 2 | ✅ | ✅ | ✅ |
-| cortex_xdr | edr | 3 | 2 | 1 | ✅ | ✅ | ✅ |
+| cortex_xdr | edr | 3 | 2 | 3 | ✅ | ✅ | ✅ |
 | cortex_xsiam | siem | 3 | 2 | 5 | ✅ | ✅ | ✅ |
 | crowdstrike | edr | 3 | 1 | 6 | ✅ | ✅ | ✅ |
+| darktrace | ndr | 4 | 2 | 3 | ✅ | ✅ | ✅ |
 | datadog | siem | 5 | 2 | 4 | ✅ | ✅ | ✅ |
 | datadog_cloud_siem | siem | 3 | 2 | 5 | ✅ | ✅ | ✅ |
 | devo | siem | 3 | 1 | 2 | ✅ | ✅ | ✅ |
@@ -45,7 +46,10 @@
 | github | vcs | 2 | 1 | 2 | ✅ | ✅ | ✅ |
 | gitlab | vcs | 3 | 1 | 2 | ✅ | ✅ | ✅ |
 | google_workspace | saas | 2 | 1 | 1 | ✅ | ✅ | ✅ |
+| greynoise | saas | 2 | 1 | 2 | ✅ | ✅ | ✅ |
+| imperva | network | 3 | 1 | 3 | ✅ | ✅ | ✅ |
 | jira | saas | 3 | 1 | 3 | ✅ | ✅ | ✅ |
+| jumpcloud | iam | 1 | 1 | 2 | ✅ | ✅ | ✅ |
 | kubernetes_audit | cloud | 5 | 1 | 2 | ✅ | ✅ | ✅ |
 | lacework | cloud | 4 | 1 | 5 | ✅ | ✅ | ✅ |
 | llm_usage | saas | 2 | 1 | 2 | ✅ | ✅ | ✅ |
@@ -63,15 +67,16 @@
 | prisma_cloud | cloud | 4 | 1 | 1 | ✅ | ✅ | ✅ |
 | proofpoint | saas | 2 | 1 | 1 | ✅ | ✅ | ✅ |
 | qradar | siem | 3 | 1 | 2 | ✅ | ✅ | ✅ |
+| qualys | cloud | 3 | 1 | 3 | ✅ | ✅ | ✅ |
 | rapid7_insightidr | siem | 2 | 1 | 4 | ✅ | ✅ | ✅ |
 | salesforce | saas | 4 | 2 | 4 | ✅ | ✅ | ✅ |
 | securonix | siem | 3 | 1 | 2 | ✅ | ✅ | ✅ |
-| sentinelone | edr | 3 | 1 | 1 | ✅ | ✅ | ✅ |
+| sentinelone | edr | 3 | 1 | 4 | ✅ | ✅ | ✅ |
 | servicenow | saas | 3 | 1 | 3 | ✅ | ✅ | ✅ |
 | slack_audit | saas | 1 | 1 | 3 | ✅ | ✅ | ✅ |
 | snowflake | saas | 5 | 1 | 4 | ✅ | ✅ | ✅ |
 | snyk | vcs | 3 | 1 | 1 | ✅ | ✅ | ✅ |
-| splunk | siem | 4 | 1 | 4 | ✅ | ✅ | ✅ |
+| splunk | siem | 5 | 1 | 4 | ✅ | ✅ | ✅ |
 | sublime_security | saas | 2 | 1 | 3 | ✅ | ✅ | ✅ |
 | sumo_logic | siem | 3 | 1 | 4 | ✅ | ✅ | ✅ |
 | sysdig | siem | 2 | 1 | 4 | ✅ | ✅ | ✅ |

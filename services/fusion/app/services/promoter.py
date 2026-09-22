@@ -35,6 +35,7 @@ from typing import Any
 import structlog
 
 from app.models.alert import AlertSeverity, RawAlert
+from app.services.provenance import extract_provenance
 
 logger = structlog.get_logger()
 
@@ -256,7 +257,8 @@ def promote_normalized_event(message: dict[str, Any]) -> RawAlert | None:
         if cand and cand.lower() not in ("none", "null"):
             hostname = cand
             break
-
+    if not hostname:
+        hostname = _get_nested(ocsf, "device", "name")
     username = _get_nested(ocsf, "actor", "user", "name") or _extract_splunk_kv(raw_data_str, "username") or _extract_splunk_kv(raw_data_str, "user") or _extract_splunk_kv(raw_data_str, "USER")
     file_hash = _first_file_hash(ocsf) or _extract_splunk_kv(raw_data_str, "file_hash") or _extract_splunk_kv(raw_data_str, "hash") or _extract_splunk_kv(raw_data_str, "sha256")
     domain = _extract_splunk_kv(raw_data_str, "domain")
@@ -279,6 +281,8 @@ def promote_normalized_event(message: dict[str, Any]) -> RawAlert | None:
         desc = _extract_splunk_kv(raw_data_str, "risk_message")
     elif _extract_splunk_kv(raw_data_str, "orig_rule_description"):
         desc = _extract_splunk_kv(raw_data_str, "orig_rule_description")
+
+    connector_id, connector_type, class_uid = extract_provenance(message, ocsf)
 
     # Title extraction: prefer orig_rule_title / orig_rule_name over generic OCSF message
     splunk_title = (
@@ -310,4 +314,7 @@ def promote_normalized_event(message: dict[str, Any]) -> RawAlert | None:
         mitre_techniques=techniques,
         raw_event=ocsf,
         event_time=_event_time(ocsf),
+        connector_id=connector_id,
+        connector_type=connector_type,
+        ocsf_class_uid=class_uid,
     )

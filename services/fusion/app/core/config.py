@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     # live event stream (app/services/detection_engine.py). Each firing rule
     # becomes a RawAlert routed through fusion.
     detection_engine_enabled: bool = Field(default=True, alias="AISOC_DETECTION_ENGINE_ENABLED")
+    # Stateful / windowed detections (brute force, spray, scans) — Redis-backed
+    # sliding-window thresholds evaluated alongside the stateless corpus.
+    windowed_detection_enabled: bool = Field(default=True, alias="AISOC_WINDOWED_DETECTION_ENABLED")
 
     # Phase A4 — consume the UEBA behavioral-anomaly stream and fold each
     # entity's latest anomaly into alert confidence + anomaly score at fuse
@@ -101,6 +104,13 @@ class Settings(BaseSettings):
 
     # Enrichment service
     enrichment_service_url: str = Field(default="http://localhost:8082", alias="ENRICHMENT_SERVICE_URL")
+    # Fuse-time streaming enrichment: call the enrichment service for each
+    # alert's IOCs and merge TI / vuln matches into fused.enrichments so the
+    # confidence threat_intel factor + exploit-in-wild boost actually fire.
+    # Best-effort + short timeout; no provider keys => empty result (no fake TI).
+    fuse_enrichment_enabled: bool = Field(default=True, alias="AISOC_FUSE_ENRICHMENT")
+    fuse_enrichment_timeout_seconds: float = Field(default=3.0, alias="AISOC_FUSE_ENRICHMENT_TIMEOUT")
+    fuse_enrichment_risk_floor: float = Field(default=50.0, alias="AISOC_FUSE_ENRICHMENT_RISK_FLOOR")
 
 
 settings = Settings()

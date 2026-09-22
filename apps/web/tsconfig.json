@@ -31,6 +31,9 @@
       ],
       "@aisoc/ui": [
         "../../packages/ui/src"
+      ],
+      "@aisoc/report-card": [
+        "../../packages/report-card/src"
       ]
     }
   },

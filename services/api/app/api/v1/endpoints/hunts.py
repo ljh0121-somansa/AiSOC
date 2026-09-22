@@ -38,7 +38,7 @@ from sqlalchemy import text
 
 from app.api.v1.deps import AuthUser, DBSession
 from app.core.airgap import AirgapViolation, enforce_airgap_for_url
-from app.services.hunt_query_generator import generate_queries_tiered
+from app.services.hunt_query_generator import _fallback_queries, generate_queries_tiered
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +126,18 @@ class HuntResponse(BaseModel):
 # ────────────────────────────────────────────────────────────────────────────
 
 
+async def _default_generate_queries(hypothesis: str, mitre: str | None = None) -> dict[str, str] | None:
+    return None
+
+
+_generate_queries = _default_generate_queries
+
+
 def _row_to_hunt(row: Any) -> HuntResponse:
+    raw_mode = getattr(row, "query_generation_mode", "ai")
+    query_generation_mode = raw_mode if raw_mode in ("ai", "fallback") else "ai"
+    raw_warnings = getattr(row, "warnings", None)
+    warnings = raw_warnings if isinstance(raw_warnings, str) else None
     return HuntResponse(
         id=row.id,
         title=row.title,
@@ -146,8 +157,8 @@ def _row_to_hunt(row: Any) -> HuntResponse:
         updated_at=row.updated_at,
         completed_at=row.completed_at,
         created_by=row.created_by,
-        query_generation_mode=getattr(row, "query_generation_mode", "ai"),
-        warnings=getattr(row, "warnings", None),
+        query_generation_mode=query_generation_mode,
+        warnings=warnings,
     )
 
 
@@ -201,10 +212,13 @@ async def create_hunt(
     user: AuthUser,
 ) -> HuntResponse:
     mitre = body.mitre_technique or body.mitre_tactic
-    # Outsource translation to the tiered query generator service (SRP compliance)
-    queries = await generate_queries_tiered(
-        db, user.tenant_id, body.hypothesis, mitre
-    )
+    if _generate_queries is not _default_generate_queries:
+        queries = (await _generate_queries(body.hypothesis, mitre)) or _fallback_queries(body.hypothesis)
+    else:
+        # Outsource translation to the tiered query generator service (SRP compliance)
+        queries = await generate_queries_tiered(
+            db, user.tenant_id, body.hypothesis, mitre
+        )
 
     hunt_id = uuid.uuid4()
     now = datetime.now(UTC)

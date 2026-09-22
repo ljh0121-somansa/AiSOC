@@ -42,6 +42,9 @@ class StepKind(str, Enum):
     LLM_RESPONSE = "llm_response"
     EVIDENCE_CITED = "evidence_cited"
     DECISION_REASON = "decision_reason"
+    # v8 P3 — a structured multi-hypothesis debate step (the replay UI renders
+    # it as a split-screen of competing hypotheses + their scores).
+    DEBATE = "debate"
 
 
 class AuditEntry(BaseModel):
