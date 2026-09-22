@@ -14,6 +14,8 @@ AiSOC — open-source AI Security Operations Center (MIT License)
 from __future__ import annotations
 
 import json
+import os
+import httpx
 from datetime import UTC, datetime
 from typing import Any
 
@@ -99,6 +101,9 @@ class ThreatIntelPipeline:
         except Exception as exc:
             logger.warning("Neo4j IOC upsert failed", error=str(exc))
 
+        # --- Mirror IOCs to ClickHouse Event Lake ---
+        await self._write_to_clickhouse(new_iocs, source)
+
         # --- Emit Kafka events ---
         if self._kafka:
             await self._emit_kafka_events(new_iocs, event_type="NEW_IOC", source=source)
@@ -167,3 +172,42 @@ class ThreatIntelPipeline:
                 await self._kafka.send(self._kafka_topic, value=payload)
             except Exception as exc:
                 logger.debug("Kafka emit failed", error=str(exc))
+
+    async def _write_to_clickhouse(
+        self,
+        iocs: list[dict[str, Any]],
+        source: str,
+    ) -> None:
+        """Bulk insert the normalized IOCs into the ClickHouse event lake."""
+        clickhouse_url = os.getenv(
+            "CLICKHOUSE_URL",
+            "http://aisoc:clickhouse_dev_secret@clickhouse:8123/aisoc",
+        )
+        values = []
+        for ioc in iocs:
+            val = ioc.get("value", "").replace("'", "\\'")
+            ioc_type = ioc.get("type", "").replace("'", "\\'")
+            src = ioc.get("source", source).replace("'", "\\'")
+            sev = ioc.get("severity", "medium").replace("'", "\\'")
+            desc = ioc.get("description", "").replace("'", "\\'")
+            values.append(f"('{val}', '{ioc_type}', '{src}', '{sev}', '{desc}')")
+
+        if not values:
+            return
+
+        sql = (
+            f"INSERT INTO aisoc.ioc_enrichments "
+            f"(ioc_value, ioc_type, source, severity, description) "
+            f"VALUES {', '.join(values)}"
+        )
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(clickhouse_url, content=sql)
+            resp.raise_for_status()
+            logger.info(
+                "Successfully mirrored IOCs to ClickHouse",
+                count=len(iocs),
+                source=source,
+            )
+        except Exception as exc:
+            logger.warning("Failed to mirror IOCs to ClickHouse", error=str(exc))

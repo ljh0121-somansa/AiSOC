@@ -17,10 +17,15 @@ const ROLE_STYLES: Record<string, { label: string; classes: string }> = {
     classes:
       'bg-rose-500/10 text-rose-200 border-rose-500/30 dark:bg-rose-500/15',
   },
-  responder: {
-    label: 'Responder',
+  tenant_admin: {
+    label: 'Admin',
     classes:
-      'bg-amber-500/10 text-amber-200 border-amber-500/30 dark:bg-amber-500/15',
+      'bg-rose-500/10 text-rose-200 border-rose-500/30 dark:bg-rose-500/15',
+  },
+  platform_admin: {
+    label: 'Platform Admin',
+    classes:
+      'bg-rose-500/10 text-rose-200 border-rose-500/30 dark:bg-rose-500/15',
   },
   analyst: {
     label: 'Analyst',

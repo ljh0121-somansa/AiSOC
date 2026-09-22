@@ -44,38 +44,6 @@ if (typeof window !== 'undefined') {
 
 // ─── Demo fallback graph ──────────────────────────────────────────────────────
 
-const DEMO_GRAPH: AttackGraph = {
-  generatedAt: '2026-05-06T12:00:00Z',
-  nodes: [
-    { id: 'host:WIN-FIN-DB01', label: 'WIN-FIN-DB01', kind: 'host', riskScore: 92 },
-    { id: 'host:WIN-PROD-WEB02', label: 'WIN-PROD-WEB02', kind: 'host', riskScore: 71 },
-    { id: 'user:alice@example.com', label: 'alice@example.com', kind: 'user', riskScore: 78 },
-    { id: 'user:svc-backup', label: 'svc-backup', kind: 'user', riskScore: 60 },
-    { id: 'ip:185.220.101.7', label: '185.220.101.7', kind: 'ip', riskScore: 95 },
-    { id: 'ip:10.0.4.12', label: '10.0.4.12', kind: 'ip', riskScore: 30 },
-    { id: 'process:powershell.exe', label: 'powershell.exe', kind: 'process', riskScore: 80 },
-    { id: 'process:lsass.exe', label: 'lsass.exe', kind: 'process', riskScore: 70 },
-    { id: 'tech:T1059.001', label: 'T1059.001 PowerShell', kind: 'technique', riskScore: 88 },
-    { id: 'tech:T1003.001', label: 'T1003.001 LSASS Memory', kind: 'technique', riskScore: 92 },
-    { id: 'tech:T1071.001', label: 'T1071.001 Web C2', kind: 'technique', riskScore: 76 },
-    { id: 'alert:A-1029', label: 'Alert A-1029', kind: 'alert', severity: 'critical' },
-    { id: 'alert:A-1030', label: 'Alert A-1030', kind: 'alert', severity: 'high' },
-  ],
-  edges: [
-    { id: 'e1', source: 'user:alice@example.com', target: 'host:WIN-FIN-DB01', label: 'logged_on' },
-    { id: 'e2', source: 'host:WIN-FIN-DB01', target: 'process:powershell.exe', label: 'spawned' },
-    { id: 'e3', source: 'process:powershell.exe', target: 'tech:T1059.001', label: 'matched' },
-    { id: 'e4', source: 'host:WIN-FIN-DB01', target: 'process:lsass.exe', label: 'accessed' },
-    { id: 'e5', source: 'process:lsass.exe', target: 'tech:T1003.001', label: 'matched' },
-    { id: 'e6', source: 'host:WIN-FIN-DB01', target: 'ip:185.220.101.7', label: 'beacon_to' },
-    { id: 'e7', source: 'ip:185.220.101.7', target: 'tech:T1071.001', label: 'matched' },
-    { id: 'e8', source: 'tech:T1003.001', target: 'alert:A-1029', label: 'triggered' },
-    { id: 'e9', source: 'tech:T1071.001', target: 'alert:A-1030', label: 'triggered' },
-    { id: 'e10', source: 'host:WIN-PROD-WEB02', target: 'user:svc-backup', label: 'auth' },
-    { id: 'e11', source: 'host:WIN-PROD-WEB02', target: 'ip:10.0.4.12', label: 'connected' },
-  ],
-};
-
 const KIND_COLORS: Record<GraphNodeKind, string> = {
   host: '#60a5fa',
   user: '#a78bfa',
@@ -243,27 +211,6 @@ const FALLBACK_TACTICS = [
   'Impact',
 ];
 
-function buildDemoCoverage(): MitreCoverage {
-  const cells = FALLBACK_TACTICS.flatMap((tactic, ti) =>
-    Array.from({ length: 6 }, (_, ri) => {
-      const detections = ((ti * 7 + ri * 3 + 5) % 9);
-      return {
-        techniqueId: `T${1000 + ti * 10 + ri}`,
-        techniqueName: `Technique ${ti + 1}.${ri + 1}`,
-        tactic,
-        detections,
-        alerts: detections * (1 + ((ti + ri) % 4)),
-        intensity: Math.min(1, detections / 8),
-      };
-    }),
-  );
-  return {
-    tactics: FALLBACK_TACTICS,
-    cells,
-    generatedAt: '2026-05-06T12:00:00Z',
-  };
-}
-
 function MitreHeatmap({ coverage }: { coverage: MitreCoverage }) {
   const grouped = useMemo(() => {
     const map = new Map<string, MitreCoverage['cells']>();
@@ -339,8 +286,11 @@ export function AttackGraphView() {
       try {
         return await graphApi.getOverview({ depth: 3 });
       } catch (err) {
-        // Fall back to demo data so the UI is always alive.
-        return DEMO_GRAPH;
+        return {
+          nodes: [],
+          edges: [],
+          generatedAt: new Date().toISOString(),
+        };
       }
     },
     { revalidateOnFocus: false, refreshInterval: 30_000 },
@@ -352,7 +302,11 @@ export function AttackGraphView() {
       try {
         return await graphApi.getMitreCoverage();
       } catch {
-        return buildDemoCoverage();
+        return {
+          tactics: [],
+          cells: [],
+          generatedAt: new Date().toISOString(),
+        };
       }
     },
     { revalidateOnFocus: false, refreshInterval: 60_000 },
@@ -519,8 +473,8 @@ export function AttackGraphView() {
           <MitreHeatmap coverage={mitre} />
         ) : (
           <EmptyState
-            title="No coverage data"
-            description="Once detections start firing, this heatmap lights up by tactic."
+            title="커버리지 데이터 없음"
+            description="실시간 탐지 규칙이 격발되기 시작하면 이 히트맵판에 전술별로 색상이 실시간 표출됩니다."
           />
         )}
       </section>

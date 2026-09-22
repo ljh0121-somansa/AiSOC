@@ -5,7 +5,8 @@ import useSWR from 'swr';
 import toast from 'react-hot-toast';
 import { EmptyState, EmptyStateIcons } from '@/components/ui/EmptyState';
 import { ErrorState } from '@/components/ui/ErrorState';
-import { auditApi, ApiError, type AuditExportFilters } from '@/lib/api';
+import { auditApi, ApiError, request, type AuditExportFilters } from '@/lib/api';
+import { isDemoMode } from '@/lib/demoMode';
 
 interface AuditEvent {
   id: string;
@@ -29,10 +30,7 @@ interface AuditListResponse {
 }
 
 const fetcher = async (url: string) => {
-  const r = await fetch(url, { credentials: 'include' });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  const text = await r.text();
-  try { return JSON.parse(text); } catch { throw new Error('Invalid JSON'); }
+  return request<AuditListResponse>(url);
 };
 
 const MOCK_AUDIT: AuditListResponse = {
@@ -52,6 +50,14 @@ const MOCK_AUDIT: AuditListResponse = {
   page: 1,
   page_size: 50,
   total_pages: 1,
+};
+
+const EMPTY_AUDIT: AuditListResponse = {
+  items: [],
+  total: 0,
+  page: 1,
+  page_size: 50,
+  total_pages: 0,
 };
 
 const ACTION_COLORS: Record<string, string> = {
@@ -84,13 +90,15 @@ export function AuditLogView() {
   if (actionFilter) params.set('action', actionFilter);
   if (resourceFilter) params.set('resource', resourceFilter);
 
+  const defaultFallback = EMPTY_AUDIT;
+
   const { data: raw, error, isLoading } = useSWR<AuditListResponse>(
     `/api/v1/audit?${params}`,
     fetcher,
-    { refreshInterval: 30_000, fallbackData: MOCK_AUDIT, shouldRetryOnError: false, errorRetryCount: 0, revalidateOnFocus: false }
+    { refreshInterval: 10_000, shouldRetryOnError: false, errorRetryCount: 0, revalidateOnFocus: false }
   );
   const isValid = raw && Array.isArray(raw.items) && typeof raw.total === 'number';
-  const data = isValid ? raw : MOCK_AUDIT;
+  const data = isValid ? raw : EMPTY_AUDIT;
 
   const handleSearch = useCallback((e: React.FormEvent) => {
     e.preventDefault();

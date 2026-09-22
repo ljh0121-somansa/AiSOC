@@ -64,25 +64,15 @@ class HuntResult:
 def _run_sigma(rule_body: str, events: list[dict[str, Any]]) -> tuple[list[dict], str | None]:
     """
     Execute a Sigma rule against a list of events.
-    Uses pySigma for parsing; falls back to a lightweight YAML-based evaluator.
+    Uses pySigma for validation; uses the lightweight, robust YAML-based evaluator for matching.
     Returns (matched_events, error_message).
     """
     try:
-        from sigma.backends.opensearch import OpensearchLuceneBackend
         from sigma.rule import SigmaRule
 
-        sigma_rule = SigmaRule.from_yaml(rule_body)
-        backend = OpensearchLuceneBackend()
-        queries = backend.convert_rule(sigma_rule)
-
-        # Use the generated Lucene query to evaluate events
-        matched = []
-        for event in events:
-            for query in queries:
-                if _lucene_match(query, event):
-                    matched.append(event)
-                    break
-        return matched, None
+        # Validate rule structure using pySigma if available
+        _ = SigmaRule.from_yaml(rule_body)
+        return _sigma_fallback(rule_body, events), None
 
     except ImportError:
         # pySigma not available – use simple YAML condition evaluator
@@ -125,13 +115,17 @@ def _eval_sigma_detection(detection: dict, flat_event: dict[str, Any]) -> bool:
         if isinstance(sel_def, dict):
             match = True
             for field_name, field_val in sel_def.items():
-                # Strip Sigma modifier suffixes (e.g. `cmdline|contains` -> `cmdline`).
-                field_lower = field_name.lower().split("|", 1)[0]
-                ev_val = str(flat_event.get(field_lower, "")).lower()
+                parts = field_name.lower().split("|")
+                field_lower = parts[0]
+                modifiers = parts[1:]
+                
+                ev_val = flat_event.get(field_lower, "")
+                
                 if isinstance(field_val, list):
-                    hit = any(str(v).lower() in ev_val for v in field_val)
+                    hit = any(_match_value_with_modifiers(ev_val, v, modifiers) for v in field_val)
                 else:
-                    hit = str(field_val).lower() in ev_val
+                    hit = _match_value_with_modifiers(ev_val, field_val, modifiers)
+                    
                 if not hit:
                     match = False
                     break
@@ -142,6 +136,41 @@ def _eval_sigma_detection(detection: dict, flat_event: dict[str, Any]) -> bool:
             selections[sel_name] = all(str(kw).lower() in flat_str for kw in sel_def)
 
     # Evaluate condition expression (supports: and, or, not, 1 of, all of)
+    return _eval_condition(condition, selections)
+
+
+def _match_value_with_modifiers(ev_val: Any, v: Any, modifiers: list[str]) -> bool:
+    """Match a field value against a search term applying Sigma modifiers."""
+    v_str = str(v).lower()
+    ev_val_str = str(ev_val).lower()
+
+    if "base64" in modifiers:
+        import base64
+        try:
+            v_str = base64.b64encode(str(v).encode("utf-8")).decode("utf-8").lower()
+        except Exception:
+            pass
+
+    if "endswith" in modifiers:
+        return ev_val_str.endswith(v_str)
+    elif "startswith" in modifiers:
+        return ev_val_str.startswith(v_str)
+    elif "re" in modifiers:
+        try:
+            return bool(re.search(v_str, ev_val_str, re.IGNORECASE))
+        except re.error:
+            return False
+    elif "cidr" in modifiers:
+        try:
+            import ipaddress
+            ip = ipaddress.ip_address(ev_val_str.strip())
+            network = ipaddress.ip_network(v_str.strip(), strict=False)
+            return ip in network
+        except Exception:
+            return False
+    else:
+        # Default is "contains" / substring match
+        return v_str in ev_val_str
     return _eval_condition(condition, selections)
 
 
@@ -377,10 +406,10 @@ def _run_kql(rule_body: str, events: list[dict[str, Any]]) -> tuple[list[dict], 
 def _kql_match(query: str, flat_event: dict[str, Any]) -> bool:
     """Minimal KQL field:value matcher."""
     # field:value pattern
-    m = re.match(r"(\w+)\s*:\s*\"?([^\"\s]+)\"?", query)
+    m = re.match(r"([\w.-]+)\s*:\s*(?:\"([^\"]*)\"|([^\s\"]+))", query)
     if m:
         field_name = m.group(1).lower()
-        value = m.group(2).lower()
+        value = (m.group(2) or m.group(3)).lower()
         ev_val = str(flat_event.get(field_name, "")).lower()
         if "*" in value:
             pattern = value.replace("*", ".*")
@@ -401,10 +430,175 @@ def _run_eql(rule_body: str, events: list[dict[str, Any]]) -> tuple[list[dict], 
 
 def _lucene_match(query: str, event: dict[str, Any]) -> bool:
     """Simple Lucene query evaluator for field:value pairs."""
-    flat = _flatten_dict(event)
-    flat_str = " ".join(f"{k}:{v}" for k, v in flat.items()).lower()
-    return query.lower() in flat_str
+    try:
+        return LuceneQueryParser(query, event).parse()
+    except Exception as exc:
+        logger.debug("Lucene query match error: %s (Query: %r)", exc, query)
+        return False
 
+def tokenize_lucene(query: str) -> list[tuple[str, Any]]:
+    """
+    Tokenize a Lucene query string into components.
+    Handles: Parentheses, Operators (AND, OR, NOT), Field-Value pairs, and Bare Terms.
+    """
+    pattern = re.compile(
+        r'(?P<lparen>\()'
+        r'|(?P<rparen>\))'
+        r'|(?P<and>\bAND\b)'
+        r'|(?P<or>\bOR\b)'
+        r'|(?P<not>\bNOT\b)'
+        r'|(?P<field_quoted>(?P<fq_name>[a-zA-Z0-9_\-\.\x7f-\xff]+):"(?P<fq_val>[^"]*)")'
+        r'|(?P<field_unquoted>(?P<fu_name>[a-zA-Z0-9_\-\.\x7f-\xff]+):(?P<fu_val>[^\s\)]+))'
+        r'|(?P<bare_quoted>"(?P<bq_val>[^"]*)")'
+        r'|(?P<bare_unquoted>[^\s\(\)]+)',
+        re.IGNORECASE
+    )
+    
+    tokens = []
+    for m in pattern.finditer(query):
+        gd = m.groupdict()
+        if gd['lparen']:
+            tokens.append(('LPAREN', '('))
+        elif gd['rparen']:
+            tokens.append(('RPAREN', ')'))
+        elif gd['and']:
+            tokens.append(('AND', 'AND'))
+        elif gd['or']:
+            tokens.append(('OR', 'OR'))
+        elif gd['not']:
+            tokens.append(('NOT', 'NOT'))
+        elif gd['field_quoted']:
+            tokens.append(('TERM', (gd['fq_name'], gd['fq_val'])))
+        elif gd['field_unquoted']:
+            tokens.append(('TERM', (gd['fu_name'], gd['fu_val'])))
+        elif gd['bare_quoted']:
+            tokens.append(('TERM', (None, gd['bq_val'])))
+        elif gd['bare_unquoted']:
+            val = gd['bare_unquoted']
+            if val.upper() in ('AND', 'OR', 'NOT'):
+                tokens.append((val.upper(), val.upper()))
+            else:
+                tokens.append(('TERM', (None, val)))
+                
+    return tokens
+
+
+class LuceneQueryParser:
+    """
+    A recursive-descent parser that evaluates a tokenized Lucene query
+    against a flattened event dictionary in-memory.
+    """
+    def __init__(self, query: str, event: dict[str, Any]) -> None:
+        self.tokens = tokenize_lucene(query)
+        self.pos = 0
+        self.flat_event = _flatten_dict(event)
+
+    def parse(self) -> bool:
+        if not self.tokens:
+            return False
+        result = self._parse_or()
+        return result
+
+    def _peek(self) -> tuple[str, Any] | None:
+        return self.tokens[self.pos] if self.pos < len(self.tokens) else None
+
+    def _consume(self) -> tuple[str, Any]:
+        tok = self.tokens[self.pos]
+        self.pos += 1
+        return tok
+
+    def _match(self, *types: str) -> bool:
+        tok = self._peek()
+        if tok and tok[0] in types:
+            self._consume()
+            return True
+        return False
+
+    def _parse_or(self) -> bool:
+        left = self._parse_and()
+        while self._match('OR'):
+            right = self._parse_and()
+            left = left or right
+        return left
+
+    def _parse_and(self) -> bool:
+        left = self._parse_not()
+        while self._match('AND'):
+            right = self._parse_not()
+            left = left and right
+        return left
+
+    def _parse_not(self) -> bool:
+        if self._match('NOT'):
+            return not self._parse_not()
+        return self._parse_atom()
+
+    def _parse_atom(self) -> bool:
+        tok = self._peek()
+        if tok is None:
+            return False
+
+        if tok[0] == 'LPAREN':
+            self._consume()
+            val = self._parse_or()
+            self._match('RPAREN')  # Consume closing parenthesis
+            return val
+
+        if tok[0] == 'TERM':
+            self._consume()
+            field, val = tok[1]
+            return self._eval_term(field, val)
+
+        self._consume()
+        return False
+
+    def _eval_term(self, field: str | None, val: str) -> bool:
+        # 역슬래시 이중 이스케이프 제거 (예: \\ -> \)
+        clean_val = val.replace('\\\\', '\\')
+        
+        # Lucene 와일드카드 기호(*, ?)를 Regex 패턴으로 안전하게 치환
+        placeholder_star = "___STAR_PLACEHOLDER___"
+        placeholder_question = "___QUESTION_PLACEHOLDER___"
+        
+        # 1. 쿼리 내 명시적인 이스케이프 문자(\*, \?)를 일반 문자로 보호
+        escaped_val = clean_val.replace(r'\*', '___LITERAL_STAR___').replace(r'\?', '___LITERAL_QUESTION___')
+        
+        # 2. 실제 작동해야 할 와일드카드(*, ?)를 임시 플레이스홀더로 교체
+        escaped_val = escaped_val.replace('*', placeholder_star).replace('?', placeholder_question)
+        
+        # 3. 정규식 특수문자 이스케이프 처리
+        regex_pattern = re.escape(escaped_val)
+        
+        # 4. 플레이스홀더를 실제 정규식 와일드카드 패턴(.* 및 .)으로 환원
+        regex_pattern = regex_pattern.replace(placeholder_star, '.*').replace(placeholder_question, '.')
+        regex_pattern = regex_pattern.replace('___LITERAL_STAR___', r'\*').replace('___LITERAL_QUESTION___', r'\?')
+        
+        try:
+            pattern = re.compile(f"^{regex_pattern}$", re.IGNORECASE)
+        except re.error:
+            pattern = None
+            
+        if field:
+            # OpenSearch/Elasticsearch 등에서 붙는 .keyword 접미사 제거
+            norm_field = field.lower()
+            if norm_field.endswith('.keyword'):
+                norm_field = norm_field[:-8]
+                
+            ev_val = str(self.flat_event.get(norm_field, ""))
+            if pattern:
+                return bool(pattern.match(ev_val))
+            return clean_val.lower() in ev_val.lower()
+        else:
+            # 필드가 지정되지 않은 일반 텍스트 탐색의 경우, 전체 필드 값을 검사
+            for ev_val in self.flat_event.values():
+                ev_str = str(ev_val)
+                if pattern:
+                    if pattern.match(ev_str):
+                        return True
+                else:
+                    if clean_val.lower() in ev_str.lower():
+                        return True
+            return False
 
 def _flatten_dict(d: dict[str, Any], prefix: str = "") -> dict[str, Any]:
     """Flatten nested dict to dot-notation keys."""

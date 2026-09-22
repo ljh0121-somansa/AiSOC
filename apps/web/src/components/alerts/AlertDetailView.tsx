@@ -61,80 +61,6 @@ const CONFIDENCE_CONFIG: Record<ConfidenceLabel, { label: string; badge: string;
   },
 };
 
-// Mock alert for development
-const MOCK_ALERT: Alert = {
-  id: 'alert-1',
-  title: 'Suspicious PowerShell execution detected',
-  description: 'A PowerShell script was executed with obfuscated content and attempted to download a payload from an external domain. The process was spawned by a user with administrative privileges outside of business hours.',
-  severity: 'critical',
-  status: 'new',
-  source: 'CrowdStrike',
-  sourceRef: 'CS-2024-789012',
-  tenantId: 'tenant-1',
-  riskScore: 95,
-  mitreAttack: [
-    { tactic: 'Execution', technique: 'PowerShell', techniqueId: 'T1059.001' },
-    { tactic: 'Defense Evasion', technique: 'Obfuscated Files or Information', techniqueId: 'T1027' },
-    { tactic: 'Command and Control', technique: 'Application Layer Protocol', techniqueId: 'T1071' },
-  ],
-  iocs: [
-    { type: 'ip', value: '185.220.101.45', malicious: true },
-    { type: 'domain', value: 'payload-c2.xyz', malicious: true },
-    { type: 'hash', value: 'a1b2c3d4e5f6789012345678901234567890abcd', malicious: true },
-  ],
-  tags: ['powershell', 'c2-beacon', 'high-priority'],
-  assignee: 'analyst@example.com',
-  createdAt: '2026-05-06T11:00:00Z',
-  updatedAt: '2026-05-06T11:30:00Z',
-  confidenceLabel: 'high',
-  confidenceScore: 0.86,
-  confidenceRationale: [
-    {
-      factor: 'severity',
-      label: 'Critical severity from source',
-      value: 1.0,
-      contribution: 0.20,
-      weight: 0.20,
-    },
-    {
-      factor: 'mitre_coverage',
-      label: '3 MITRE techniques mapped (T1059.001, T1027, T1071)',
-      value: 1.0,
-      contribution: 0.18,
-      weight: 0.18,
-    },
-    {
-      factor: 'threat_intel',
-      label: 'IOC matched against known C2 infrastructure',
-      value: 1.0,
-      contribution: 0.20,
-      weight: 0.20,
-    },
-    {
-      factor: 'ml_score',
-      label: 'Anomaly score 0.94 (UEBA baseline deviation)',
-      value: 0.94,
-      contribution: 0.14,
-      weight: 0.15,
-    },
-    {
-      factor: 'upstream_risk',
-      label: 'Affected user is in elevated-risk cohort',
-      value: 0.78,
-      contribution: 0.08,
-      weight: 0.10,
-    },
-    {
-      factor: 'ioc_density',
-      label: '3 distinct malicious IOCs in single event',
-      value: 0.85,
-      contribution: 0.06,
-      weight: 0.07,
-    },
-  ],
-  ledgerRunId: 'run-mock-c2-beacon-investigation',
-};
-
 // ─── Sections ─────────────────────────────────────────────────────────────────
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
@@ -342,61 +268,27 @@ function LedgerEvidenceChain({ runId }: { runId: string }) {
 
 // ─── AI Investigation Panel ───────────────────────────────────────────────────
 
-function AIInvestigation({ alertId }: { alertId: string }) {
+function AIInvestigation({ alertId, alert }: { alertId: string; alert?: Alert }) {
   const [investigation, setInvestigation] = useState<AgentInvestigation | null>(null);
   const [isRunning, setIsRunning] = useState(false);
-  const startInvestigation = async () => {
+  const [error, setError] = useState<string | null>(null);
+  const startInvestigation = async (reinvestigate = false) => {
     setIsRunning(true);
+    setError(null);
     try {
-      const result = await agentsApi.investigate(alertId);
-      setInvestigation(result);
-    } catch (err) {
-      // Show mock investigation for demo
-      setInvestigation({
-        id: 'inv-1',
+      const result = await agentsApi.investigate(
         alertId,
-        status: 'completed',
-        findings: `## AI Investigation Summary
-
-**Threat Classification:** Advanced Persistent Threat (APT) - High Confidence
-
-### Executive Summary
-The PowerShell execution event represents a multi-stage attack with C2 communication. The attacker leveraged legitimate administrative credentials obtained via credential stuffing to execute an obfuscated downloader script.
-
-### Key Findings
-1. **Initial Access**: Credential abuse from IP 185.220.101.45 (known Tor exit node)
-2. **Execution**: Obfuscated PowerShell base64 encoded payload downloading secondary stage
-3. **C2 Communication**: Established encrypted channel to payload-c2.xyz (newly registered domain, 3 days old)
-4. **Lateral Movement Risk**: Current user has admin rights on 12 additional systems
-
-### MITRE ATT&CK Coverage
-- T1059.001 (PowerShell) → Active
-- T1027 (Obfuscation) → Active  
-- T1071 (Application Layer Protocol) → Active
-
-### Recommended Actions
-1. Isolate affected endpoint immediately
-2. Block IP 185.220.101.45 at perimeter firewall
-3. Block domain payload-c2.xyz at DNS level
-4. Reset credentials for affected user account
-5. Hunt for similar PowerShell patterns across fleet`,
-        recommendations: [
-          'Isolate endpoint DESKTOP-ABC123 from network immediately',
-          'Block IP 185.220.101.45 at firewall',
-          'Block domain payload-c2.xyz at DNS',
-          'Reset password for user john.doe@company.com',
-          'Review admin rights across all systems',
-        ],
-        actions: [
-          { type: 'isolate_endpoint', target: 'DESKTOP-ABC123', status: 'pending' },
-          { type: 'block_ip', target: '185.220.101.45', status: 'pending' },
-          { type: 'block_domain', target: 'payload-c2.xyz', status: 'pending' },
-        ],
-        startedAt: new Date().toISOString(),
-        completedAt: new Date().toISOString(),
-      });
+        reinvestigate,
+        alert as unknown as Record<string, unknown>,
+      );
+      setInvestigation(result);
+    } catch (err : any) {
+        if ((err as Error)?.name === 'AbortError') return;
+        const detail = err?.response?.data?.detail || err?.detail || err?.message || '요청 처리에 실패했습니다.';
+        toast.error(`조사 실행 실패: ${detail}`);
+    } finally {
+      setIsRunning(false);
     }
-    setIsRunning(false);
   };
 
   if (!investigation) {
@@ -405,7 +297,7 @@ The PowerShell execution event represents a multi-stage attack with C2 communica
         <p className="text-sm text-gray-400 mb-1">Agent investigation</p>
         <p className="text-xs text-gray-600 mb-4">Run the agent on this alert to produce a markdown report, MITRE mapping, and a list of recommended actions. Every step is recorded in the case ledger.</p>
         <button
-          onClick={startInvestigation}
+          onClick={() => void startInvestigation(false)}
           disabled={isRunning}
           className="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium px-6 py-2 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
         >
@@ -433,12 +325,18 @@ The PowerShell execution event represents a multi-stage attack with C2 communica
             'bg-red-500'
           )} />
           <span className="text-xs text-gray-400 capitalize">{investigation.status}</span>
+          {investigation.cached && (
+            <span className="text-[10px] bg-blue-500/10 text-blue-400 border border-blue-500/20 px-1.5 py-0.5 rounded font-mono">
+              cached
+            </span>
+          )}
         </div>
         <button
-          onClick={startInvestigation}
-          className="text-xs text-blue-400 hover:text-blue-300"
+          onClick={() => void startInvestigation(true)}
+          disabled={isRunning}
+          className="text-xs text-blue-400 hover:text-blue-300 disabled:opacity-50"
         >
-          Re-investigate
+          {isRunning ? 'Re-investigating...' : 'Re-investigate'}
         </button>
       </div>
 
@@ -837,7 +735,7 @@ export function AlertDetailView({ alertId }: { alertId: string }) {
   const { data: alert, isLoading, mutate } = useSWR(
     ['alert', alertId],
     () => alertsApi.get(alertId),
-    { fallbackData: { ...MOCK_ALERT, id: alertId, status } }
+    { fallbackData: undefined }
   );
 
   const handleStatusChange = async (newStatus: Alert['status']) => {
@@ -1055,7 +953,7 @@ export function AlertDetailView({ alertId }: { alertId: string }) {
           {/* Right column - 1/3 */}
           <div className="space-y-4">
             <Section title="AI Investigation">
-              <AIInvestigation alertId={alertId} />
+              <AIInvestigation alertId={alertId} alert={alert} />
             </Section>
 
             <Section title="Verdict & feedback">

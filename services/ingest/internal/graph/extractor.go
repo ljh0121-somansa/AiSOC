@@ -92,11 +92,12 @@ func ExtractFromOCSF(eventID, tenantID, connectorType string, ocsf map[string]in
 // at known field paths; this pulls those out so we never produce zero-node
 // projections for connectors we haven't fully wired yet.
 func extractGeneric(ev *Event, ocsf map[string]interface{}) {
+	var userKey, devKey, srcKey, dstKey string
 	if name := getString(ocsf, "actor.user.name"); name != "" {
-		key := fmt.Sprintf("user:%s:%s", ev.TenantID, name)
+		userKey = fmt.Sprintf("user:%s:%s", ev.TenantID, name)
 		ev.Nodes = append(ev.Nodes, Node{
 			Label:      NodeUser,
-			NaturalKey: key,
+			NaturalKey: userKey,
 			TenantID:   ev.TenantID,
 			Properties: map[string]interface{}{
 				"name":  name,
@@ -105,30 +106,58 @@ func extractGeneric(ev *Event, ocsf map[string]interface{}) {
 		})
 	}
 	if dev := getString(ocsf, "device.name"); dev != "" {
-		key := fmt.Sprintf("endpoint:%s:%s", ev.TenantID, dev)
+		devKey = fmt.Sprintf("endpoint:%s:%s", ev.TenantID, dev)
 		ev.Nodes = append(ev.Nodes, Node{
 			Label:      NodeEndpoint,
-			NaturalKey: key,
+			NaturalKey: devKey,
 			TenantID:   ev.TenantID,
-			Properties: map[string]interface{}{"name": dev},
+			Properties: map[string]interface{}{
+				"name": dev,
+				"ip":   getString(ocsf, "src_endpoint.ip"),
+			},
 		})
 	}
 	if srcIP := getString(ocsf, "src_endpoint.ip"); srcIP != "" {
-		key := fmt.Sprintf("netpath:%s:%s", ev.TenantID, srcIP)
-		ev.Nodes = append(ev.Nodes, Node{
-			Label:      NodeNetworkPath,
-			NaturalKey: key,
-			TenantID:   ev.TenantID,
-			Properties: map[string]interface{}{"src_ip": srcIP, "role": "src"},
-		})
+		srcKey = fmt.Sprintf("netpath:%s:%s", ev.TenantID, srcIP)
+		if devKey == "" { // 👈 장비(demo)가 없을 때만 생성 (1줄 추가)                                       
+		ev.Nodes = append(ev.Nodes, Node{                                                                 
+			Label:      NodeNetworkPath,                                                                   
+			NaturalKey: srcKey,                                                                            
+			TenantID:   ev.TenantID,                                                                       
+			Properties: map[string]interface{}{"src_ip": srcIP, "role": "src"},                            
+		})                                                                                                
+		}
 	}
 	if dstIP := getString(ocsf, "dst_endpoint.ip"); dstIP != "" {
-		key := fmt.Sprintf("netpath:%s:%s", ev.TenantID, dstIP)
+		dstKey = fmt.Sprintf("netpath:%s:%s", ev.TenantID, dstIP)
 		ev.Nodes = append(ev.Nodes, Node{
 			Label:      NodeNetworkPath,
-			NaturalKey: key,
+			NaturalKey: dstKey,
 			TenantID:   ev.TenantID,
 			Properties: map[string]interface{}{"dst_ip": dstIP, "role": "dst"},
+		})
+	}
+
+	// 출발지(PC A) ─────► 목적지(PC B) 연결선(Edge) 생성
+	fromKey, fromLabel := devKey, NodeEndpoint
+	if fromKey == "" {
+		fromKey, fromLabel = srcKey, NodeNetworkPath
+	}
+
+	if fromKey != "" && dstKey != "" {
+		ev.Edges = append(ev.Edges, Edge{
+			Type:      RelAccesses,
+			FromLabel: fromLabel, FromKey: fromKey,
+			ToLabel:   NodeNetworkPath, ToKey: dstKey,
+		})
+	}
+
+	// 사용자 ─────► 장비 연결선
+	if userKey != "" && devKey != "" {
+		ev.Edges = append(ev.Edges, Edge{
+			Type:      RelAccesses,
+			FromLabel: NodeUser, FromKey: userKey,
+			ToLabel:   NodeEndpoint, ToKey: devKey,
 		})
 	}
 }

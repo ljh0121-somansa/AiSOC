@@ -44,7 +44,6 @@ except Exception:
 # Error-wrapper: catches exceptions in any node and marks state as failed
 # ---------------------------------------------------------------------------
 
-
 def _safe_node(fn):
     """Wrap an async node so exceptions are captured in state instead of crashing the graph.
     Also emits an OpenTelemetry span per node execution."""
@@ -66,7 +65,7 @@ def _safe_node(fn):
                 span.set_status(trace.StatusCode.ERROR, str(exc))
                 state = InvestigatorState.from_dict(state_dict)
                 state.status = "failed"
-                state.error = str(exc)
+                state.error = f"[{fn.__name__} 실패] {str(exc)}"
                 state.completed_at = datetime.utcnow()
                 state.log(StepKind.ERROR, fn.__name__, f"Node failed: {exc}")
                 logger.error(f"{fn.__name__} failed", case_id=state.case_id, error=str(exc))
@@ -179,6 +178,13 @@ class InvestigatorOrchestrator:
                 result = await self._graph.ainvoke(initial.to_dict())
                 final = InvestigatorState.from_dict(result)
                 # Stash cost summary so the API/UI can surface it.
+                if final.error or final.status in ("pending", "running", "failed"):
+                    final.status = "failed"
+                    if not final.error:
+                        final.error = "Investigation failed or interrupted unexpectedly."
+                else:
+                    final.status = "completed"
+
                 final.cost_summary = tracker.summary()
 
             # Persist the full audit log post-hoc (one shot, no streaming)
@@ -332,6 +338,13 @@ class InvestigatorOrchestrator:
 
             # Emit the final "done" event with the complete state payload
             if last_state is not None:
+                if last_state.error or last_state.status in ("pending", "running", "failed"):
+                    last_state.status = "failed"
+                    if not last_state.error:
+                        last_state.error = "Investigation failed or interrupted unexpectedly."
+                else:
+                    last_state.status = "completed"
+                    
                 if tenant_uuid is not None and last_state.report_md:
                     await ledger.record_artifact(
                         run_id=run_uuid,
@@ -348,7 +361,7 @@ class InvestigatorOrchestrator:
                         iterations=last_state.iteration,
                     )
                 yield {
-                    "type": "done",
+                    "type": "error" if last_state.status == "failed" else "done",
                     "case_id": case_id,
                     "run_id": str(run_uuid),
                     "state": {

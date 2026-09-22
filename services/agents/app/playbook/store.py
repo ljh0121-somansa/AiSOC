@@ -52,6 +52,30 @@ def _resolve_repo_root() -> Path:
 _REPO_ROOT = _resolve_repo_root()
 _DEFAULT_PACK_ROOT = _REPO_ROOT / "playbooks" / "packs" / "v1"
 
+def normalize_severity(sev: Any) -> str:                                                                   
+    """Normalize severity (Enum, int, or string) to standard lowercase string:                             
+    'critical', 'high', 'medium', 'low', 'info'.                                                           
+    """                                                                                                    
+    if sev is None or sev == "":                                                                           
+        return ""                                                                                          
+    if hasattr(sev, "value"):                                                                              
+        sev = sev.value                                                                                    
+    if isinstance(sev, int):                                                                               
+        return {5: "critical", 4: "high", 3: "medium", 2: "low", 1: "info"}.get(sev, "")                   
+    s = str(sev).strip().lower()                                                                           
+    if s.startswith("alertseverity."):                                                                     
+        s = s.replace("alertseverity.", "")                                                                
+    if s in ("5", "critical", "fatal"):                                                                    
+        return "critical"                                                                                  
+    if s in ("4", "high"):                                                                                 
+        return "high"                                                                                      
+    if s in ("3", "medium", "med"):                                                                        
+        return "medium"                                                                                    
+    if s in ("2", "low"):                                                                                  
+        return "low"                                                                                       
+    if s in ("1", "info", "informational"):                                                                
+        return "info"                                                                                      
+    return s
 
 class PlaybookStore:
     """CRUD store for Playbook objects, backed by a JSON manifest file."""
@@ -191,7 +215,14 @@ class PlaybookStore:
             # Optional severity filter
             if "severity" in trigger:
                 allowed = trigger["severity"]
-                if context.get("severity") not in allowed:
+                if isinstance(allowed, str):                                                               
+                    allowed = [allowed]                                                                    
+                allowed_set = {normalize_severity(s) for s in allowed if s}                                
+                raw_ctx_sev = context.get("severity")                                                      
+                if not raw_ctx_sev and isinstance(context.get("alert"), dict):                             
+                    raw_ctx_sev = context["alert"].get("severity")                                         
+                ctx_sev = normalize_severity(raw_ctx_sev)                                                  
+                if allowed_set and ctx_sev and ctx_sev not in allowed_set:                                 
                     continue
             # Optional tag filter
             if "tags" in trigger:

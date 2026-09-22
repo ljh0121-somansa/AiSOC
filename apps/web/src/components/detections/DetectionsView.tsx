@@ -62,55 +62,7 @@ const SAMPLE_EQL = `sequence by aws.account.id with maxspan=1h
   [aws where event.module == "guardduty" and event.severity >= 7]
 `;
 
-const DEMO_RULES: DetectionRule[] = [
-  {
-    id: 'rule-001',
-    name: 'Suspicious PowerShell Encoded Command',
-    description:
-      'Flags powershell.exe spawning with -EncodedCommand, a common LOLBin tradecraft used to evade content filters.',
-    language: 'sigma',
-    body: SAMPLE_SIGMA,
-    enabled: true,
-    severity: 'high',
-    tags: ['windows', 'lolbin', 'powershell'],
-    mitre: ['T1059.001', 'T1027'],
-    createdAt: ago(60 * 24 * 14),
-    updatedAt: ago(60 * 6),
-    lastTriggeredAt: ago(38),
-    hitCount: 42,
-  },
-  {
-    id: 'rule-002',
-    name: 'Impossible Travel — Same User',
-    description:
-      'Detects identity sign-ins from two geographies within a window that is physically impossible to traverse.',
-    language: 'kql',
-    body: SAMPLE_KQL,
-    enabled: true,
-    severity: 'medium',
-    tags: ['identity', 'authn'],
-    mitre: ['T1078'],
-    createdAt: ago(60 * 24 * 30),
-    updatedAt: ago(60 * 24 * 2),
-    lastTriggeredAt: ago(60 * 7),
-    hitCount: 12,
-  },
-  {
-    id: 'rule-003',
-    name: 'AWS GuardDuty High-Severity Finding',
-    description:
-      'Forwards GuardDuty findings of severity 7+ into AiSOC as alerts and links them to the affected resource.',
-    language: 'eql',
-    body: SAMPLE_EQL,
-    enabled: false,
-    severity: 'critical',
-    tags: ['aws', 'cloud'],
-    mitre: ['T1078.004', 'T1110'],
-    createdAt: ago(60 * 24 * 5),
-    updatedAt: ago(60 * 24 * 1),
-    hitCount: 0,
-  },
-];
+const DEFAULT_RULES: DetectionRule[] = [];
 
 const LANG_LABEL: Record<DetectionLanguage, string> = {
   sigma: 'Sigma',
@@ -182,7 +134,7 @@ export function DetectionsView() {
   // array reference on every render — important because we feed `rules`
   // into a downstream useMemo dep array.
   const rules = useMemo<DetectionRule[]>(
-    () => data?.rules ?? (useFallback ? DEMO_RULES : []),
+    () => data?.rules ?? (useFallback ? DEFAULT_RULES : []),
     [data, useFallback],
   );
 

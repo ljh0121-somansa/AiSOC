@@ -115,6 +115,8 @@ import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from fastapi import HTTPException
+from fastapi import status
 
 from app.core.rate_limit import RateLimitDecision, TokenBucketLimiter
 from app.security.llm_resolver import LlmConfig, resolve_llm_config
@@ -527,35 +529,13 @@ def _build_next_steps(alert: dict[str, Any], mitre_ids: list[str]) -> list[dict[
 
     return steps[:4]
 
-
-def _build_summary(alert: dict[str, Any], mitre_ids: list[str]) -> str:
-    """Deterministic 2–3 sentence summary used when the LLM is disabled."""
-    title = alert.get("title") or "Security alert"
-    severity = (alert.get("severity") or "unknown").lower()
-    source = alert.get("source") or "an unknown source"
-    desc = (alert.get("description") or "").strip()
-
-    technique_clause = ""
-    if mitre_ids:
-        technique_clause = f" The detection maps to {', '.join(mitre_ids[:3])}, which the technique cards below describe in full."
-
-    base = f"{title} fired at {severity} severity from {source}.{technique_clause}"
-    if desc:
-        # Trim to keep the drawer scannable.
-        snippet = desc if len(desc) <= 240 else desc[:237] + "…"
-        base += f" {snippet}"
-    return base
-
-
 # ---------------------------------------------------------------------------
 # LLM call (optional, best-effort)
 # ---------------------------------------------------------------------------
 
-
 async def _llm_summary(
     alert: dict[str, Any],
     mitre_techs: list[dict[str, Any]],
-    fallback: str,
     llm_config: LlmConfig,
 ) -> str:
     """Ask the model for a tightly-scoped summary, with a hard fallback.
@@ -571,7 +551,10 @@ async def _llm_summary(
     function has zero awareness of where the credentials came from.
     """
     if not llm_config.allowed or not llm_config.api_key:
-        return fallback
+        raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="LLM 서비스를 이용할 수 없습니다. (Fallback 요약 생성이 비활성화됨)"
+            )
 
     try:
         import httpx
@@ -620,11 +603,16 @@ async def _llm_summary(
                 json={"model": model, "messages": messages, "max_tokens": 320},
             )
             resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"].strip()
+            raw_content = resp.json()["choices"][0]["message"]["content"].strip()
+            clean_content = raw_content.split("</think>", 1)[-1]
+            return clean_content
 
     except Exception as exc:
         logger.warning("explain.llm_error", error=str(exc))
-        return fallback
+        raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="LLM 서비스를 이용할 수 없습니다. (Fallback 요약 생성이 비활성화됨)"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -645,10 +633,9 @@ async def _stream_explanation(req: ExplainRequest, llm_config: LlmConfig) -> Asy
         mitre_ids = _extract_mitre_ids(alert)
         mitre_cards = [_resolve_technique(t) for t in mitre_ids]
 
-        fallback_summary = _build_summary(alert, mitre_ids)
         # Run the LLM call concurrently with the deterministic emissions
         # so the drawer paints fast even on a cold network.
-        summary_task = asyncio.create_task(_llm_summary(alert, mitre_cards, fallback_summary, llm_config))
+        summary_task = asyncio.create_task(_llm_summary(alert, mitre_cards, llm_config))
 
         yield _frame({"kind": "section", "id": "summary", "title": "What happened"})
         # Stream the summary word-by-word once it resolves.
@@ -683,6 +670,10 @@ async def _stream_explanation(req: ExplainRequest, llm_config: LlmConfig) -> Asy
 
         # ── DONE ──────────────────────────────────────────────────────────
         yield _frame({"kind": "done", "alert_id": alert_id})
+    except HTTPException as http_exc:
+        # 🟢 Fallback에서 던져진 503 예외를 받아 NDJSON 에러 프레임으로 방출
+        logger.warning("explain.fallback_503_triggered", detail=http_exc.detail)
+        yield _frame({"kind": "error", "error": str(http_exc.detail)})
 
     except Exception as exc:  # noqa: BLE001 — frontend gets a structured error
         logger.exception("explain.stream_failed", error=str(exc))

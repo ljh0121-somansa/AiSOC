@@ -114,9 +114,9 @@ def build_investigation_graph() -> StateGraph:
         {"end": END, "continue": "triage"},
     )
     graph.add_edge("triage", "enrichment")
-    graph.add_edge("enrichment", "investigation")
-    graph.add_edge("investigation", "attack_path")
-    graph.add_edge("attack_path", END)
+    graph.add_edge("enrichment", "attack_path")
+    graph.add_edge("attack_path", "investigation")
+    graph.add_edge("investigation", END)
 
     return graph.compile()
 

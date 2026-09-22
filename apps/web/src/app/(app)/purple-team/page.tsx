@@ -139,42 +139,9 @@ function coverageColor(c: number): string {
 }
 
 const MOCK_COVERAGE: CoverageMatrix = {
-  tactics: ['initial-access', 'execution', 'persistence', 'privilege-escalation', 'defense-evasion', 'credential-access', 'lateral-movement', 'command-and-control', 'exfiltration'],
-  techniques: {
-    'initial-access': [
-      { technique_id: 'T1566', technique_name: 'Phishing', test_count: 12, pass_count: 10, detected: 8, coverage: 0.67 },
-      { technique_id: 'T1078', technique_name: 'Valid Accounts', test_count: 6, pass_count: 5, detected: 3, coverage: 0.5 },
-    ],
-    'execution': [
-      { technique_id: 'T1059', technique_name: 'Command & Scripting', test_count: 18, pass_count: 16, detected: 14, coverage: 0.78 },
-      { technique_id: 'T1204', technique_name: 'User Execution', test_count: 8, pass_count: 7, detected: 5, coverage: 0.63 },
-    ],
-    'persistence': [
-      { technique_id: 'T1053', technique_name: 'Scheduled Task/Job', test_count: 10, pass_count: 9, detected: 7, coverage: 0.7 },
-    ],
-    'privilege-escalation': [
-      { technique_id: 'T1548', technique_name: 'Abuse Elevation', test_count: 5, pass_count: 4, detected: 2, coverage: 0.4 },
-    ],
-    'defense-evasion': [
-      { technique_id: 'T1027', technique_name: 'Obfuscated Files', test_count: 14, pass_count: 12, detected: 10, coverage: 0.71 },
-      { technique_id: 'T1070', technique_name: 'Indicator Removal', test_count: 7, pass_count: 5, detected: 3, coverage: 0.43 },
-    ],
-    'credential-access': [
-      { technique_id: 'T1003', technique_name: 'OS Credential Dumping', test_count: 11, pass_count: 10, detected: 9, coverage: 0.82 },
-      { technique_id: 'T1110', technique_name: 'Brute Force', test_count: 9, pass_count: 8, detected: 7, coverage: 0.78 },
-    ],
-    'lateral-movement': [
-      { technique_id: 'T1021', technique_name: 'Remote Services', test_count: 6, pass_count: 5, detected: 3, coverage: 0.5 },
-    ],
-    'command-and-control': [
-      { technique_id: 'T1071', technique_name: 'Application Layer Protocol', test_count: 8, pass_count: 7, detected: 5, coverage: 0.63 },
-      { technique_id: 'T1105', technique_name: 'Ingress Tool Transfer', test_count: 5, pass_count: 4, detected: 2, coverage: 0.4 },
-    ],
-    'exfiltration': [
-      { technique_id: 'T1048', technique_name: 'Exfil Over Alt Protocol', test_count: 4, pass_count: 3, detected: 1, coverage: 0.25 },
-    ],
-  },
-  summary: { total_techniques: 201, tested_techniques: 14, detected_techniques: 10, overall_coverage: 0.71 },
+  tactics: [],
+  techniques: {},
+  summary: { total_techniques: 0, tested_techniques: 0, detected_techniques: 0, overall_coverage: 0.0 },
 }
 
 // Visual ring around a technique cell that reflects how it changed since the

@@ -175,13 +175,7 @@ const DEMO_RESULT: ResolverResult = {
   notes: ['demo data — backend unreachable'],
 };
 
-const DEMO_PROVIDERS: ProviderInfo[] = [
-  { name: 'aws', coverage: 'full' },
-  { name: 'azure', coverage: 'scaffold' },
-  { name: 'gcp', coverage: 'scaffold' },
-  { name: 'gws', coverage: 'scaffold' },
-  { name: 'okta', coverage: 'scaffold' },
-];
+const DEMO_PROVIDERS: ProviderInfo[] = [];
 
 // ---------------------------------------------------------------------------
 // Helpers

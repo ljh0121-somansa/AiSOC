@@ -201,7 +201,8 @@ CREATE INDEX IF NOT EXISTS idx_rules_type    ON detection_rules(rule_type);
 -- ──────────────────────────────────────────────────────────────────────────────
 
 INSERT INTO tenants (id, name, slug, plan)
-VALUES ('00000000-0000-0000-0000-000000000001', 'Default', 'default', 'enterprise')
+VALUES 
+    ('00000000-0000-0000-0000-000000000001', 'SOMANSA', 'default', 'enterprise')
 ON CONFLICT (slug) DO NOTHING;
 
 -- password = "admin" (bcrypt)
@@ -209,10 +210,10 @@ INSERT INTO users (id, tenant_id, email, username, hashed_password, role, is_act
 VALUES (
     '00000000-0000-0000-0000-000000000002',
     '00000000-0000-0000-0000-000000000001',
-    'admin@aisoc.local',
+    'admin@somansa.com',
     'admin',
-    '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj3EEbF7FtRS',
-    'admin',
+    '$2b$12$b4lDfeFRZFPAoW.0ccPl..kxZarIgm4NrwFvXjJS65phRFv46nILK',
+    'platform_admin',
     TRUE,
     TRUE
 ) ON CONFLICT (email) DO NOTHING;

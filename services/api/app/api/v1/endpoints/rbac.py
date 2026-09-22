@@ -17,7 +17,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.api.v1.deps import AuthUser, require_permission
+from app.api.v1.deps import AuthUser, CurrentUser, require_permission
 from app.db.rls import TenantDBSession
 from app.models.rbac import Permission, Role, RolePermission, UserRole
 from app.models.tenant import User
@@ -82,7 +82,7 @@ class UserRoleOut(BaseModel):
 
 @router.get("/permissions", response_model=list[PermissionOut])
 async def list_permissions(
-    current_user: Annotated[AuthUser, Depends(require_permission("roles:read"))],
+    current_user: Annotated[CurrentUser, Depends(require_permission("roles:read"))],
     db: TenantDBSession,
     category: str | None = None,
 ) -> list[PermissionOut]:
@@ -101,7 +101,7 @@ async def list_permissions(
 
 @router.get("/roles", response_model=list[RoleOut])
 async def list_roles(
-    current_user: Annotated[AuthUser, Depends(require_permission("roles:read"))],
+    current_user: Annotated[CurrentUser, Depends(require_permission("roles:read"))],
     db: TenantDBSession,
 ) -> list[RoleOut]:
     """List all roles for the current tenant."""
@@ -131,7 +131,7 @@ async def list_roles(
 @router.post("/roles", response_model=RoleOut, status_code=status.HTTP_201_CREATED)
 async def create_role(
     body: RoleIn,
-    current_user: Annotated[AuthUser, Depends(require_permission("roles:write"))],
+    current_user: Annotated[CurrentUser, Depends(require_permission("roles:write"))],
     db: TenantDBSession,
 ) -> RoleOut:
     """Create a custom role for the current tenant."""
@@ -170,7 +170,7 @@ async def create_role(
 @router.get("/roles/{role_id}", response_model=RoleOut)
 async def get_role(
     role_id: uuid.UUID,
-    current_user: Annotated[AuthUser, Depends(require_permission("roles:read"))],
+    current_user: Annotated[CurrentUser, Depends(require_permission("roles:read"))],
     db: TenantDBSession,
 ) -> RoleOut:
     role = await _get_role_or_404(db, role_id, current_user.tenant_id)
@@ -189,15 +189,15 @@ async def get_role(
 async def update_role(
     role_id: uuid.UUID,
     body: RoleUpdate,
-    current_user: Annotated[AuthUser, Depends(require_permission("roles:write"))],
+    current_user: Annotated[CurrentUser, Depends(require_permission("roles:write"))],
     db: TenantDBSession,
 ) -> RoleOut:
     role = await _get_role_or_404(db, role_id, current_user.tenant_id)
 
-    if role.is_system:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="System roles cannot be modified")
+    if role.is_system and body.name is not None and body.name != role.name:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="System role names cannot be renamed")
 
-    if body.name is not None:
+    if body.name is not None and not role.is_system:
         role.name = body.name
     if body.description is not None:
         role.description = body.description
@@ -225,7 +225,7 @@ async def update_role(
 @router.delete("/roles/{role_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 async def delete_role(
     role_id: uuid.UUID,
-    current_user: Annotated[AuthUser, Depends(require_permission("roles:write"))],
+    current_user: Annotated[CurrentUser, Depends(require_permission("roles:write"))],
     db: TenantDBSession,
 ) -> None:
     role = await _get_role_or_404(db, role_id, current_user.tenant_id)
@@ -243,7 +243,7 @@ async def delete_role(
 @router.get("/users/{user_id}/roles", response_model=list[UserRoleOut])
 async def get_user_roles(
     user_id: uuid.UUID,
-    current_user: Annotated[AuthUser, Depends(require_permission("users:read"))],
+    current_user: Annotated[CurrentUser, Depends(require_permission("users:read"))],
     db: TenantDBSession,
 ) -> list[UserRoleOut]:
     """List roles assigned to a user within the current tenant."""
@@ -292,7 +292,7 @@ async def assign_role(
 async def revoke_role(
     user_id: uuid.UUID,
     role_id: uuid.UUID,
-    current_user: Annotated[AuthUser, Depends(require_permission("users:write"))],
+    current_user: Annotated[CurrentUser, Depends(require_permission("users:write"))],
     db: TenantDBSession,
 ) -> None:
     """Revoke a role from a user."""

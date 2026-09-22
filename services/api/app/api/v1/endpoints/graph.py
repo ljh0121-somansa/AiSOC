@@ -5,7 +5,7 @@ AiSOC — open-source AI Security Operations Center (MIT License)
 
 from __future__ import annotations
 
-import logging
+import structlog
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -15,7 +15,7 @@ from sqlalchemy import text
 from app.api.v1.deps import CurrentUser, DBSession, get_current_user
 from app.services import graph_service
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/graph", tags=["graph"])
 
@@ -153,6 +153,183 @@ class UpsertCaseGraphRequest(BaseModel):
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
+
+
+class OverviewGraphNode(BaseModel):
+    id: str
+    label: str
+    kind: str = "asset"
+    riskScore: float | None = None
+    severity: str | None = None
+    properties: dict[str, Any] = Field(default_factory=dict)
+
+
+class OverviewGraphEdge(BaseModel):
+    id: str | None = None
+    source: str
+    target: str
+    label: str | None = None
+
+
+class OverviewGraphResponse(BaseModel):
+    nodes: list[OverviewGraphNode]
+    edges: list[OverviewGraphEdge]
+    generatedAt: str
+
+
+async def _graph_overview_from_relational(
+    db: DBSession, tenant_id: str
+) -> dict[str, Any]:
+    """Reconstruct an overview attack graph from relational alerts."""
+    from datetime import UTC, datetime
+
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    seen_nodes: set[str] = set()
+
+    q = text(
+        "SELECT id, title, severity, category, connector_type, description, "
+        "raw_event FROM alerts "
+        "WHERE tenant_id = CAST(:tid AS UUID) OR tenant_id IS NULL "
+        "ORDER BY created_at DESC LIMIT 50"
+    ).bindparams(tid=tenant_id)
+
+    try:
+        rows = (await db.execute(q)).fetchall()
+        for idx, r in enumerate(rows):
+            alert_id = f"alert:{r.id}"
+            if alert_id not in seen_nodes:
+                seen_nodes.add(alert_id)
+                nodes.append(
+                    {
+                        "id": alert_id,
+                        "label": r.title or f"Alert {str(r.id)[:8]}",
+                        "kind": "alert",
+                        "severity": str(r.severity or "medium").lower(),
+                        "riskScore": 75.0,
+                        "properties": {
+                            "category": r.category,
+                            "connector_type": r.connector_type,
+                        },
+                    }
+                )
+
+            raw_data = r.raw_event or {}
+            if isinstance(raw_data, dict):
+                src_ip = raw_data.get("src_endpoint", {}).get("ip") or raw_data.get("src_ip")
+                hostname = raw_data.get("device", {}).get("name") or raw_data.get("hostname")
+                user_name = raw_data.get("actor", {}).get("user", {}).get("name") or raw_data.get("user_name")
+
+                if src_ip:
+                    ip_id = f"ip:{src_ip}"
+                    if ip_id not in seen_nodes:
+                        seen_nodes.add(ip_id)
+                        nodes.append(
+                            {
+                                "id": ip_id,
+                                "label": str(src_ip),
+                                "kind": "ip",
+                                "riskScore": 80.0,
+                                "properties": {"ip": str(src_ip)},
+                            }
+                        )
+                    edges.append(
+                        {
+                            "id": f"e-ip-{idx}",
+                            "source": ip_id,
+                            "target": alert_id,
+                            "label": "source_of",
+                        }
+                    )
+
+                if hostname:
+                    host_id = f"host:{hostname}"
+                    if host_id not in seen_nodes:
+                        seen_nodes.add(host_id)
+                        nodes.append(
+                            {
+                                "id": host_id,
+                                "label": str(hostname),
+                                "kind": "host",
+                                "riskScore": 65.0,
+                                "properties": {"hostname": str(hostname)},
+                            }
+                        )
+                    edges.append(
+                        {
+                            "id": f"e-host-{idx}",
+                            "source": host_id,
+                            "target": alert_id,
+                            "label": "affected",
+                        }
+                    )
+
+                if user_name:
+                    user_id = f"user:{user_name}"
+                    if user_id not in seen_nodes:
+                        seen_nodes.add(user_id)
+                        nodes.append(
+                            {
+                                "id": user_id,
+                                "label": str(user_name),
+                                "kind": "user",
+                                "riskScore": 60.0,
+                                "properties": {"user_name": str(user_name)},
+                            }
+                        )
+                    edges.append(
+                        {
+                            "id": f"e-user-{idx}",
+                            "source": user_id,
+                            "target": alert_id,
+                            "label": "triggered_by",
+                        }
+                    )
+
+    except Exception as exc:
+        logger.warning("Relational graph overview failed", error=str(exc))
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "generatedAt": datetime.now(UTC).isoformat(),
+    }
+
+
+
+
+@router.get(
+    "",
+    response_model=OverviewGraphResponse,
+    summary="Get tenant attack graph overview",
+)
+@router.get(
+    "/",
+    response_model=OverviewGraphResponse,
+    summary="Get tenant attack graph overview",
+)
+async def get_overview(
+    db: DBSession,
+    depth: Annotated[int, Query(ge=1, le=10)] = 3,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> OverviewGraphResponse:
+    """Return tenant-level attack graph overview from Neo4j or Relational DB."""
+    data: dict[str, Any] | None = None
+    try:
+        data = await graph_service.get_overview_graph(
+            tenant_id=str(current_user.tenant_id),
+            depth=depth,
+        )
+    except Exception as exc:
+        logger.info("Graph overview Neo4j query failed", error=str(exc))
+
+    if not data or not data.get("nodes"):
+        data = await _graph_overview_from_relational(
+            db, str(current_user.tenant_id)
+        )
+
+    return OverviewGraphResponse(**data)
+
 
 
 async def _attack_path_from_relational(

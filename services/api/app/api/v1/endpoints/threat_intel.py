@@ -69,6 +69,11 @@ class IOCOut(IOCCreate):
     model_config = ConfigDict(from_attributes=True)
 
 
+class IndicatorsResponse(BaseModel):
+    indicators: list[IOCOut]
+    total: int
+
+
 class ThreatActorCreate(BaseModel):
     name: str
     aliases: list[str] | None = None
@@ -136,6 +141,54 @@ async def list_iocs(
     q = q.order_by(ThreatIntelIOC.last_seen.desc()).offset(offset).limit(limit)
     result = await db.execute(q)
     return list(result.scalars().all())
+
+
+@router.get(
+    "/indicators",
+    response_model=IndicatorsResponse,
+    summary="List threat indicators",
+)
+async def list_indicators(
+    current_user: Annotated[
+        AuthUser, Depends(require_permission("threat_intel:read"))
+    ],
+    ioc_type: str | None = Query(None),
+    severity: str | None = Query(None),
+    is_active: bool | None = Query(None),
+    limit: int = Query(50, le=500),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    # Query matching records
+    q = select(ThreatIntelIOC).where(
+        ThreatIntelIOC.tenant_id == current_user.tenant_id
+    )
+    if ioc_type:
+        q = q.where(ThreatIntelIOC.ioc_type == ioc_type)
+    if severity:
+        q = q.where(ThreatIntelIOC.severity == severity)
+    if is_active is not None:
+        q = q.where(ThreatIntelIOC.is_active == is_active)
+
+    # Get total count first
+    from sqlalchemy import func
+
+    count_q = select(func.count()).select_from(q.subquery())
+    total = await db.scalar(count_q) or 0
+
+    # Get limited rows
+    q = (
+        q.order_by(ThreatIntelIOC.last_seen.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    result = await db.execute(q)
+    rows = list(result.scalars().all())
+
+    return {
+        "indicators": rows,
+        "total": total,
+    }
 
 
 @router.post("/iocs", response_model=IOCOut, status_code=status.HTTP_201_CREATED)

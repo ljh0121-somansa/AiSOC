@@ -12,80 +12,6 @@ import { clsx } from 'clsx';
 import { format } from 'date-fns';
 import { EmptyState, EmptyStateIcons } from '@/components/ui/EmptyState';
 
-// ─── Mock Data ────────────────────────────────────────────────────────────────
-// Static timestamps avoid SSR/client hydration mismatches (React error #418)
-// that occur when Date.now() differs between server render and client hydration.
-
-const MOCK_INDICATORS: ThreatIndicator[] = [
-  {
-    id: 'ioc-001',
-    type: 'ip',
-    value: '185.220.101.45',
-    confidence: 95,
-    severity: 'critical',
-    tags: ['tor-exit', 'ransomware-c2', 'known-bad'],
-    sources: ['AbuseIPDB', 'VirusTotal', 'GreyNoise'],
-    firstSeen: '2024-01-15T10:00:00Z',
-    lastSeen: '2026-05-06T18:30:00Z',
-    description: 'Tor exit node with ransomware C2 activity',
-    country: 'DE',
-    malicious: true,
-  },
-  {
-    id: 'ioc-002',
-    type: 'domain',
-    value: 'malicious-update-cdn.ru',
-    confidence: 88,
-    severity: 'high',
-    tags: ['phishing', 'credential-harvest'],
-    sources: ['VirusTotal'],
-    firstSeen: '2024-02-01T00:00:00Z',
-    lastSeen: '2026-05-06T17:00:00Z',
-    description: 'Phishing domain mimicking software update CDN',
-    malicious: true,
-  },
-  {
-    id: 'ioc-003',
-    type: 'hash',
-    value: 'a1b2c3d4e5f6789012345678901234567890abcd',
-    confidence: 99,
-    severity: 'critical',
-    tags: ['malware', 'ransomware', 'lockbit'],
-    sources: ['VirusTotal', 'Hybrid Analysis'],
-    firstSeen: '2024-01-28T00:00:00Z',
-    lastSeen: '2026-05-06T19:00:00Z',
-    description: 'LockBit 3.0 ransomware payload hash',
-    malicious: true,
-  },
-  {
-    id: 'ioc-004',
-    type: 'url',
-    value: 'https://cdn.legit-looking.xyz/payload.exe',
-    confidence: 76,
-    severity: 'high',
-    tags: ['dropper', 'malware-distribution'],
-    sources: ['URLScan', 'VirusTotal'],
-    firstSeen: '2024-02-10T00:00:00Z',
-    lastSeen: '2026-05-06T15:00:00Z',
-    description: 'Malware distribution URL hosting dropper',
-    malicious: true,
-  },
-  {
-    id: 'ioc-005',
-    type: 'ip',
-    value: '45.33.32.156',
-    confidence: 62,
-    severity: 'medium',
-    tags: ['scanner', 'reconnaissance'],
-    sources: ['GreyNoise', 'Shodan'],
-    firstSeen: '2024-01-20T00:00:00Z',
-    lastSeen: '2026-05-05T19:30:00Z',
-    description: 'Known internet scanner with anomalous activity',
-    country: 'US',
-    malicious: false,
-  },
-];
-
 // ─── Type badges ──────────────────────────────────────────────────────────────
 
 const TYPE_CONFIG: Record<IndicatorType, { label: string; color: string }> = {
@@ -235,10 +161,10 @@ export function ThreatIntelView() {
   const { data } = useSWR(
     'threat-intel-indicators',
     () => threatIntelApi.list(),
-    { fallbackData: { indicators: MOCK_INDICATORS, total: MOCK_INDICATORS.length } },
+    { fallbackData: undefined },
   );
 
-  const allIndicators = data?.indicators ?? MOCK_INDICATORS;
+  const allIndicators = data?.indicators ?? [];
 
   const indicators = allIndicators.filter((ioc) => {
     if (typeFilter !== 'all' && ioc.type !== typeFilter) return false;

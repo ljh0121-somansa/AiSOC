@@ -21,13 +21,6 @@ _BCRYPT_MAX_BYTES = 72
 
 ROLE_PERMISSIONS: dict[str, list[str]] = {
     "platform_admin": ["*"],
-    # ``admin`` is the role string handed out by the dev-mode demo user
-    # (see ``app.api.v1.dev_auth``) and by some legacy seed scripts. It
-    # must resolve to the same privileges as ``platform_admin`` so that
-    # ``require_permission(...)`` does not silently deny while
-    # identity-only deps silently allow — that inconsistency was the
-    # source of the P0.3 audit finding.
-    "admin": ["*"],
     "tenant_admin": [
         "alerts:read",
         "alerts:write",
@@ -43,46 +36,44 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "connectors:delete",
         "users:read",
         "users:write",
+        "roles:read",
+        "roles:write",
         "rules:read",
         "rules:write",
         "reports:read",
         "reports:write",
         "threat_intel:read",
-        # Tenant admins must be able to manage their tenant's threat-intel
-        # surface (IOCs, actor profiles, feed config). Without :write the
-        # admin role could not even add a feed, let alone delete a poisoned
-        # IOC injected by a compromised analyst.
         "threat_intel:write",
+        "audit_log:read",
+        "compliance:read",
         "settings:read",
         "settings:write",
-        # Workstream 7: tenant lake API. Tenant admins get full access
-        # to the warm-tier query surface (POST /api/v1/lake/sql) and
-        # the schema discovery endpoint (GET /api/v1/lake/schema). The
-        # rewriter still enforces tenant_id predicates and the
-        # ClickHouse client still enforces row caps and timeouts; the
-        # permission only controls who *can* query at all.
         "lake:query",
         "lake:read_schema",
     ],
     "soc_lead": [
         "alerts:read",
         "alerts:write",
+        "alerts:delete",
         "cases:read",
         "cases:write",
+        "cases:delete",
         "playbooks:read",
+        "playbooks:write",
         "playbooks:execute",
         "connectors:read",
-        "users:read",
         "rules:read",
         "rules:write",
         "reports:read",
         "reports:write",
         "threat_intel:read",
-        # SOC leads triage incidents and need to be able to add/expire
-        # IOCs derived from investigations without waiting on the threat-
-        # hunter or tenant-admin role.
         "threat_intel:write",
-        # SOC leads run investigations across the lake routinely.
+        "users:read",
+        "users:write",
+        "roles:read",
+        "audit_log:read",
+        "compliance:read",
+        "settings:read",
         "lake:query",
         "lake:read_schema",
     ],
@@ -94,34 +85,52 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "playbooks:read",
         "playbooks:execute",
         "connectors:read",
-        "threat_intel:read",
+        "rules:read",
         "reports:read",
-        # Analysts need lake access to drill into raw events when
-        # alerts don't tell the whole story. Schema is read-only and
-        # the rate limiter caps abuse.
+        "threat_intel:read",
+        "users:read",
+        "roles:read",
+        "audit_log:read",
+        "compliance:read",
+        "settings:read",
         "lake:query",
         "lake:read_schema",
     ],
     "threat_hunter": [
         "alerts:read",
+        "alerts:write",
         "cases:read",
         "cases:write",
+        "playbooks:read",
+        "connectors:read",
         "threat_intel:read",
         "threat_intel:write",
         "rules:read",
         "rules:write",
         "reports:read",
-        # Threat hunters live in the lake — this is their primary
-        # workspace for hypothesis-driven investigation across raw
-        # events, alert metrics, and IOC enrichments.
+        "users:read",
+        "roles:read",
+        "audit_log:read",
+        "compliance:read",
+        "settings:read",
         "lake:query",
         "lake:read_schema",
     ],
     "viewer": [
         "alerts:read",
         "cases:read",
+        "playbooks:read",
+        "connectors:read",
+        "rules:read",
         "reports:read",
         "threat_intel:read",
+        "users:read",
+        "roles:read",
+        "audit_log:read",
+        "compliance:read",
+        "settings:read",
+        "lake:query",
+        "lake:read_schema",
     ],
     "api_service": [
         "alerts:read",
@@ -131,6 +140,10 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "threat_intel:read",
     ],
 }
+
+# Backwards-compatibility aliases
+ROLE_PERMISSIONS["admin"] = ROLE_PERMISSIONS["tenant_admin"]
+ROLE_PERMISSIONS["analyst"] = ROLE_PERMISSIONS["soc_analyst"]
 
 
 def _to_bcrypt_input(password: str) -> bytes:

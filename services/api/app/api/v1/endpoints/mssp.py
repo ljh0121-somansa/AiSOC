@@ -26,8 +26,8 @@ router = APIRouter(prefix="/mssp", tags=["mssp"])
 class ChildTenantOut(BaseModel):
     id: uuid.UUID
     name: str
-    mssp_role: str
-    created_at: str
+    mssp_role: str | None
+    created_at: datetime | str
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -41,7 +41,7 @@ class TenantNoteOut(TenantNoteCreate):
     id: uuid.UUID
     parent_id: uuid.UUID
     author_id: uuid.UUID | None
-    created_at: str
+    created_at: datetime | str
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -57,7 +57,7 @@ class DelegationOut(DelegationCreate):
     parent_tenant_id: uuid.UUID
     granted_by_user: uuid.UUID | None
     revoked_at: datetime | None
-    created_at: str
+    created_at: datetime | str
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -86,7 +86,9 @@ async def list_child_tenants(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[Tenant]:
-    """Return all child tenants of the current parent tenant."""
+    """Return all child tenants of the current parent tenant (platform_admin only)."""
+    if current_user.role != "platform_admin":
+        return []
     result = await db.execute(select(Tenant).where(Tenant.parent_tenant_id == current_user.tenant_id))
     return list(result.scalars().all())
 

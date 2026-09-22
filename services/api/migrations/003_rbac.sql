@@ -154,7 +154,8 @@ BEGIN
 END;
 $$;
 
--- RLS on RBAC tables
+-- Seed default tenant system roles
+SELECT seed_system_roles('00000000-0000-0000-0000-000000000001'::uuid);
 ALTER TABLE roles            ENABLE ROW LEVEL SECURITY;
 ALTER TABLE roles            FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS roles_tenant ON roles;

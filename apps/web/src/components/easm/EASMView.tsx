@@ -53,41 +53,23 @@ const TYPE_LABELS: Record<AssetType, string> = {
   service: 'Service',
 };
 
-const MOCK_ASSETS: Asset[] = [
-  { id: 'a1', asset: 'corp.example.com', type: 'domain', status: 'healthy', risk: 'low', lastSeen: '2 min ago' },
-  { id: 'a2', asset: 'api.corp.example.com', type: 'subdomain', status: 'warning', risk: 'medium', lastSeen: '5 min ago' },
-  { id: 'a3', asset: '203.0.113.42', type: 'ip', status: 'critical', risk: 'critical', lastSeen: '1 min ago' },
-  { id: 'a4', asset: 'staging.example.com', type: 'subdomain', status: 'warning', risk: 'high', lastSeen: '12 min ago' },
-  { id: 'a5', asset: 'mail.corp.example.com', type: 'service', status: 'healthy', risk: 'low', lastSeen: '3 min ago' },
-  { id: 'a6', asset: '198.51.100.17', type: 'ip', status: 'healthy', risk: 'info', lastSeen: '8 min ago' },
-  { id: 'a7', asset: 'dev.internal.example.com', type: 'subdomain', status: 'critical', risk: 'high', lastSeen: '1 min ago' },
-  { id: 'a8', asset: 'vpn.corp.example.com', type: 'service', status: 'healthy', risk: 'medium', lastSeen: '4 min ago' },
-  { id: 'a9', asset: 'cdn.example.com', type: 'domain', status: 'healthy', risk: 'low', lastSeen: '6 min ago' },
-  { id: 'a10', asset: '192.0.2.88', type: 'ip', status: 'warning', risk: 'medium', lastSeen: '15 min ago' },
-];
+const DEFAULT_ASSETS: Asset[] = [];
 
-const MOCK_CERTIFICATES: Certificate[] = [
-  { id: 'c1', domain: 'corp.example.com', issuer: "Let's Encrypt", expiryDate: '2026-08-14', daysRemaining: 99, status: 'valid' },
-  { id: 'c2', domain: 'api.corp.example.com', issuer: 'DigiCert', expiryDate: '2026-05-21', daysRemaining: 14, status: 'expiring' },
-  { id: 'c3', domain: 'staging.example.com', issuer: "Let's Encrypt", expiryDate: '2026-05-03', daysRemaining: -4, status: 'expired' },
-  { id: 'c4', domain: 'mail.corp.example.com', issuer: 'Sectigo', expiryDate: '2027-01-10', daysRemaining: 248, status: 'valid' },
-  { id: 'c5', domain: 'vpn.corp.example.com', issuer: 'DigiCert', expiryDate: '2026-06-01', daysRemaining: 25, status: 'expiring' },
-  { id: 'c6', domain: 'dev.internal.example.com', issuer: 'Self-Signed', expiryDate: '2026-05-09', daysRemaining: 2, status: 'expiring' },
-];
+const DEFAULT_CERTIFICATES: Certificate[] = [];
 
 const SUMMARY = {
-  totalAssets: MOCK_ASSETS.length,
-  exposedServices: MOCK_ASSETS.filter((a) => a.status === 'critical' || a.status === 'warning').length,
-  certIssues: MOCK_CERTIFICATES.filter((c) => c.status !== 'valid').length,
-  riskScore: 72,
+  totalAssets: 0, //MOCK_ASSETS.length,
+  exposedServices: 0, //MOCK_ASSETS.filter((a) => a.status === 'critical' || a.status === 'warning').length,
+  certIssues: 0, //MOCK_CERTIFICATES.filter((c) => c.status !== 'valid').length,
+  riskScore: 0,
 };
 
 export function EASMView() {
   const [assetFilter, setAssetFilter] = useState<Asset['status'] | 'all'>('all');
 
   const filteredAssets = assetFilter === 'all'
-    ? MOCK_ASSETS
-    : MOCK_ASSETS.filter((a) => a.status === assetFilter);
+    ? DEFAULT_ASSETS
+    : DEFAULT_ASSETS.filter((a) => a.status === assetFilter);
 
   return (
     <div className="space-y-6">
@@ -211,7 +193,7 @@ export function EASMView() {
               </tr>
             </thead>
             <tbody>
-              {MOCK_CERTIFICATES.map((cert) => (
+              {DEFAULT_CERTIFICATES.map((cert) => (
                 <tr key={cert.id} className="border-b border-gray-800/30 hover:bg-gray-800/30 transition-colors">
                   <td className="px-5 py-3">
                     <span className="text-gray-200 font-mono text-xs">{cert.domain}</span>

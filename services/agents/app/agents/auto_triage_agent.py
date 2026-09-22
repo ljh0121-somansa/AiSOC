@@ -96,7 +96,7 @@ You MUST respond with a JSON object and nothing else:
 {
   "verdict": "true_positive" | "benign_true_positive" | "false_positive" | "benign" | "needs_review",
   "confidence": <float 0.0–1.0>,
-  "rationale": "<2-4 sentence explanation of your reasoning>"
+  "rationale": "<2-4 sentence explanation of your reasoning in Korean>"
 }
 
 Reasoning guidelines:
@@ -110,6 +110,7 @@ Reasoning guidelines:
 - Be conservative: when uncertain, prefer true_positive or needs_review over
   auto-closing, to avoid missing threats.
 - confidence should reflect how certain you are, not the severity of the threat.
+- LANGUAGE RULE: To optimize token usage, perform all internal reasoning and JSON keys in English, but you MUST write the "rationale" value in natural, professional Korean for the security analyst UI.
 """
 
 
@@ -231,8 +232,12 @@ async def run_auto_triage(state: InvestigationState) -> InvestigationState:
 
     alert_context = _build_alert_context(state)
 
-    model_name = os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or os.getenv("AISOC_LLM_MODEL", "gpt-4o-mini")
-    llm = ChatOpenAI(model=model_name, temperature=0.0, max_tokens=512)
+    llm = make_chat_model(
+        "triage",
+        temperature=0.0,
+        max_tokens=512,
+        model_kwargs={"response_format": {"type": "json_object"}},
+    )
 
     t0 = time.monotonic()
     try:

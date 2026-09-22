@@ -5,13 +5,13 @@ AiSOC — open-source AI Security Operations Center (MIT License)
 
 from __future__ import annotations
 
-import logging
+import structlog
 from datetime import UTC, datetime
 from typing import Any
 
 from app.db.neo4j import get_session
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 # ─── Entity Upsert Helpers ────────────────────────────────────────────────────
@@ -484,3 +484,143 @@ async def get_mitre_coverage(tenant_id: str) -> list[dict[str, Any]]:
         records = await result.data()
 
     return records
+
+
+
+async def get_overview_graph(
+    tenant_id: str, depth: int = 3, limit: int = 200
+) -> dict[str, Any]:
+    """Fetch the tenant-wide attack graph overview from Neo4j."""
+    cypher = """
+    MATCH (n)
+    WHERE n.tenant_id =  OR n.tenant_id IS NULL
+    OPTIONAL MATCH (n)-[r]-(m)
+    WHERE m.tenant_id =  OR m.tenant_id IS NULL
+    RETURN n, labels(n) AS labels, r, m, labels(m) AS target_labels
+    LIMIT 200
+    """
+    try:
+        async with get_session() as s:
+            result = await s.run(cypher, tenant_id=tenant_id)
+            records = await result.data()
+
+        if not records:
+            return {
+                "nodes": [],
+                "edges": [],
+                "generatedAt": datetime.now(UTC).isoformat(),
+            }
+
+        nodes: list[dict[str, Any]] = []
+        edges: list[dict[str, Any]] = []
+        seen_nodes: set[str] = set()
+        seen_edges: set[str] = set()
+
+        for rec in records:
+            n = rec.get("n")
+            node_id = None
+            if n:
+                props = dict(n)
+                node_id = str(
+                    props.get("id")
+                    or props.get("value")
+                    or props.get("hostname")
+                    or props.get("username")
+                    or props.get("technique_id")
+                    or f"node-{len(seen_nodes) + 1}"
+                )
+                if node_id not in seen_nodes:
+                    seen_nodes.add(node_id)
+                    labels = rec.get("labels") or ["Asset"]
+                    kind = str(labels[0]).lower() if labels else "asset"
+                    label_str = str(
+                        props.get("hostname")
+                        or props.get("username")
+                        or props.get("value")
+                        or props.get("title")
+                        or props.get("name")
+                        or node_id
+                    )
+                    nodes.append(
+                        {
+                            "id": node_id,
+                            "label": label_str,
+                            "kind": kind,
+                            "riskScore": float(
+                                props.get("risk_score", 50.0) or 50.0
+                            ),
+                            "severity": str(
+                                props.get("severity", "medium")
+                            ).lower(),
+                            "properties": props,
+                        }
+                    )
+
+            m = rec.get("m")
+            m_id = None
+            if m:
+                m_props = dict(m)
+                m_id = str(
+                    m_props.get("id")
+                    or m_props.get("value")
+                    or m_props.get("hostname")
+                    or m_props.get("username")
+                    or m_props.get("technique_id")
+                    or f"node-{len(seen_nodes) + 1}"
+                )
+                if m_id not in seen_nodes:
+                    seen_nodes.add(m_id)
+                    m_labels = rec.get("target_labels") or ["Asset"]
+                    m_kind = str(m_labels[0]).lower() if m_labels else "asset"
+                    m_label_str = str(
+                        m_props.get("hostname")
+                        or m_props.get("username")
+                        or m_props.get("value")
+                        or m_props.get("title")
+                        or m_props.get("name")
+                        or m_id
+                    )
+                    nodes.append(
+                        {
+                            "id": m_id,
+                            "label": m_label_str,
+                            "kind": m_kind,
+                            "riskScore": float(
+                                m_props.get("risk_score", 50.0) or 50.0
+                            ),
+                            "severity": str(
+                                m_props.get("severity", "medium")
+                            ).lower(),
+                            "properties": m_props,
+                        }
+                    )
+
+            r = rec.get("r")
+            if r and node_id and m_id:
+                edge_id = f"e-{node_id}-{m_id}"
+                if edge_id not in seen_edges:
+                    seen_edges.add(edge_id)
+                    edges.append(
+                        {
+                            "id": edge_id,
+                            "source": node_id,
+                            "target": m_id,
+                            "label": "relates_to",
+                        }
+                    )
+
+        if nodes:
+            return {
+                "nodes": nodes,
+                "edges": edges,
+                "generatedAt": datetime.now(UTC).isoformat(),
+            }
+
+    except Exception as exc:
+        logger.warning("Neo4j overview graph query failed", error=str(exc))
+
+    return {
+        "nodes": [],
+        "edges": [],
+        "generatedAt": datetime.now(UTC).isoformat(),
+    }

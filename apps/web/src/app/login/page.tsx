@@ -125,26 +125,6 @@ function LoginInner() {
             </p>
           </div>
 
-          {/* Demo banner */}
-          <div className="mb-6 rounded-xl border border-indigo-500/30 bg-indigo-500/5 px-4 py-3 text-sm">
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <p className="font-medium text-indigo-300">Public demo</p>
-                <p className="text-xs text-zinc-400 mt-0.5">
-                  <code className="text-zinc-300">demo@tryaisoc.com</code> /{' '}
-                  <code className="text-zinc-300">aisoc-demo</code>
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={useDemo}
-                className="shrink-0 rounded-lg border border-indigo-500/40 bg-indigo-500/10 px-3 py-1.5 text-xs font-medium text-indigo-200 hover:bg-indigo-500/20 transition"
-              >
-                Use demo
-              </button>
-            </div>
-          </div>
-
           {/* Form */}
           <form onSubmit={submit} className="space-y-4" noValidate>
             <label className="block">

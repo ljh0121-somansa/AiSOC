@@ -7,6 +7,7 @@ import { TimeWindowSelector } from './TimeWindowSelector';
 import { TenantSwitcher } from './TenantSwitcher';
 import { RoleBadge } from './RoleBadge';
 import { useTenant } from './TenantProvider';
+import { authApi } from '@/lib/api';
 
 // Order matters: longer/more specific paths first so startsWith() picks
 // the right label for nested routes (e.g. /detection/catalog before /detection).
@@ -46,7 +47,19 @@ export function TopBar({ demoOffset = false }: TopBarProps) {
   const pathname = usePathname();
   const [now, setNow] = useState<Date | null>(null);
   const [shortcut, setShortcut] = useState<'⌘K' | 'Ctrl K'>('⌘K');
+  const [mounted, setMounted] = useState(false);
   const { userRole } = useTenant();
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  const currentUser = mounted ? authApi.currentUser() : null;
+  const displayUsername = currentUser?.username || currentUser?.email?.split('@')[0] || 'Operator';
+  const displayRole = mounted && userRole
+    ? userRole.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
+    : 'User';
+  const userInitials = displayUsername.slice(0, 2).toUpperCase();
 
   // Update the clock every second on the client only (avoids hydration drift).
   useEffect(() => {
@@ -223,11 +236,11 @@ export function TopBar({ demoOffset = false }: TopBarProps) {
         {/* User avatar */}
         <div className="flex items-center gap-2 cursor-pointer group">
           <div className="w-8 h-8 rounded-full bg-brand-600 flex items-center justify-center text-xs font-bold text-white">
-            SO
+            {userInitials}
           </div>
           <div className="hidden lg:block">
-            <p className="text-xs font-medium text-fg-secondary">SOC Analyst</p>
-            <p className="text-xs text-fg-subtle">Admin</p>
+            <p className="text-xs font-medium text-fg-secondary">{displayUsername}</p>
+            <p className="text-xs text-fg-subtle">{displayRole}</p>
           </div>
         </div>
       </div>

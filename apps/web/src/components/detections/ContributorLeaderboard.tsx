@@ -21,9 +21,7 @@ const BADGE_STYLES: Record<Contributor['badge'], { bg: string; text: string; bor
   bronze:   { bg: 'bg-orange-500/10',  text: 'text-orange-300', border: 'border-orange-500/30', label: 'Bronze' },
 };
 
-const CORE_CONTRIBUTORS: Contributor[] = [
-  { name: 'AiSOC', rules: 218, categories: ['cloud', 'endpoint', 'identity', 'network', 'application'], badge: 'platinum' },
-];
+const CORE_CONTRIBUTORS: Contributor[] = [];
 
 const BADGE_THRESHOLDS: { tier: Contributor['badge']; min: number; label: string }[] = [
   { tier: 'platinum', min: 50, label: '50+ rules' },

@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import { clsx } from 'clsx';
 import { EmptyState, EmptyStateIcons } from '@/components/ui/EmptyState';
+import { isDemoMode } from '@/lib/demoMode';
 
 interface Analyst {
   id: string;
@@ -90,12 +91,15 @@ export function TeamAnalyticsView() {
   const [sortBy, setSortBy] = useState<SortKey>('score');
   const [search, setSearch] = useState('');
 
-  const totalCases = ANALYSTS.reduce((s, a) => s + a.casesClosed, 0);
-  const avgResolution = Math.round(ANALYSTS.reduce((s, a) => s + a.avgResolutionMin, 0) / ANALYSTS.length);
-  const teamAccuracy = (ANALYSTS.reduce((s, a) => s + a.accuracy, 0) / ANALYSTS.length).toFixed(1);
-  const totalBadges = ANALYSTS.reduce((s, a) => s + a.badges.length, 0);
+  const demoActive = isDemoMode();
+  const analystsList = demoActive ? ANALYSTS : [];
 
-  const sorted = [...ANALYSTS]
+  const totalCases = analystsList.reduce((s, a) => s + a.casesClosed, 0);
+  const avgResolution = analystsList.length > 0 ? Math.round(analystsList.reduce((s, a) => s + a.avgResolutionMin, 0) / analystsList.length) : 0;
+  const teamAccuracy = analystsList.length > 0 ? (analystsList.reduce((s, a) => s + a.accuracy, 0) / analystsList.length).toFixed(1) : '0.0';
+  const totalBadges = analystsList.reduce((s, a) => s + a.badges.length, 0);
+
+  const sorted = [...analystsList]
     .filter((a) => !search.trim() || a.name.toLowerCase().includes(search.toLowerCase()))
     .sort((a, b) => {
       switch (sortBy) {
@@ -105,6 +109,24 @@ export function TeamAnalyticsView() {
         case 'speed':    return a.avgResolutionMin - b.avgResolutionMin;
       }
     });
+
+  if (!demoActive && analystsList.length === 0) {
+    return (
+      <div className="space-y-6">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight text-white">Team Analytics</h1>
+          <p className="mt-1 text-sm text-gray-400">Analyst performance and gamification leaderboard</p>
+        </div>
+        <div className="rounded-xl border border-gray-800 bg-gray-900/40 p-12">
+          <EmptyState
+            icon={EmptyStateIcons.cases}
+            title="No Team Analytics Data Yet"
+            description="Analyst performance metrics, closed cases, and achievements will appear here as your team handles alerts and cases."
+          />
+        </div>
+      </div>
+    );
+  }
 
   const SORT_OPTIONS: { key: SortKey; label: string }[] = [
     { key: 'score',    label: 'Score' },

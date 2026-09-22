@@ -32,7 +32,7 @@ DEMO_USER_ID: uuid.UUID = uuid.UUID("00000000-0000-0000-0000-000000000002")
 # pydantic ``EmailStr``). Deterministic, public-demo-only credentials.
 DEMO_USER_EMAIL: str = "demo@tryaisoc.com"
 DEMO_USER_PASSWORD: str = "aisoc-demo"
-DEMO_USER_ROLE: str = "admin"
+DEMO_USER_ROLE: str = "platform_admin"
 
 
 def is_dev_mode() -> bool:

@@ -35,6 +35,8 @@ from sqlalchemy import and_, or_, select, update
 from app.api.v1.deps import AuthUser, DBSession, require_permission
 from app.models.detection_rule import DetectionRule
 from app.services.rule_engine import execute_rule
+from app.core.mitre import resolve_tactic
+from app.core.mitre import total_techniques_count
 
 router = APIRouter(prefix="/detection", tags=["detection_rules"])
 
@@ -148,6 +150,14 @@ def _parse_sample_events(sample: str | None) -> list[dict[str, Any]]:
     if not text:
         return [{}]
 
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                return [data]
+        except Exception:
+            pass
+            
     # Try JSON array first.
     if text.startswith("["):
         try:
@@ -550,7 +560,6 @@ DRIFT_FP_RATE_THRESHOLD = 0.2
 DRIFT_LOW_CONFIDENCE_THRESHOLD = 40
 DRIFT_STALE_DAYS = 30
 
-
 def _primary_tactic(rule: DetectionRule) -> str | None:
     """Pick a single tactic to plot a rule's techniques against.
 
@@ -594,9 +603,17 @@ def _build_coverage(rules: list[DetectionRule], *, now: datetime | None = None) 
             if not tech_id:
                 continue
             cell = by_technique[tech_id]
+
+            final_tactic = (
+                tactic
+                or cell["tactic"]
+                or resolve_tactic(tech_id)
+            )
+
             # Keep the first non-null tactic we see for stable plotting.
-            if cell["tactic"] is None and tactic:
-                cell["tactic"] = tactic
+            if final_tactic and final_tactic != "unmapped":
+                cell["tactic"] = final_tactic
+                tactics_set.add(final_tactic)
             if is_active:
                 cell["active"] = int(cell["active"]) + 1
             else:
@@ -615,7 +632,7 @@ def _build_coverage(rules: list[DetectionRule], *, now: datetime | None = None) 
     cells.sort(key=lambda c: (c.tactic or "zzz-unmapped", c.techniqueId))
 
     covered = sum(1 for c in cells if c.activeRules > 0)
-
+    total_count = total_techniques_count()
     return CoverageResponse(
         tactics=sorted(tactics_set),
         cells=cells,
@@ -623,7 +640,7 @@ def _build_coverage(rules: list[DetectionRule], *, now: datetime | None = None) 
             totalRules=total_rules,
             activeRules=active_rules,
             inactiveRules=total_rules - active_rules,
-            techniques=len(cells),
+            techniques=len(cells) if total_count<=0 else total_count,
             coveredTechniques=covered,
         ),
         generatedAt=now.isoformat(),
