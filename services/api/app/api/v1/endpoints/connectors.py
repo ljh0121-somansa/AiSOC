@@ -159,6 +159,27 @@ class ConnectorResponse(BaseModel):
 
     model_config = {"from_attributes": True}
 
+def _normalize_config(raw) -> dict:
+    """Normalize raw JSONB config to dict, rescuing nested dicts or JSON strings from lists."""
+    if isinstance(raw, dict):
+        return raw
+
+    if isinstance(raw, list):
+        merged = {}
+        for item in raw:
+            if isinstance(item, dict):
+                merged.update(item)
+            elif isinstance(item, str):
+                try:
+                    parsed = json.loads(item)
+                    if isinstance(parsed, dict):
+                        merged.update(parsed)
+                except Exception:
+                    pass
+        return merged
+    return {}
+
+
 
 def _build_connector_response(connector: Connector) -> ConnectorResponse:
     """Hydrate a ``ConnectorResponse`` and attach the live freshness SLO.
@@ -171,6 +192,8 @@ def _build_connector_response(connector: Connector) -> ConnectorResponse:
     declare "this Splunk instance polls hourly, don't paint yellow"
     without changing the global table.
     """
+    if not isinstance(connector.connector_config, dict):
+        connector.connector_config = _normalize_config(connector.connector_config)
     response = ConnectorResponse.model_validate(connector)
     override = None
     cfg = connector.connector_config or {}

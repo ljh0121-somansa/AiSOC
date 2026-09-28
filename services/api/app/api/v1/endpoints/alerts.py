@@ -4,7 +4,7 @@ import logging
 import re
 import uuid
 from datetime import UTC, datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel
@@ -119,13 +119,14 @@ class AlertDetailResponse(AlertResponse):
       merged from the case timeline and the audit log.
     * ``recommended_actions`` — normalised structured actions from
       the ResponderAgent (or the legacy list-of-strings shape).
+    * ``raw_event`` — raw event payload for the full-detail Raw JSON tab.
     """
 
     narrative: str | None = None
     related_entities: list[RelatedEntity] = []
     mini_timeline: list[MiniTimelineEvent] = []
     recommended_actions: list[RecommendedAction] = []
-
+    raw_event: Any = None
 
 class AlertSnoozeRequest(BaseModel):
     """Snooze an alert from the mobile responder PWA."""

@@ -21,6 +21,9 @@ def _clean_llm_env(monkeypatch):
         "OPENAI_BASE_URL",
         "LLM_BASE_URL",
         "LLM_GATEWAY_URL",
+        "OPENAI_MODEL",
+        "LLM_MODEL",
+        "OPENAI_MODEL_NAME",
         "AISOC_MODEL_PIN_TRIAGE",
         "AISOC_MODEL_PIN_NL",
     ):
@@ -42,6 +45,18 @@ def test_alias_env_override_escape_hatch(monkeypatch):
     # Other roles are unaffected by a single-role override.
     assert resolve_model_alias("nl") == "aisoc-nl"
 
+
+
+def test_alias_falls_back_to_openai_model(monkeypatch):
+    monkeypatch.setenv("OPENAI_MODEL", "qwen3_8")
+    assert resolve_model_alias("triage") == "qwen3_8"
+    assert resolve_model_alias("copilot") == "qwen3_8"
+    assert resolve_model_alias("investigation") == "qwen3_8"
+
+    # Specific role pin takes precedence over global OPENAI_MODEL
+    monkeypatch.setenv("AISOC_MODEL_PIN_TRIAGE", "special-triage")
+    assert resolve_model_alias("triage") == "special-triage"
+    assert resolve_model_alias("copilot") == "qwen3_8"
 
 # ── resolve_base_url ─────────────────────────────────────────────────────────
 

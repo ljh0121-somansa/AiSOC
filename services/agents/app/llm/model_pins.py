@@ -58,8 +58,15 @@ _DEFAULT_PINS: dict[str, ModelPin] = {
 
 
 def _env_override(role: str) -> str | None:
-    return os.environ.get(f"AISOC_MODEL_PIN_{role.upper()}")
-
+    role_pin = os.environ.get(f"AISOC_MODEL_PIN_{role.upper()}")
+    if role_pin:
+        return role_pin
+    return (
+        os.environ.get("OPENAI_MODEL", "").strip()
+        or os.environ.get("LLM_MODEL", "").strip()
+        or os.environ.get("OPENAI_MODEL_NAME", "").strip()
+        or None
+    )
 
 def get_pin(role: str) -> ModelPin:
     """Return the pin for a role, honouring an env override of the primary."""

@@ -413,8 +413,14 @@ async def _stream_llm(system: str, user: str, model: str) -> AsyncIterator[str]:
         for i in range(0, len(text), 8):
             yield text[i : i + 8]
         return
-    max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "2048")) 
-    llm = ChatOpenAI(model=model, temperature=0.2, max_tokens=max_tokens, streaming=True, response_format={"type": "json_object"})
+    max_tokens = int(os.getenv("AISOC_MAX_TOKENS", "2048"))
+    llm = ChatOpenAI(
+        model=model,
+        temperature=0.2,
+        max_tokens=max_tokens,
+        streaming=True,
+        model_kwargs={"response_format": {"type": "json_object"}},
+    )
     buffer = ""
     async for chunk in safe_astream(llm, [SystemMessage(content=system), HumanMessage(content=user)]):
         if not hasattr(chunk, "content") or not chunk.content:

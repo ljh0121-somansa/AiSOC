@@ -25,9 +25,9 @@ service's lifespan), not in this router.
 
 from __future__ import annotations
 
+import inspect
 import re
 from typing import Any
-
 import structlog
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
@@ -153,18 +153,25 @@ class PushStatusChangeRequest(BaseModel):
 def _instantiate_or_422(cls: type, kwargs: dict[str, Any]) -> Any:
     """Construct ``cls(**kwargs)`` and convert config errors to HTTP 422.
 
-    Pulled out into a helper because four endpoints now share the exact
-    same construction path; keeping it inline meant duplicating the
-    ``TypeError`` handling four times.
+    Defensively strips platform/scheduler metadata (checkpoint,
+    poll_interval_seconds) if the connector class does not declare them.
     """
+    cleaned = {k: v for k, v in kwargs.items() if k not in {"checkpoint"}}
     try:
-        return cls(**kwargs)
+        sig = inspect.signature(cls.__init__)
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        if not has_var_kw and "poll_interval_seconds" in cleaned and "poll_interval_seconds" not in sig.parameters:
+            cleaned.pop("poll_interval_seconds", None)
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        return cls(**cleaned)
     except TypeError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"connector config does not match schema: {exc}",
         ) from exc
-
 
 def _require_capability(cls: type, capability: Capability, connector_id: str) -> None:
     """Reject calls to a connector that doesn't declare ``capability``.
@@ -251,23 +258,7 @@ async def test_connector_connection(connector_id: str, payload: TestConnectionRe
     # boundary.
     kwargs = {**payload.auth_config, **payload.connector_config}
 
-    try:
-        connector = cls(**kwargs)
-    except TypeError as exc:
-        # Almost always "missing 1 required positional argument" or "got
-        # unexpected keyword argument", i.e. caller passed a config that
-        # doesn't match this connector's schema. Surface as 422 so the
-        # frontend can highlight the offending field.
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"connector config does not match schema: {exc}",
-        ) from exc
-    except Exception as exc:  # pragma: no cover - last-ditch
-        logger.exception("connector.test.constructor_error", connector_id=_safe_log_val(connector_id))
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to construct connector. Check your configuration.",
-        ) from exc
+    connector = _instantiate_or_422(cls, kwargs)
 
     try:
         result = await connector.test_connection()
@@ -299,13 +290,7 @@ async def get_resource_config(connector_id: str, payload: ResourceConfigRequest)
         raise HTTPException(status_code=404, detail=f"Connector '{connector_id}' not found")
 
     kwargs = {**payload.auth_config, **payload.connector_config}
-    try:
-        connector = cls(**kwargs)
-    except TypeError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"connector config does not match schema: {exc}",
-        ) from exc
+    connector = _instantiate_or_422(cls, kwargs)
 
     try:
         config = await connector.get_resource_config(payload.resource_id, payload.at_ts)
@@ -352,13 +337,7 @@ async def run_federated_query(connector_id: str, payload: FederatedQueryRequest)
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
 
     kwargs = {**payload.auth_config, **payload.connector_config}
-    try:
-        connector = cls(**kwargs)
-    except TypeError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"connector config does not match schema: {exc}",
-        ) from exc
+    connector = _instantiate_or_422(cls, kwargs)
 
     try:
         rows = await connector.query(unified)

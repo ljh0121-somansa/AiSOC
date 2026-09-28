@@ -813,9 +813,13 @@ function normalizeAlert(raw: unknown): Alert {
     confidenceLabel: (r.confidence_label ?? r.confidenceLabel) as
       | ConfidenceLabel
       | undefined,
-    confidenceScore:
-      pickNum('confidence_score', 'confidenceScore') ??
-      pickNum('confidence', 'confidence'),
+    confidenceScore: (() => {
+      const num =
+        pickNum('confidence_score', 'confidenceScore') ??
+        pickNum('confidence', 'confidence');
+      if (typeof num !== 'number') return undefined;
+      return num > 1 ? Number((num / 100).toFixed(4)) : num;
+    })(),
     confidenceRationale,
     ledgerRunId: pickStr('ledger_run_id', 'ledgerRunId'),
     disposition: (r.disposition ?? null) as Alert['disposition'],

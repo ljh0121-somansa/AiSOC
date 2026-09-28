@@ -34,6 +34,7 @@ from sqlalchemy import (
     cast,
     func,
     select,
+    text,
     update,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -118,6 +119,26 @@ class ConnectorInstance:
     last_outage_at: datetime | None = None
     last_backfill_at: datetime | None = None
 
+def normalize_config(raw) -> dict:
+    """Normalize raw JSONB config to dict, rescuing nested dicts or JSON strings from lists."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, list):
+        merged: dict[str, Any] = {}
+        for item in raw:
+            if isinstance(item, dict):
+                merged.update(item)
+            elif isinstance(item, str):
+                try:
+                    parsed = json.loads(item)
+                    if isinstance(parsed, dict):
+                        merged.update(parsed)
+                except Exception:
+                    pass
+        return merged
+    return {}
+
+
 
 async def fetch_enabled_connectors(connection: Any) -> list[ConnectorInstance]:
     """Return every connector instance with ``is_enabled = True``.
@@ -155,8 +176,8 @@ async def fetch_enabled_connectors(connection: Any) -> list[ConnectorInstance]:
             name=row.name,
             connector_type=row.connector_type,
             is_enabled=row.is_enabled,
-            auth_config=row.auth_config or {},
-            connector_config=row.connector_config or {},
+            auth_config=normalize_config(row.auth_config),
+            connector_config=normalize_config(row.connector_config),
             health_status=row.health_status,
             last_sync=row.last_sync,
             events_ingested=row.events_ingested,
@@ -260,8 +281,16 @@ async def record_checkpoint(
     re-scans a bounded overlap rather than skipping events.
     """
     now = datetime.now(UTC)
-    patch = cast(json.dumps({"checkpoint": checkpoint}), JSONB)
-    merged = func.coalesce(connectors_table.c.connector_config, cast("{}", JSONB)).op("||")(patch)
+    safe_target = func.case(
+        (func.jsonb_typeof(connectors_table.c.connector_config) == "object", connectors_table.c.connector_config),
+        else_=cast("{}", JSONB),
+    )
+    merged = func.jsonb_set(
+        safe_target,
+        text("ARRAY['checkpoint']"),
+        cast(json.dumps(checkpoint), JSONB),
+        True,
+    )
     stmt = update(connectors_table).where(connectors_table.c.id == connector_id).values(connector_config=merged, updated_at=now)
     await connection.execute(stmt)
 

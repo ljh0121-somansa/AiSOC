@@ -74,7 +74,7 @@ class SplunkConnector(BaseConnector):
                     "string",
                     "Saved Search Name",
                     required=False,
-                    default="AiSOC_Alerts",
+                    default="",
                     help_text="Dispatched via the saved-search endpoint. Leave blank to search index=notable.",
                 ),
                 Field(
@@ -92,14 +92,6 @@ class SplunkConnector(BaseConnector):
                     required=False,
                     default=True,
                     help_text="Disable only for self-signed certificates in private deployments.",
-                ),
-                Field(
-                    "poll_interval_seconds",
-                    "integer",
-                    "Polling Interval (seconds)",
-                    required=False,
-                    default=300,
-                    help_text="How often to query Splunk for alerts (e.g. 300 for 5 min, 86400 for 24 hours).",
                 ),
             ],
         )
@@ -121,11 +113,15 @@ class SplunkConnector(BaseConnector):
         self,
         base_url: str,
         token: str,
-        saved_search: str = "AiSOC_Alerts",
+        saved_search: str = "",
         ssl_verify: bool = True,
         page_size: int = _DEFAULT_PAGE_SIZE,
+        **kwargs,
     ):
-        self._base_url = base_url.rstrip("/")
+        url = str(base_url).strip().rstrip("/")
+        if not url.startswith(("http://", "https://")):
+            url = f"https://{url}"
+        self._base_url = url
         self._token = token
         self._saved_search = saved_search
         self._ssl_verify = ssl_verify
@@ -156,8 +152,13 @@ class SplunkConnector(BaseConnector):
         return self._next_checkpoint
 
     def _headers(self) -> dict[str, str]:
+        tok = str(self._token).strip()
+        if tok.lower().startswith("bearer ") or tok.lower().startswith("splunk "):
+            auth_header = tok
+        else:
+            auth_header = f"Bearer {tok}"
         return {
-            "Authorization": f"Bearer {self._token}",
+            "Authorization": auth_header,
             "Content-Type": "application/x-www-form-urlencoded",
         }
 
@@ -195,7 +196,10 @@ class SplunkConnector(BaseConnector):
             sid = await self._dispatch(client, earliest)
             if not sid:
                 return []
-            await self._await_job(client, sid)
+            state = await self._await_job(client, sid)
+            if state != "DONE":
+                logger.warning("splunk.search_job.unfinished", sid=sid, state=state)
+                raise RuntimeError(f"Splunk search job {sid} ended with state: {state}")
             rows = await self._collect_results(client, sid)
 
         ordered = self._order_and_checkpoint(rows)
@@ -222,8 +226,16 @@ class SplunkConnector(BaseConnector):
                     "trigger_actions": "0",
                 },
             )
-            resp.raise_for_status()
-            return self._extract_sid(resp)
+            if resp.status_code == 404 and ss == "AiSOC_Alerts":
+                logger.warning(
+                    "splunk.saved_search.not_found",
+                    saved_search=ss,
+                    fallback="index=notable",
+                    msg="Default saved search 'AiSOC_Alerts' not found on Splunk server; falling back to notable index",
+                )
+            else:
+                resp.raise_for_status()
+                return self._extract_sid(resp)
 
         index = ss[len("index=") :] if ss.startswith("index=") else "notable"
         resp = await client.post(
@@ -315,7 +327,8 @@ class SplunkConnector(BaseConnector):
         flow into the fusion engine. The API layer wraps each row with
         connector identity so downstream consumers can tell sources apart.
         """
-        index = self._saved_search if self._saved_search.startswith("index=") else "notable"
+        raw_ss = (self._saved_search or "").strip()
+        index = raw_ss[len("index=") :] if raw_ss.startswith("index=") else (raw_ss or "notable")
         spl = to_spl(unified, index=index)
         async with httpx.AsyncClient(timeout=60.0, verify=self._ssl_verify) as client:
             resp = await client.post(

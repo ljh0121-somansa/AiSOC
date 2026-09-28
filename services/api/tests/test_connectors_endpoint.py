@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 from app.api.v1.endpoints.connectors import (
+    _build_connector_response,
     _fetch_catalog,
     _proxy_test_connection,
     _validate_connector_type,
@@ -245,3 +246,36 @@ async def test_proxy_test_connection_non_dict_body_normalised() -> None:
         result = await _proxy_test_connection("splunk", {}, {})
     assert isinstance(result, dict)
     assert result["success"] is False
+
+
+def test_build_connector_response_rescues_corrupted_list_connector_config() -> None:
+    import uuid
+    from datetime import datetime, UTC
+    from app.models.connector import Connector
+
+    # Simulates DB row where connector_config became an array due to Postgres ||
+    connector = Connector(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        name="Splunk SIEM",
+        connector_type="splunk",
+        category="siem",
+        is_enabled=True,
+        connector_config=[
+            {"base_url": "https://10.204.10.91:8089", "saved_search": ""},
+            '{"checkpoint": {"time": "2026-09-28T09:00:00Z", "id": "1"}}',
+        ],
+        health_status="healthy",
+        events_ingested=100,
+        events_dropped=0,
+        error_count=0,
+        oauth_provisioned=False,
+        tags=[],
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    # Should not raise pydantic.ValidationError
+    resp = _build_connector_response(connector)
+    assert isinstance(resp.connector_config, dict)
+    assert resp.connector_config["base_url"] == "https://10.204.10.91:8089"
+    assert resp.connector_config["checkpoint"] == {"time": "2026-09-28T09:00:00Z", "id": "1"}

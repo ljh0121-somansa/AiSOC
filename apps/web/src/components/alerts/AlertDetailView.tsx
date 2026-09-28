@@ -105,7 +105,10 @@ function IOCBadge({ type, value, malicious }: { type: string; value: string; mal
 
 function ConfidenceChip({ label, score }: { label: ConfidenceLabel; score?: number }) {
   const cfg = CONFIDENCE_CONFIG[label];
-  const pct = typeof score === 'number' ? Math.round(score * 100) : null;
+  const pct =
+    typeof score === 'number'
+      ? Math.max(0, Math.min(100, Math.round(score > 1 ? score : score * 100)))
+      : null;
   return (
     <span
       className={clsx(
@@ -159,6 +162,11 @@ function ConfidenceExplainability({
 }) {
   const cfg = CONFIDENCE_CONFIG[label];
   const sortedRationale = [...rationale].sort((a, b) => b.contribution - a.contribution);
+  const normalizedScore = typeof score === 'number' ? (score > 1 ? score / 100 : score) : null;
+  const normalizedPct =
+    typeof score === 'number'
+      ? Math.max(0, Math.min(100, Math.round(score > 1 ? score : score * 100)))
+      : null;
 
   return (
     <Section title="Detection Confidence">
@@ -168,9 +176,9 @@ function ConfidenceExplainability({
           <div className="flex-1">
             <div className="flex items-baseline gap-3">
               <span className="text-sm font-semibold text-gray-100">{cfg.label}</span>
-              {typeof score === 'number' && (
+              {normalizedScore !== null && normalizedPct !== null && (
                 <span className="text-xs font-mono text-gray-500">
-                  score {score.toFixed(2)} ({Math.round(score * 100)}%)
+                  score {normalizedScore.toFixed(2)} ({normalizedPct}%)
                 </span>
               )}
             </div>
