@@ -7,7 +7,14 @@ license = "MIT"
 
 [tool.poetry.dependencies]
 python = "^3.11"
-fastapi = ">=0.109,<0.137"
+# Aligned with services/api. The previous `<0.137` cap held starlette at
+# 1.0.0, which carries six advisories (PYSEC-2026-161/248/249/2280/2281),
+# and because a stale poetry.lock kept this service out of the dependency
+# scan entirely, nothing in CI ever said so (#650).
+# Floor 0.117: below it a `-> None` handler under PEP 563 trips FastAPI's
+# "204 must not have a response body" assert at import. One range for
+# every service — see services/api/pyproject.toml for the measurement.
+fastapi = ">=0.117,<0.142"
 uvicorn = {extras = ["standard"], version = "^0.27.0"}
 pydantic = "^2.5.0"
 pydantic-settings = "^2.1.0"
@@ -24,9 +31,20 @@ structlog = ">=24.1,<26.0"
 asyncpg = ">=0.29,<0.31"
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^7.4.0"
-pytest-asyncio = "^0.23.0"
+# Floored at 9.0.3 for GHSA advisory coverage; the caret pins excluded it.
+# pytest-asyncio is widened to match — 0.23 predates pytest 9 and the two
+# resolve together or not at all.
+pytest = ">=9.0.3,<10.0"
+pytest-asyncio = ">=1.0,<2.0"
 respx = "^0.21.1"
+
+# Same shape as services/api and services/osquery-tls rather than a third
+# strictness level. `python_version` is pinned so the finding set does not
+# move with whatever interpreter mypy happens to run on.
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true
 
 [build-system]
 requires = ["poetry-core"]

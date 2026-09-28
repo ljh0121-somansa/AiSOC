@@ -24,6 +24,7 @@ Usage:
     python scripts/validate_playbooks.py
     python scripts/validate_playbooks.py path/to/extra/dir
 """
+
 from __future__ import annotations
 
 import json
@@ -31,17 +32,32 @@ import sys
 from collections.abc import Iterable
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+# `scripts/` is on sys.path when this file is run as a program, but not when a
+# test loads it by path with importlib. gate_toolkit sits beside it either way.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from gate_toolkit import repo_root, self_test_if_requested
+
+self_test_if_requested(__file__)
+
+ROOT = repo_root()
 DEFAULT_PACK = ROOT / "playbooks" / "packs" / "v1"
 
 # Make the services/agents Pydantic models importable.
 sys.path.insert(0, str(ROOT / "services" / "agents"))
 
+# Raised rather than printed-and-exited: `scripts/check_playbook_schema_parity.py`
+# imports this module to read SUPPORTED_TRIGGERS, and `sys.exit()` raises
+# SystemExit, which derives from BaseException and so slips past that gate's
+# `except Exception`. A broken environment would have killed the parity gate's
+# interpreter instead of producing its diagnostic.
 try:
     from app.playbook.models import Playbook, StepType  # type: ignore[import-not-found]
-except Exception as exc:  # pragma: no cover - import errors visible to user
-    print(f"FATAL: cannot import Playbook model: {exc}", file=sys.stderr)
-    sys.exit(2)
+except Exception as exc:  # noqa: BLE001 - environment, not input
+    raise ImportError(
+        f"cannot import the Playbook model from services/agents: {exc}. "
+        "Install that service's dependencies before running the playbook validator."
+    ) from exc
 
 
 SUPPORTED_TRIGGERS = {"alert", "case", "manual", "schedule"}
@@ -87,9 +103,7 @@ def _validate_one(fp: Path) -> tuple[Playbook | None, list[str]]:
             # Allow trailing condition with no branches (acts as filter / gate).
         else:
             if s.next_true or s.next_false:
-                errors.append(
-                    f"step '{s.id}': non-condition step has next_true/next_false"
-                )
+                errors.append(f"step '{s.id}': non-condition step has next_true/next_false")
 
     # Trigger sanity
     on = pb.trigger.get("on") if isinstance(pb.trigger, dict) else None
@@ -121,10 +135,7 @@ def main() -> int:
         if pb is None:
             continue
         if pb.id in seen_ids:
-            all_errors.append(
-                f"{rel}: duplicate playbook id '{pb.id}' "
-                f"(also in {seen_ids[pb.id].relative_to(ROOT)})"
-            )
+            all_errors.append(f"{rel}: duplicate playbook id '{pb.id}' (also in {seen_ids[pb.id].relative_to(ROOT)})")
         else:
             seen_ids[pb.id] = fp
         # Category is the parent dir name relative to packs/v1.

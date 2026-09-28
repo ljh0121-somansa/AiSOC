@@ -11,14 +11,25 @@ Routes
 ------
 
 ``GET /v1/identity/effective-permissions/providers``
-    Return the supported provider list + per-provider coverage status. The
-    UI uses this to render the provider switcher and grey-out the
-    scaffolded providers.
+    Return the supported provider list + per-provider coverage status.
+    The UI uses this to render the provider switcher.
 
 ``GET /v1/identity/{principal_id}/effective-permissions?provider=...``
-    Return a :class:`ResolverResult` JSON envelope. Scaffolded providers
-    (Azure, GCP, Okta, GWS) return HTTP 501 with the same envelope shape so
-    the UI can still render the empty state.
+    Return a :class:`ResolverResult` JSON envelope.
+
+All five resolvers — AWS, Azure, GCP, Okta and Google Workspace — are
+implemented and report ``coverage: "full"``. This docstring described Azure,
+GCP, Okta and GWS as scaffolds returning HTTP 501 long after they stopped
+being scaffolds, and the ``NotImplementedError`` branch below has been
+unreachable for as long.
+
+What *is* still limited is the **snapshot**, not the resolver. A resolver is a
+pure function over a provider snapshot, and only Okta's is assembled from a
+live connector today — the other four expect a connector to answer the
+``__posture_snapshot__`` sentinel, and no connector implements it. With
+``AISOC_EFFECTIVE_PERMISSIONS_LIVE=1`` those four therefore return **412**
+("no policy snapshot ingested yet") rather than a fabricated snapshot. See
+``app/services/effective_permissions/posture_loader.py``.
 
 The endpoint deliberately accepts an optional ``snapshot_b64`` query param
 (base64-encoded JSON) so an analyst can dry-run the resolver against a
@@ -39,11 +50,11 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, s
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.v1.deps import CurrentUser
 from app.api.v1.endpoints.auth import get_current_user
 from app.core.config import settings
 from app.db.database import get_db
 from app.models.connector import Connector
-from app.models.tenant import User
 from app.security.credential_vault import get_vault
 from app.services.effective_permissions.base import ResolverError
 from app.services.effective_permissions.posture_loader import (
@@ -107,7 +118,7 @@ async def _maybe_live_snapshot(db: AsyncSession, tenant_id: Any, provider: str, 
     summary="List supported effective-permissions providers",
 )
 async def list_providers(
-    _user: User = Depends(get_current_user),
+    _user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Return ``{"providers": [{"name", "coverage"}, ...]}``.
 
@@ -135,10 +146,10 @@ async def get_effective_permissions(
     snapshot_b64: str | None = Query(
         None,
         description=(
-            "Optional base64-encoded JSON snapshot for dry-run resolution. " "Only honoured when AISOC_ALLOW_INLINE_SNAPSHOT=1 is set."
+            "Optional base64-encoded JSON snapshot for dry-run resolution. Only honoured when AISOC_ALLOW_INLINE_SNAPSHOT=1 is set."
         ),
     ),
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """Resolve and return the effective-permissions envelope.
@@ -150,7 +161,7 @@ async def get_effective_permissions(
     if provider not in SUPPORTED_PROVIDERS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(f"unknown provider {provider!r}; " f"supported: {sorted(SUPPORTED_PROVIDERS)}"),
+            detail=(f"unknown provider {provider!r}; supported: {sorted(SUPPORTED_PROVIDERS)}"),
         )
 
     snapshot: dict[str, Any] | None = None
@@ -158,7 +169,7 @@ async def get_effective_permissions(
         if os.getenv(_INLINE_SNAPSHOT_FLAG, "0") != "1":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="inline snapshots are disabled; set " f"{_INLINE_SNAPSHOT_FLAG}=1 to dry-run.",
+                detail=f"inline snapshots are disabled; set {_INLINE_SNAPSHOT_FLAG}=1 to dry-run.",
             )
         try:
             snapshot = json.loads(base64.b64decode(snapshot_b64).decode("utf-8"))
@@ -181,6 +192,15 @@ async def get_effective_permissions(
             snapshot=snapshot,
         )
     except NotImplementedError as exc:
+        # Kept as a guard, not as a documented behaviour. Every registered
+        # resolver is implemented, so reaching this means a new provider was
+        # added to SUPPORTED_PROVIDERS without one — which should surface
+        # loudly rather than as an empty result the UI renders as "no access".
+        logger.error(
+            "effective_permissions.resolver_not_implemented provider=%s err=%s",
+            str(provider).replace("\r", "").replace("\n", " ")[:64],
+            str(exc).replace("\r", "").replace("\n", " ")[:200],
+        )
         raise HTTPException(
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
             detail={

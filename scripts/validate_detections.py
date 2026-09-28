@@ -41,8 +41,17 @@ from __future__ import annotations
 
 import json
 import sys
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+# `scripts/` is on sys.path when this file is run as a program, but not when a
+# test loads it by path with importlib. gate_toolkit sits beside it either way.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from gate_toolkit import repo_root, self_test_if_requested
+
+self_test_if_requested(__file__)
 
 try:
     import yaml
@@ -50,16 +59,23 @@ except ImportError:
     print("ERROR: PyYAML not installed. Run: pip install pyyaml")
     sys.exit(1)
 
-ROOT = Path(__file__).parent.parent
+ROOT = repo_root()
 DETECTIONS_DIR = ROOT / "detections"
 FIXTURES_DIR = DETECTIONS_DIR / "fixtures"
 SCRIPTS_DIR = ROOT / "scripts"
+RULESET_DIR = ROOT / "services" / "fusion" / "app" / "data"
 
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from detection_specs_index import all_specs  # noqa: E402
-from generate_detections import matches  # noqa: E402
+# Imported as modules, not as bound attributes (py/import-of-mutable-attribute).
+import detection_specs_index  # noqa: E402
+import generate_detections  # noqa: E402
+
+all_specs = detection_specs_index.all_specs
+enrich = generate_detections.enrich
+matches = generate_detections.matches
+requested_derived_fields = generate_detections.requested_derived_fields
 
 VALID_SEVERITIES = {"low", "medium", "high", "critical"}
 VALID_CATEGORIES = {
@@ -72,6 +88,28 @@ VALID_CATEGORIES = {
 }
 
 REQUIRED_FIELDS = ["id", "name", "severity", "detection"]
+
+
+@lru_cache(maxsize=1)
+def engine_rule_ids() -> frozenset[str]:
+    """Ids the detection engine loads, across both compiled rulesets.
+
+    Empty when neither artefact is on disk, which the summary reports as
+    unknown rather than as zero — a fresh checkout that has not exported the
+    ruleset should not be told none of its rules run.
+    """
+    ids: set[str] = set()
+    for name in ("detection_ruleset.json", "detection_ruleset_imported.json"):
+        path = RULESET_DIR / name
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        ids |= {str(r["id"]) for r in data.get("rules") or [] if r.get("id")}
+    return frozenset(ids)
+
 
 # Provenance fields required on every imported rule. License and
 # license_url should be present so we can prove the redistribution chain;
@@ -114,9 +152,7 @@ IMPORTED_TIERS: dict[str, dict[str, str]] = {
 # Spec lookup — for native fixture replay only.
 # =============================================================================
 
-_SPEC_BY_KEY: dict[tuple[str, str], dict[str, Any]] = {
-    (cat, spec["slug"]): spec for cat, spec in all_specs()
-}
+_SPEC_BY_KEY: dict[tuple[str, str], dict[str, Any]] = {(cat, spec["slug"]): spec for cat, spec in all_specs()}
 
 
 # =============================================================================
@@ -229,9 +265,7 @@ def validate_rule(
         return [f"YAML parse error: {exc}"], None
 
     if not isinstance(rule, dict):
-        return [
-            "Rule is not a YAML mapping (expected key: value pairs at top level)"
-        ], None
+        return ["Rule is not a YAML mapping (expected key: value pairs at top level)"], None
 
     for field in REQUIRED_FIELDS:
         if field not in rule:
@@ -241,42 +275,23 @@ def validate_rule(
         return errors, rule
 
     if rule["severity"] not in VALID_SEVERITIES:
-        errors.append(
-            f"Invalid severity '{rule['severity']}'; must be one of: "
-            f"{', '.join(sorted(VALID_SEVERITIES))}"
-        )
+        errors.append(f"Invalid severity '{rule['severity']}'; must be one of: {', '.join(sorted(VALID_SEVERITIES))}")
 
     rule_category = rule.get("category")
     if rule_category and rule_category not in VALID_CATEGORIES:
-        errors.append(
-            f"Invalid category '{rule_category}'; must be one of: "
-            f"{', '.join(sorted(VALID_CATEGORIES))}"
-        )
+        errors.append(f"Invalid category '{rule_category}'; must be one of: {', '.join(sorted(VALID_CATEGORIES))}")
 
     expected_category = classification["category"]
-    if (
-        rule_category
-        and expected_category
-        and rule_category != expected_category
-    ):
-        errors.append(
-            f"Rule category '{rule_category}' does not match directory "
-            f"'{expected_category}'"
-        )
+    if rule_category and expected_category and rule_category != expected_category:
+        errors.append(f"Rule category '{rule_category}' does not match directory '{expected_category}'")
 
     rule_id = str(rule["id"])
     expected_prefix = classification["id_prefix"]
     if expected_prefix and not rule_id.startswith(expected_prefix):
-        errors.append(
-            f"Rule id '{rule_id}' must start with '{expected_prefix}' "
-            f"(tier: {classification['tier']})"
-        )
+        errors.append(f"Rule id '{rule_id}' must start with '{expected_prefix}' (tier: {classification['tier']})")
 
     if rule_id in seen_ids:
-        errors.append(
-            f"Duplicate id '{rule_id}' — already defined in "
-            f"{seen_ids[rule_id]}"
-        )
+        errors.append(f"Duplicate id '{rule_id}' — already defined in {seen_ids[rule_id]}")
     else:
         seen_ids[rule_id] = path
 
@@ -299,10 +314,7 @@ def _validate_provenance(rule: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     provenance = rule.get("provenance")
     if not isinstance(provenance, dict):
-        return [
-            "Imported rule is missing required 'provenance' block "
-            "(see tools/detection_import/README.md)"
-        ]
+        return ["Imported rule is missing required 'provenance' block (see tools/detection_import/README.md)"]
     for field in REQUIRED_PROVENANCE_FIELDS:
         value = provenance.get(field)
         if value in (None, ""):
@@ -310,9 +322,7 @@ def _validate_provenance(rule: dict[str, Any]) -> list[str]:
     return errors
 
 
-def replay_fixture(
-    rule_path: Path, rule: dict[str, Any], strict: bool
-) -> list[str]:
+def replay_fixture(rule_path: Path, rule: dict[str, Any], strict: bool) -> list[str]:
     """Replay positive + negative fixtures against the canonical spec.
 
     Native tier only. Looks up the spec for this rule by ``(category,
@@ -335,13 +345,9 @@ def replay_fixture(
     if pos_missing or neg_missing:
         msg_parts = []
         if pos_missing:
-            msg_parts.append(
-                f"missing positive fixture {pos_path.relative_to(ROOT)}"
-            )
+            msg_parts.append(f"missing positive fixture {pos_path.relative_to(ROOT)}")
         if neg_missing:
-            msg_parts.append(
-                f"missing negative fixture {neg_path.relative_to(ROOT)}"
-            )
+            msg_parts.append(f"missing negative fixture {neg_path.relative_to(ROOT)}")
         msg = "; ".join(msg_parts)
         if strict:
             errors.append(msg)
@@ -351,10 +357,7 @@ def replay_fixture(
 
     spec = _SPEC_BY_KEY.get((category, slug))
     if spec is None:
-        msg = (
-            f"no canonical spec found for ({category}, {slug}); "
-            f"hand-authored rule — fixture replay skipped"
-        )
+        msg = f"no canonical spec found for ({category}, {slug}); hand-authored rule — fixture replay skipped"
         errors.append(f"WARN: {msg}")
         return errors
 
@@ -371,14 +374,18 @@ def replay_fixture(
         errors.append(f"fixture load error: {exc}")
         return errors
 
+    # Enriched the way the engine enriches. Replaying against the bare
+    # matcher tests a pipeline production does not run — a rule matching a
+    # derived field would fail here while working live, which trains people
+    # to weaken the gate.
+    wanted = requested_derived_fields([{"match_when": match_when}])
+    pos_event = enrich(pos_event, wanted)
+    neg_event = enrich(neg_event, wanted)
+
     if not matches(match_when, pos_event):
-        errors.append(
-            "positive fixture did NOT match match_when (expected match)"
-        )
+        errors.append("positive fixture did NOT match match_when (expected match)")
     if matches(match_when, neg_event):
-        errors.append(
-            "negative fixture DID match match_when (expected no match)"
-        )
+        errors.append("negative fixture DID match match_when (expected no match)")
     return errors
 
 
@@ -390,8 +397,17 @@ def main() -> int:
 
     yaml_files = sorted(DETECTIONS_DIR.rglob("*.yaml"))
     if not yaml_files:
-        print("WARNING: No .yaml files found under detections/")
-        return 0
+        # This was a WARNING and an exit 0 — the validator for the corpus the
+        # product's headline number describes, certifying an empty corpus as
+        # valid. "No rules are broken" and "no rules were opened" are the same
+        # sentence here, and only one of them is good news.
+        print(
+            f"ERROR: no .yaml files found under {DETECTIONS_DIR}. Zero rules validated is "
+            f"not zero rules broken — either the corpus is gone or this is not the tree "
+            f"it was meant to read.",
+            file=sys.stderr,
+        )
+        return 1
 
     seen_ids: dict[str, Path] = {}
     total = 0
@@ -403,14 +419,15 @@ def main() -> int:
         "community": 0,
         "unknown": 0,
     }
-    quarantine_count = 0
+    loaded_ids = engine_rule_ids()
+    executable_count = 0
 
     for path in yaml_files:
         rel = path.relative_to(ROOT)
 
-        # Skip the meta/index files at the top of detections/, e.g.
-        # detections/coverage.yaml, that aren't rule files. Those live
-        # directly under detections/ with no category dir.
+        # Skip any meta/index file at the top of detections/ that is not a
+        # rule file. A rule lives under a category directory; anything
+        # directly under detections/ with no category dir is not one.
         try:
             rel_under = path.relative_to(DETECTIONS_DIR)
         except ValueError:
@@ -423,21 +440,25 @@ def main() -> int:
         classification = classify(path)
         tier = classification["tier"]
         tier_counts[tier] = tier_counts.get(tier, 0) + 1
-        if classification["is_quarantined"]:
-            quarantine_count += 1
 
         total += 1
 
         errors, rule = validate_rule(path, seen_ids, classification)
         rule_failed = bool(errors)
 
+        # Whether a rule runs is reported by asking the engine, not by reading
+        # the path. `_quarantine/` stopped meaning "cannot run" when the Sigma
+        # compiler began translating rules where they sat — 1,724 files under
+        # that directory are loaded and fire — so the old path-derived figure
+        # said 5,937 while `detection_truth_table.py` said 4,213 about the same
+        # tree. Two counts of one thing that disagree is how a stale number
+        # survives; this one derives from the same artefact as the truth table.
+        rule_loaded = str((rule or {}).get("id") or "") in loaded_ids
+        if rule_loaded:
+            executable_count += 1
+
         replay_errors: list[str] = []
-        if (
-            rule
-            and not rule_failed
-            and tier == "native"
-            and path.parent.name in VALID_CATEGORIES
-        ):
+        if rule and not rule_failed and tier == "native" and path.parent.name in VALID_CATEGORIES:
             replay_errors = replay_fixture(path, rule, strict=strict)
 
         warnings = [e for e in replay_errors if e.startswith("WARN:")]
@@ -454,26 +475,18 @@ def main() -> int:
                 print(f"    - {e}")
         else:
             warn_suffix = f" ({len(warnings)} warn)" if warnings else ""
-            quarantine_suffix = "  [quarantined]" if classification["is_quarantined"] else ""
-            print(f"PASS  [{tier}] {rel}{warn_suffix}{quarantine_suffix}")
+            state_suffix = "  [executable]" if rule_loaded else "  [not loaded]"
+            print(f"PASS  [{tier}] {rel}{warn_suffix}{state_suffix}")
             for w in warnings:
                 print(f"    {w}")
 
     print(f"\n{'─' * 60}")
-    print(
-        f"Validated {total} rules — {total - failed} passed, {failed} failed, "
-        f"{fixture_warnings} fixture warnings"
-    )
-    print(
-        "  Tiers: "
-        + ", ".join(
-            f"{tier}={count}"
-            for tier, count in sorted(tier_counts.items())
-            if count > 0
-        )
-    )
-    if quarantine_count:
-        print(f"  Quarantined (parsed-but-disabled): {quarantine_count}")
+    print(f"Validated {total} rules — {total - failed} passed, {failed} failed, {fixture_warnings} fixture warnings")
+    print("  Tiers: " + ", ".join(f"{tier}={count}" for tier, count in sorted(tier_counts.items()) if count > 0))
+    if loaded_ids:
+        print(f"  Executable (loaded by the engine): {executable_count}; not loaded: {total - executable_count}")
+    else:
+        print("  Executable: unknown — no compiled ruleset on disk; run scripts/export_detection_ruleset.py")
 
     return 1 if failed > 0 else 0
 

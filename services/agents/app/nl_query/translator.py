@@ -902,8 +902,17 @@ async def enhance_with_llm(
         import json
         import textwrap
 
-        from app.llm.contract import safe_chat_completions_request
-        from app.llm.factory import chat_completions_url, resolve_model_alias
+        # This module is vendored byte-identically into services/api, where
+        # `app.llm` does not exist — so importing only the agents path made
+        # the ImportError below swallow the whole LLM branch, and /nl-query
+        # silently returned the deterministic translation forever. Safe by
+        # accident, and invisible. Resolve whichever package is present.
+        try:
+            from app.llm.contract import safe_chat_completions_request
+            from app.llm.factory import chat_completions_url, resolve_model_alias
+        except ImportError:  # running inside services/api
+            from app.services.llm_safety import safe_chat_completions_request
+            from app.services.model_aliases import chat_completions_url, resolve_model_alias
 
         prompt = textwrap.dedent(
             f"""
@@ -921,11 +930,12 @@ async def enhance_with_llm(
             {"role": "user", "content": prompt},
         ]
 
+        resolved_model = model or resolve_model_alias("nl")
         payload = await safe_chat_completions_request(
             api_key=api_key,
-            model=model or resolve_model_alias("nl"),
+            model=resolved_model,
             messages=messages,
-            url=chat_completions_url(),
+            url=chat_completions_url(resolved_model),
             timeout=timeout,
             response_format={"type": "json_object"},
             temperature=0,

@@ -48,6 +48,7 @@ Exit codes:
     2  MITRE accuracy regressed by ≥ --max-regression-pp vs baseline (w2-dac)
     3  Eval substrate imports failed (services/agents deps not installed)
 """
+
 from __future__ import annotations
 
 import argparse
@@ -58,7 +59,15 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
+# `scripts/` is on sys.path when this file is run as a program, but not when a
+# test loads it by path with importlib. gate_toolkit sits beside it either way.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from gate_toolkit import repo_root, self_test_if_requested
+
+self_test_if_requested(__file__)
+
+_REPO_ROOT = repo_root()
 _AGENTS_ROOT = _REPO_ROOT / "services" / "agents"
 # Order matters: scripts/ also contains a tests/ package (scripts/tests/) for
 # the CLI smoke test, and would shadow services/agents/tests/ if it landed at
@@ -73,8 +82,10 @@ sys.path.insert(0, str(_AGENTS_ROOT))
 # don't have the full agent dev dependency stack (pydantic, langgraph, ...).
 from eval_telemetry import (  # type: ignore  # noqa: E402
     DEFAULT_INCIDENTS_PATH,
-    DEFAULT_MODEL as _TELEMETRY_DEFAULT_MODEL,
     compute_per_investigation_telemetry,
+)
+from eval_telemetry import (  # noqa: E402  # same reason as the import above
+    DEFAULT_MODEL as _TELEMETRY_DEFAULT_MODEL,
 )
 
 # Wet-eval shim (T5.5). Dry-run path is stdlib-only; live path imports the
@@ -166,6 +177,7 @@ try:
     from tests.test_response_quality import (  # type: ignore
         evaluate_response_quality,
     )
+
     _SUBSTRATE_AVAILABLE = True
 except Exception as _exc:  # pragma: no cover - degraded mode for telemetry-only
     _SUBSTRATE_IMPORT_ERROR = _exc
@@ -222,9 +234,7 @@ _TEMPLATE_TARGETS = {
     "response_quality": 0.75,
 }
 
-_TELEMETRY_PATH = (
-    _AGENTS_ROOT / "tests" / "eval_data" / "synthetic_telemetry.jsonl"
-)
+_TELEMETRY_PATH = _AGENTS_ROOT / "tests" / "eval_data" / "synthetic_telemetry.jsonl"
 
 # Canonical suite name list. Kept in lock-step with the keys of
 # ``summary["suites"]`` built in ``main()`` and the per-suite ``_run_*``
@@ -523,13 +533,7 @@ def _run_confidence_calibration() -> dict:
         "value": inv_brier,
         "target": _CALIB_BRIER_INV,
         # Lower-is-better: passed iff *all* sub-gates pass.
-        "passed": (
-            inv_brier_pass
-            and inv_ece_pass
-            and triage_brier_pass
-            and triage_ece_pass
-            and bool(res.get("passed", False))
-        ),
+        "passed": (inv_brier_pass and inv_ece_pass and triage_brier_pass and triage_ece_pass and bool(res.get("passed", False))),
         "duration_ms": round(dur, 1),
         "details": {
             "lower_is_better": True,
@@ -543,12 +547,8 @@ def _run_confidence_calibration() -> dict:
             "triage_ece_max": _CALIB_ECE_TRIAGE,
             "investigation_separation": res["investigation"]["separation"],
             "triage_separation": res["triage"]["separation"],
-            "mean_confidence_positive_investigation": res["investigation"][
-                "mean_confidence_positive"
-            ],
-            "mean_confidence_benign_investigation": res["investigation"][
-                "mean_confidence_benign"
-            ],
+            "mean_confidence_positive_investigation": res["investigation"]["mean_confidence_positive"],
+            "mean_confidence_benign_investigation": res["investigation"]["mean_confidence_benign"],
             "investigation_brier_pass": inv_brier_pass,
             "investigation_ece_pass": inv_ece_pass,
             "triage_brier_pass": triage_brier_pass,
@@ -628,9 +628,7 @@ def _run_playbook_completion() -> dict:
     dur = (time.perf_counter() - t0) * 1000
 
     per_incident = res.per_incident or []
-    hc_rate, hc_covered, hc_total = res.severity_completion_rate_mapped(
-        ("high", "critical"), per_incident
-    )
+    hc_rate, hc_covered, hc_total = res.severity_completion_rate_mapped(("high", "critical"), per_incident)
     hc_raw_rate = res.severity_completion_rate(("high", "critical"))
     overall_pass = res.completion_rate >= _PLAYBOOK_OVERALL_FLOOR
     high_crit_pass = hc_rate >= _PLAYBOOK_HIGH_CRIT_FLOOR
@@ -642,13 +640,7 @@ def _run_playbook_completion() -> dict:
         "metric": "completion_rate",
         "value": round(res.completion_rate, 4),
         "target": _PLAYBOOK_OVERALL_FLOOR,
-        "passed": (
-            overall_pass
-            and high_crit_pass
-            and align_pass
-            and no_orphan_playbooks
-            and no_orphan_templates
-        ),
+        "passed": (overall_pass and high_crit_pass and align_pass and no_orphan_playbooks and no_orphan_templates),
         "duration_ms": round(dur, 1),
         "details": {
             "incidents": res.incidents,
@@ -808,18 +800,12 @@ def main() -> None:
     parser.add_argument(
         "--telemetry-model",
         default=_TELEMETRY_DEFAULT_MODEL,
-        help=(
-            "Model name to apply against the rate card when computing the "
-            "per-investigation USD projection. Default: gpt-4o."
-        ),
+        help=("Model name to apply against the rate card when computing the per-investigation USD projection. Default: gpt-4o."),
     )
     parser.add_argument(
         "--no-telemetry-records",
         action="store_true",
-        help=(
-            "Drop the per-incident telemetry array from the JSON report. "
-            "Aggregate + per-template stats are always kept."
-        ),
+        help=("Drop the per-incident telemetry array from the JSON report. Aggregate + per-template stats are always kept."),
     )
     parser.add_argument(
         "--wet",
@@ -854,6 +840,28 @@ def main() -> None:
             "the substrate suites."
         ),
     )
+    parser.add_argument(
+        "--wet-limit",
+        type=int,
+        default=None,
+        help=(
+            "Only meaningful with --wet. Dispatch at most N incidents instead "
+            "of the full 200. A CPU-hosted local model cannot finish the whole "
+            "corpus inside a CI budget; the slice is a deterministic prefix so "
+            "runs stay comparable, and the report records how many were used."
+        ),
+    )
+    parser.add_argument(
+        "--wet-require-live",
+        action="store_true",
+        help=(
+            "Only meaningful with --wet. Fail instead of degrading to dry-run "
+            "numbers when the live agent cannot be reached. Degrading is right "
+            "for a reporting job, but fatal for a gate: a degraded run would "
+            "publish substrate numbers as live-agent performance. Any job that "
+            "asserts on these numbers must pass this."
+        ),
+    )
     args = parser.parse_args()
 
     # Wet-eval mode short-circuits the substrate gates entirely (T5.5).
@@ -873,10 +881,19 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(2)
-        wet_report = compute_wet_eval(
-            mode=wet_mode,
-            harness_version=f"scripts/run_evals.py @ {os.environ.get('GITHUB_SHA', 'local')}",
-        )
+        try:
+            wet_report = compute_wet_eval(
+                mode=wet_mode,
+                harness_version=(f"scripts/run_evals.py @ {os.environ.get('GITHUB_SHA', 'local')}"),
+                limit=args.wet_limit,
+                require_live=args.wet_require_live,
+            )
+        except RuntimeError as exc:
+            # Only reachable under --wet-require-live. A caller that asked for
+            # live numbers and got a degraded run needs a non-zero exit, not a
+            # well-formed report full of substrate estimates.
+            print(f"[run_evals] live wet-eval required but unavailable: {exc}", file=sys.stderr)
+            sys.exit(3)
         wet_block = wet_report.to_dict(include_records=False)
         summary = {
             "generated_at": datetime.now(UTC).isoformat(),
@@ -901,20 +918,11 @@ def main() -> None:
             print(f"  Incidents:      {wet_block['incidents']}")
             print(f"  Templates:      {wet_block['templates']}")
             lat = wet_block["latency_seconds"]
-            print(
-                f"  Latency (s):    p50={lat['p50']:.2f}  p95={lat['p95']:.2f}  "
-                f"p99={lat['p99']:.2f}  mean={lat['mean']:.2f}"
-            )
+            print(f"  Latency (s):    p50={lat['p50']:.2f}  p95={lat['p95']:.2f}  p99={lat['p99']:.2f}  mean={lat['mean']:.2f}")
             tot = wet_block["tokens"]["total"]
-            print(
-                f"  Tokens / inv:   mean={tot['mean']:.0f}  median={tot['median']:.0f}  "
-                f"p95={tot['p95']:.0f}  p99={tot['p99']:.0f}"
-            )
+            print(f"  Tokens / inv:   mean={tot['mean']:.0f}  median={tot['median']:.0f}  p95={tot['p95']:.0f}  p99={tot['p99']:.0f}")
             usd = wet_block["usd"]
-            print(
-                f"  USD / inv:      mean=${usd['mean']:.5f}  median=${usd['median']:.5f}  "
-                f"p95=${usd['p95']:.5f}  p99=${usd['p99']:.5f}"
-            )
+            print(f"  USD / inv:      mean=${usd['mean']:.5f}  median=${usd['median']:.5f}  p95=${usd['p95']:.5f}  p99=${usd['p99']:.5f}")
             print(f"  MITRE accuracy: {wet_block['mitre_accuracy']:.4f}")
             if wet_block.get("warnings"):
                 print("-" * 78)
@@ -928,13 +936,20 @@ def main() -> None:
         # Substrate suites need pydantic / langchain etc. If they're not
         # installed we can still emit the telemetry block — surface the
         # original ImportError so operators know what to fix.
+        #
+        # Exit 3, which is what this file's own "Exit codes" block has always
+        # said a substrate-import failure returns. It exited 2, and 2 means
+        # "MITRE accuracy regressed against the baseline" — so a fresh clone
+        # missing a dependency reported an accuracy regression, and the one
+        # actionable instruction (install the deps) was not in the message.
         msg = (
-            "Substrate-suite imports failed (likely missing agent dev deps "
-            f"such as pydantic): {_SUBSTRATE_IMPORT_ERROR!r}. "
-            "Pass --telemetry-only to emit just the T2.4 token/USD/latency block."
+            "ERROR: substrate-suite imports failed (likely missing agent dev deps "
+            f"such as pydantic): {_SUBSTRATE_IMPORT_ERROR!r}.\n"
+            "  Fix:  pip install -e services/agents\n"
+            "  Or:   pass --telemetry-only to emit just the T2.4 token/USD/latency block."
         )
         print(msg, file=sys.stderr)
-        sys.exit(2)
+        sys.exit(3)
 
     keep_records = not args.no_telemetry_records
     per_investigation = _build_per_investigation_block(
@@ -951,22 +966,40 @@ def main() -> None:
         }
         summary["all_passed"] = True  # telemetry-only never gates substrate
     else:
+        # Only the requested suites are *called*. The previous form built this
+        # dict with all eleven calls inline, so `--suite mitre_accuracy` ran
+        # every suite, took the full runtime, and then printed
+        # "PASS — mitre_accuracy green" — a verdict naming one suite and
+        # decided by eleven. `--ci` would fail a single-suite run on an
+        # unrelated regression, which is the opposite of what an operator
+        # bisecting to one gate is asking for. `args.suite` reached nothing
+        # but the banner wording.
+        runners = {
+            "mitre_accuracy": _run_mitre,
+            "alert_reduction": _run_alert_reduction,
+            "investigation_completeness": _run_completeness,
+            "response_quality": _run_response_quality,
+            "hunt_corpus": _run_hunt_corpus,
+            "adversary_eval": _run_adversary,
+            "confidence_calibration": _run_confidence_calibration,
+            "memory_recall": _run_memory_recall,
+            "override_accuracy": _run_override_accuracy,
+            "playbook_completion_rate": _run_playbook_completion,
+            "detection_fp_rate": _run_detection_fp_rate,
+        }
+        # The registry and the name list are the same set, asserted rather than
+        # assumed: argparse accepts a name from `_SUITE_NAMES`, so one missing
+        # here would be a KeyError at the moment somebody bisects a regression.
+        if set(runners) != set(_SUITE_NAMES):
+            raise AssertionError(f"suite registry and _SUITE_NAMES disagree: {set(runners) ^ set(_SUITE_NAMES)}")
+        selected = _SUITE_NAMES if args.suite == "all" else (args.suite,)
         summary = {
             "generated_at": datetime.now(UTC).isoformat(),
             "dataset": "synthetic_incidents.json (200 cases, deterministic)",
-            "suites": {
-                "mitre_accuracy": _run_mitre(),
-                "alert_reduction": _run_alert_reduction(),
-                "investigation_completeness": _run_completeness(),
-                "response_quality": _run_response_quality(),
-                "hunt_corpus": _run_hunt_corpus(),
-                "adversary_eval": _run_adversary(),
-                "confidence_calibration": _run_confidence_calibration(),
-                "memory_recall": _run_memory_recall(),
-                "override_accuracy": _run_override_accuracy(),
-                "playbook_completion_rate": _run_playbook_completion(),
-                "detection_fp_rate": _run_detection_fp_rate(),
-            },
+            # Which suites this report describes. Without it a single-suite
+            # report is indistinguishable from a full one that lost ten suites.
+            "suite_filter": args.suite,
+            "suites": {name: runners[name]() for name in selected},
             "telemetry": _summarise_telemetry(),
             "per_investigation": per_investigation,
         }
@@ -1032,23 +1065,14 @@ def main() -> None:
         print(f"  Incidents:     {pi['incidents']}  Templates: {pi['templates']}")
         print("-" * 78)
         tok = pi["tokens_per_investigation"]
-        print(
-            f"  Tokens / investigation:  mean={tok['mean']:.0f}  median={tok['median']:.0f}  "
-            f"p95={tok['p95']:.0f}  p99={tok['p99']:.0f}"
-        )
-        print(
-            f"      prompt mean={tok['prompt_mean']:.0f}    completion mean={tok['completion_mean']:.0f}"
-        )
+        print(f"  Tokens / investigation:  mean={tok['mean']:.0f}  median={tok['median']:.0f}  p95={tok['p95']:.0f}  p99={tok['p99']:.0f}")
+        print(f"      prompt mean={tok['prompt_mean']:.0f}    completion mean={tok['completion_mean']:.0f}")
         usd = pi["usd_per_investigation"]
         print(
-            f"  USD / investigation:     mean=${usd['mean']:.5f}  median=${usd['median']:.5f}  "
-            f"p95=${usd['p95']:.5f}  p99=${usd['p99']:.5f}"
+            f"  USD / investigation:     mean=${usd['mean']:.5f}  median=${usd['median']:.5f}  p95=${usd['p95']:.5f}  p99=${usd['p99']:.5f}"
         )
         lat = pi["latency_per_investigation_ms"]
-        print(
-            f"  Latency (ms / inv):      p50={lat['p50']:.4f}  p95={lat['p95']:.4f}  "
-            f"p99={lat['p99']:.4f}  (substrate-only path)"
-        )
+        print(f"  Latency (ms / inv):      p50={lat['p50']:.4f}  p95={lat['p95']:.4f}  p99={lat['p99']:.4f}  (substrate-only path)")
         print("=" * 78)
         try:
             rel = args.out.relative_to(_REPO_ROOT)
@@ -1065,10 +1089,7 @@ def main() -> None:
             mark = "PASS" if suite["passed"] else "FAIL"
             lower_is_better = bool(suite.get("details", {}).get("lower_is_better"))
             comparator = "<=" if lower_is_better else ">="
-            print(
-                f"  [{mark}] {name:<28} {suite['metric']:<28} "
-                f"{suite['value']:.3f}  (target {comparator} {suite['target']:.2f})"
-            )
+            print(f"  [{mark}] {name:<28} {suite['metric']:<28} {suite['value']:.3f}  (target {comparator} {suite['target']:.2f})")
             tpl = suite.get("per_template")
             if tpl:
                 tpl_mark = "PASS" if tpl["passed"] else "FAIL"
@@ -1101,10 +1122,7 @@ def main() -> None:
             tok = pi.get("tokens_per_investigation", {})
             usd = pi.get("usd_per_investigation", {})
             lat = pi.get("latency_per_investigation_ms", {})
-            print(
-                f"  Per-investigation budget (deterministic substrate, "
-                f"model={pi.get('model', '?')})"
-            )
+            print(f"  Per-investigation budget (deterministic substrate, model={pi.get('model', '?')})")
             print(
                 f"    tokens   mean={tok.get('mean', 0):.0f}  median={tok.get('median', 0):.0f}  "
                 f"p95={tok.get('p95', 0):.0f}  p99={tok.get('p99', 0):.0f}"
@@ -1119,17 +1137,9 @@ def main() -> None:
             )
         print("=" * 78)
         if summary["all_passed"]:
-            verdict = (
-                "PASS — ALL GATES GREEN"
-                if args.suite == "all"
-                else f"PASS — {args.suite} green"
-            )
+            verdict = "PASS — ALL GATES GREEN" if args.suite == "all" else f"PASS — {args.suite} green"
         else:
-            verdict = (
-                "FAIL — REGRESSION DETECTED"
-                if args.suite == "all"
-                else f"FAIL — {args.suite} regressed"
-            )
+            verdict = "FAIL — REGRESSION DETECTED" if args.suite == "all" else f"FAIL — {args.suite} regressed"
         print(f"  {verdict}")
         cmp = summary.get("baseline_compare")
         if cmp and cmp.get("available"):

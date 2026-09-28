@@ -51,8 +51,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import httpx
-from sqlalchemy import and_, func, select, text
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException
 from fastapi import status
@@ -62,6 +61,7 @@ from app.models.alert import Alert
 from app.models.detection_rule import DetectionRule
 from app.services.cost_dashboard import _impute_public_cost
 from app.services.llm_resolver import LlmConfig, resolve_llm_config
+from app.services.llm_safety import LLMContractViolation, safe_chat_completions_request
 
 logger = logging.getLogger(__name__)
 
@@ -232,7 +232,16 @@ async def _resolve_rule_lineage(db: AsyncSession, alert: Alert) -> tuple[Detecti
     # 1. Explicit reference in raw_event or tags.
     explicit_id = _explicit_rule_id_from_alert(alert)
     if explicit_id is not None:
-        result = await db.execute(select(DetectionRule).where(DetectionRule.id == explicit_id))
+        # `explicit_id` is read out of the alert's raw_event, so it is
+        # vendor-supplied rather than ours. Narrowed to this alert's tenant
+        # plus the platform-wide rules, or a crafted raw_event could name
+        # another tenant's rule and have its definition explained back.
+        result = await db.execute(
+            select(DetectionRule).where(
+                DetectionRule.id == explicit_id,
+                or_(DetectionRule.tenant_id == alert.tenant_id, DetectionRule.tenant_id.is_(None)),
+            )
+        )
         rule = result.scalar_one_or_none()
         if rule is not None:
             # The raw_event probe wins over the tag probe; we don't
@@ -799,14 +808,29 @@ async def _call_llm_for_summary(
         )
 
     try:
-        async with httpx.AsyncClient(timeout=50, verify=False) as client:
-            resp = await client.post(
-                url,
-                headers={"Authorization": f"Bearer {llm_config.api_key}"},
-                json={"model": llm_config.model, "messages": messages, "max_tokens": 5000},
-            )
-            resp.raise_for_status()
-            payload = resp.json()
+        # T2.3 — the contract runs before the request. The user message is a
+        # JSON dump of the alert, so this is the API's most direct path for
+        # raw event data to reach a third party.
+        payload = await safe_chat_completions_request(
+            api_key=llm_config.api_key,
+            model=llm_config.model,
+            messages=messages,
+            url=url,
+            timeout=20.0,
+            max_tokens=360,
+        )
+    except LLMContractViolation as exc:
+        # Reported as its own error string rather than folded into the
+        # generic branch, so an operator can tell "we refused to send this"
+        # apart from "the provider was unreachable".
+        return _LlmCallResult(
+            text=None,
+            model=llm_config.model,
+            prompt_tokens=0,
+            completion_tokens=0,
+            latency_ms=(time.monotonic() - started) * 1000.0,
+            error=f"llm_contract_violation: {exc.reason}",
+        )
     except Exception as exc:  # noqa: BLE001
         return _LlmCallResult(
             text=None,

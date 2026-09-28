@@ -103,18 +103,235 @@ When a user hits an endpoint they don't have permission for, AiSOC returns `403 
 
 ## Multi-tenant isolation (RLS)
 
-AiSOC is multi-tenant by design. Every tenant-partitioned table has Postgres Row-Level Security enforced. The migration that sets this up is [`002_rls.sql`](https://github.com/beenuar/AiSOC/blob/main/services/api/migrations/002_rls.sql).
+AiSOC is multi-tenant by design, and Postgres Row-Level Security is the **second** layer under that. The primary control is the `tenant_id` predicate in the query, gated by [`scripts/check_tenant_query_predicates.py`](https://github.com/beenuar/AiSOC/blob/main/scripts/check_tenant_query_predicates.py). This section describes the layer beneath it, including where it does not currently engage.
 
 The model:
 
 1. The application layer authenticates the user and resolves their `tenant_id`.
-2. Before issuing any query, the SQLAlchemy middleware sets `SET LOCAL app.current_tenant_id = '<uuid>'`.
-3. RLS policies on every tenant-scoped table (`cases`, `alerts`, `connectors`, `detection_rules`, `api_keys`, `playbooks`, `audit_log`, …) enforce `tenant_id = current_tenant_id()`.
-4. The `FORCE ROW LEVEL SECURITY` flag ensures even the table owner is subject to the policy — there is no superuser escape hatch via the application's DB role.
+2. Before issuing any query, the session sets `SET LOCAL app.current_tenant_id = '<uuid>'`.
+3. RLS policies on tenant-scoped tables enforce `tenant_id = current_tenant_id()`.
+4. `FORCE ROW LEVEL SECURITY` is set on every one of them, so the *table owner* is also subject to the policy.
 
-If `app.current_tenant_id` is not set (e.g. an internal job that needs to operate cross-tenant), the policy permits the query. This is intentional for system-level workers but means **the application-level ORM session must always set the tenant** before serving user requests. The middleware that does this is wired in [`services/api/app/api/deps.py`](https://github.com/beenuar/AiSOC/blob/main/services/api/app/api/deps.py).
+[`002_rls.sql`](https://github.com/beenuar/AiSOC/blob/main/services/api/migrations/002_rls.sql) introduced this for six tables. [`060_rls_coverage.sql`](https://github.com/beenuar/AiSOC/blob/main/services/api/migrations/060_rls_coverage.sql) extended it to the rest of the API chain, and the four services that manage their own schema (honeytokens, osquery-tls, purple-team, ueba) each carry a matching alembic revision. Coverage went from **31 of 95 tenant-scoped tables to 92 of 95**. Run `python scripts/check_tenant_query_predicates.py --inventory` for the live figure rather than trusting this one.
 
-The `users` table is excluded from RLS deliberately — it would create a chicken-and-egg problem during authentication. Tenant filtering on `users` is enforced at the application layer through `get_current_user()`.
+The three that remain are named rather than rounded away: `users` is excluded deliberately (below), and `case_tasks` / `case_timeline` are ORM models that no migration creates, so there is no table to protect.
+
+### The role the services connect as
+
+A role with `SUPERUSER` or `BYPASSRLS` ignores policies *even under* `FORCE ROW LEVEL SECURITY` — FORCE binds the table owner, not a superuser. And an owner, though bound by FORCE, can simply issue `ALTER TABLE … NO FORCE ROW LEVEL SECURITY`. So there are three ways around a policy, and the default deployment used to hand a service all three at once: every service connected as `POSTGRES_USER=aisoc`, which the `postgres` image creates as a superuser and which owns every table the chain builds. **In that configuration no policy in this database did anything**, which was measured rather than assumed.
+
+[`061_runtime_app_role.sql`](https://github.com/beenuar/AiSOC/blob/main/services/api/migrations/061_runtime_app_role.sql) splits the credential in two, and every deployment surface in this repository now ships the split:
+
+| Role | What it is for | Grants |
+| --- | --- | --- |
+| `aisoc` (`POSTGRES_USER`) | Owns every table. Applies the migration chain. **No service connects as it.** | Everything, by ownership |
+| `aisoc_app` | Every service's `DATABASE_URL`. Row-level security applies to it. | `USAGE` on schema `public`; `SELECT, INSERT, UPDATE, DELETE` on tables and views; `USAGE, SELECT` on sequences; `EXECUTE` on functions |
+
+That grant list is the whole of it. No `CREATE` on the schema, so the role cannot create or alter a table. No `TRUNCATE`, which would otherwise let one statement delete every tenant's rows without a policy seeing a `WHERE` clause — `002_rls.sql` had granted `ALL`, and 061 revokes it. No `REFERENCES`, no `TRIGGER`. The role owns nothing.
+
+`EXECUTE` on functions looks redundant because `PUBLIC` holds it by default, and on a stock database it is. It is spelled out because a deployment that hardens with `REVOKE ALL ON ALL FUNCTIONS FROM PUBLIC` would otherwise break RLS itself: `current_tenant_id()` is evaluated as the querying role inside every policy.
+
+`DATABASE_MIGRATION_URL` carries the owner's DSN and is read by `python -m app.scripts.run_migrations` and nothing else. Leave it unset and migrations fall back to `DATABASE_URL`, which is right for a deployment that has not split the roles and fails loudly — `permission denied for schema public` — on one that has.
+
+Verify any deployment with:
+
+```bash
+python scripts/check_runtime_db_role.py --dsn "$DATABASE_URL" --owner-dsn "$DATABASE_MIGRATION_URL"
+```
+
+It reads `pg_roles` and `pg_class` directly, so it answers for the database rather than for the config file, and it fails on all three bypasses plus a view that reads around the policies. `rolsuper` and `rolbypassrls` must both be false and the role must own nothing.
+
+#### Two views were reading around the policies
+
+A view executes its underlying reads as the **view's owner** unless it is declared `security_invoker`. Both views in this schema are owned by the role that ran the chain, so `mssp_tenant_latest_metrics` and `mssp_effective_tenant_rules` would have gone on returning every tenant's rows to `aisoc_app` after the role switch — a bypass that survives the fix meant to close it. Measured: bound to tenant A, the view returned 2 rows before and 1 after. 061 switches both to `security_invoker`, and the gate checks views as well as tables.
+
+#### What an operator still has to do
+
+The compose stacks and CI need nothing: `infra/postgres/initdb/20_runtime_role_password.sh` runs inside the postgres image's first-boot init, after the migration chain and before the container reports healthy, and sets the runtime role's password from `AISOC_APP_DB_PASSWORD`. `depends_on: service_healthy` makes that ordering a guarantee rather than a race.
+
+Three cases are **not** automatic:
+
+* **An existing data volume.** `/docker-entrypoint-initdb.d` only runs when the data directory is empty, so `docker compose up` on a stack you already had never reaches that script. `app.scripts.run_migrations` applies `AISOC_APP_DB_PASSWORD` on every run, which covers it — but the API must have run migrations once with the variable set before the other services can authenticate. On a stack upgraded in place, expect the non-API services to fail their first connection attempts and recover on restart.
+* **A managed Postgres** (RDS, Cloud SQL, a Helm-installed chart). There is no init hook. Apply the chain as the owner with `AISOC_APP_DB_PASSWORD` in the job's environment, then point the services' `DATABASE_URL` at `aisoc_app`. The Terraform environment generates the password for you (`terraform output -raw db_app_password`); the Helm chart ships no Secret template, so `values.yaml` spells the three steps out.
+* **Rotating away from `changeme`.** `002_rls.sql` created `aisoc_app` with that literal. 061 does not clear it, because clearing it would break an operator who had already set a real password. Everything above overwrites it; if none of it applies to you, set one by hand. `check_runtime_db_role.py --dsn` tries that password and fails if it still works.
+
+### A session that never bound a tenant still sees everything
+
+If `app.current_tenant_id` is not set the policy permits the query. That is deliberate and load-bearing: ingest, fusion, the hunt scheduler's sweep, the retention purge and tenant deletion all operate across tenants and would otherwise process nothing, silently. Every policy in all five schema chains carries the arm
+
+```sql
+USING (tenant_id = current_tenant_id() OR current_tenant_id() IS NULL)
+```
+
+and [`scripts/check_rls_policy_shape.py`](https://github.com/beenuar/AiSOC/blob/main/scripts/check_rls_policy_shape.py) fails if one is added without it. **A worker that silently stops seeing data is a worse failure than the bypass this change closes**, so that gate matters as much as the role does.
+
+One construct did not survive the switch. `SET LOCAL row_security = off` appeared in the retention purge, the hunt scheduler and tenant deletion, and it only ever worked because the connecting role was a superuser: for a role the policies apply to, Postgres does not ignore them when row security is off — it raises `query would be affected by row-level security policy for table "…"`. All three now rely on the unbound-session arm and call `assert_cross_tenant_session()` first, which raises if a tenant *is* bound, because such a sweep would process one tenant's rows and report success.
+
+The paths that deliberately **do** bind a tenant are `TenantDBSession` in the API, `_set_rls_context` in the agents ledger / hunt store / LLM resolver / Splunk evidence reader, and the per-hunt rebind in the hunt scheduler. Everywhere else the query predicate is the only control, which is why that gate is still the one that matters most.
+
+### Which role each service runs as
+
+Every service runs as the scoped runtime role. Nothing needs a cross-tenant credential, because the fail-open arm already gives an unbound session cross-tenant visibility — the distinction is per *session*, not per service, and that is strictly safer: a service that binds a tenant for one request cannot escape it by having been given a privileged role at startup.
+
+| Service | Role | Why |
+| --- | --- | --- |
+| `api` | runtime | Binds a tenant per request through `TenantDBSession`. Also holds `DATABASE_MIGRATION_URL` — the owner — used only by the migration runner at startup. |
+| `ingest` (Go, `DATABASE_DSN`) | runtime | Writes inbox events for every tenant on an unbound session; the fail-open arm admits them. |
+| `fusion` | runtime | Promotes alerts across tenants, unbound. |
+| `agents` | runtime | Binds a tenant in the ledger, hunt store and LLM resolver; unbound elsewhere. |
+| `actions`, `connectors`, `threatintel`, `honeytokens`, `purple-team`, `ueba`, `osquery-tls` | runtime | DML only. `osquery-tls` resolves a node's tenant *from* its enrolment key, so that lookup is unbound by necessity. |
+| retention purge / hunt scheduler / tenant deletion (in-process in `api`) | runtime, unbound | Cross-tenant by design, and now assert that no tenant is bound before sweeping. |
+| migration runner, `alembic`, `scripts/backup.sh` | owner | DDL, and a dump that has to read and rewrite tables the runtime role cannot. |
+
+#### The four services that apply their own chain
+
+`honeytokens`, `osquery-tls`, `purple-team` and `ueba` manage their own schema through alembic, and the row above only holds because each now resolves a *migration* credential separately from its runtime one. Until it did, both came from the same variable: an operator pointing such a service at the owner lost row-level security on the twelve tables those chains own, and the deployment surface still read as compliant.
+
+Set both per service — see [the table in Env vars](../deployment/env-vars#the-four-services-that-manage-their-own-schema). Leaving the migration variable unset still works and prints a warning on stderr naming what will happen; under the DML-only role the first `CREATE TABLE` fails with `permission denied for schema public`.
+
+Each chain also grants the runtime role `SELECT, INSERT, UPDATE, DELETE` on its own tables rather than relying on `061_runtime_app_role.sql` having run first. Nothing orders the chains against each other, and `ALTER DEFAULT PRIVILEGES` is recorded against the role that issued it — so a deployment that applies the API chain and a service chain under different owners, or points a service at its own database, would otherwise get a service that starts, connects, and answers every query with `permission denied`.
+
+Verified against `postgres:16` with all four chains applied and two tenants seeded: bound to one tenant the runtime role sees one row of two in `ueba_entity_baselines`, `honeytokens` and `osquery_node`; unbound it sees both, which is the fail-open arm the sweeps depend on; a cross-tenant insert is refused by the policy; `CREATE TABLE` is refused with `permission denied for schema public`; and `ALTER TABLE … NO FORCE ROW LEVEL SECURITY` with `must be owner of table`.
+
+The `users` table is excluded from RLS deliberately — it would create a chicken-and-egg problem during authentication, and platform-admin user administration is cross-tenant by design. Tenant filtering on `users` is enforced at the application layer through `get_current_user()`.
+
+### The tenant comes from the credential, never from the request
+
+Row-Level Security answers one question: *given* a tenant, can this query see
+another one's rows? It cannot answer the question above it — where did that
+tenant come from? If a route reads it out of the query string, RLS dutifully
+isolates whichever tenant the caller typed.
+
+That is not hypothetical. `/fusion/entity-risk/*` took `tenant_id` as a query
+parameter with no auth dependency on the route, on both the API gateway and
+the fusion service, and the console reaches fusion *directly* through a
+Next.js rewrite when `FUSION_URL` is set. An anonymous request naming another
+tenant's UUID returned that tenant's entity-risk queue. Redis key prefixing
+(`aisoc:fusion:rba:topn:{tenant}`) did not help, because prefixing isolates
+whichever tenant it is handed. Nor would validating the parameter: a UUID that
+parses is still a UUID the caller chose.
+
+So the rule across every service is:
+
+- **The authoritative tenant is the authenticated principal's.** In
+  `services/api` that is `CurrentUser.tenant_id`. In the services the browser
+  reaches directly (`agents`, `fusion`, `osquery-tls`) and the
+  service-to-service ones (`honeytokens`, `purple-team`, `ueba`), it is
+  resolved by `app/security/tenant_scope.py`, which accepts either a console
+  session — the first-party HS256 access token, whose verified `tenant_id`
+  claim is authoritative — or a trusted service declaring the tenant it acts
+  for on the `X-AiSOC-Tenant-ID` header.
+- **A `tenant_id` on the request is a filter, not a selector.** It is
+  intersected with the caller's scope through `resolve_scoped_tenant()`, so an
+  MSSP operator can narrow to one managed customer while naming an outside
+  tenant returns `403` rather than that tenant's data. Omitting it reads the
+  caller's own tenant, which is what the console does.
+- **No scope never becomes all scopes.** A service token that declares no
+  tenant resolves to an *empty* scope and is refused. Cross-tenant surfaces
+  (the MSSP portfolio) resolve their tenant list in
+  `app/services/org_scope.py` and pass it through `require_scope()`, which
+  raises rather than running unfiltered SQL. Every cross-tenant leak this
+  codebase has had took the shape of a scope that was absent rather than
+  narrow, and a read that treated absent as "no filter".
+
+`scripts/check_route_tenant_scope.py` enforces this structurally. It is an AST
+pass over every route in `services/` and fails in both directions — a route
+taking a tenant identifier with no auth dependency, and a route accepting one
+without intersecting it with scope — including tenant fields on request-body
+models, since `POST {"tenant_id": …}` is the same hole as `?tenant_id=`. Run
+`--inventory` for the per-service table or `--self-test` to watch it catch
+injected drift. `services/mesh` is exempt by design: it is a federated hub
+protected by Ed25519 signatures and k-anonymity, where a shared bearer token
+would break federation rather than secure it.
+
+### Every route authenticates, or says why it does not
+
+The gate above asks a *conditional* question: if a route takes a tenant, where
+did the tenant come from. A route that takes no tenant was never in its reach,
+and an unauthenticated route that takes no tenant is still an unauthenticated
+route. 37 routes in `services/agents` took none — including the one that
+executes a response playbook against your estate.
+
+`scripts/check_route_auth.py` inverts the default. Every route under
+`services/` must carry an authentication dependency or appear in one of three
+tables, each of which records **why** it is reachable without one:
+
+| Table | What it holds | Example |
+|---|---|---|
+| `PUBLIC_MODULES` | whole modules that exist to be probed, keyed by path | `app/_health.py` |
+| `PUBLIC_ROUTES` | individual routes public by design, each with its reason | `POST /auth/login`, the SAML ACS, a published replay |
+| `IN_BAND_CREDENTIAL_ROUTES` | routes whose credential is verified *inside* the handler | the Slack and Teams webhooks, the ITSM inbox, `?token=` WebSockets |
+
+That third table matters more than it looks. An AST pass sees no `Depends` and
+calls those routes unauthenticated — they are not. Slack Bolt verifies a
+request signature, the Teams webhook verifies an HMAC-signed card payload with
+a replay window, and the ITSM inbox authenticates on a per-tenant token in the
+path. Each entry **names the verifier** and stops protecting the route the
+moment the handler stops calling it, so the exemption cannot outlive its
+justification.
+
+`services/agents` is the one service that needs **dual-mode** authentication.
+The console reaches its routes directly through a Next.js rewrite carrying the
+first-party access token, so a bearer-token-only scheme would lock the browser
+out; the guard is the same `require_console_or_service_auth` described above.
+Its WebSocket cannot use a FastAPI dependency at all — a browser cannot set an
+`Authorization` header on a handshake — so it accepts the credential as
+`?token=`, verifies it with the same vendored logic, and closes with code 1008
+before accepting the connection.
+
+Run `python scripts/check_route_auth.py --inventory` for the per-service
+table.
+
+### Reads addressed by an id still filter on a tenant
+
+Tenant isolation is enforced at read time, per store, and the predicate is the
+control that matters. 92 of 95 tenant-scoped tables now carry an RLS policy (it
+was 31), and since `061_runtime_app_role.sql` the shipped role is one those
+policies apply to — so the second layer is real rather than nominal. It still
+engages only on a session that has run `SET LOCAL app.current_tenant_id`, and
+the workers deliberately do not: on an `aisoc_*` table read through a plain
+unbound session, a missing predicate is still a leak, not a defence-in-depth
+gap.
+
+The dangerous shape is a query that matches on an id and nothing else —
+`select(Honeytoken).where(Honeytoken.id == token_id)`. It takes no tenant, so
+the parameter gate cannot see it, and naming another tenant's UUID reaches
+their row.
+
+`scripts/check_tenant_query_predicates.py` enforces the predicate directly.
+Both the tenant-scoped ORM models and the tenant-scoped tables are derived
+from the tree — a model's `tenant_id` column, the migrations' DDL — rather
+than listed, so a new migration cannot slip past a stale constant. A statement
+counts as scoped when the tenant predicate reaches it by any structural route:
+inline in the `.where()` chain, appended to a `filters` list, bound to a
+variable, added by a later `q = q.where(...)`, carried in through a join, or
+applied by a helper that takes the statement and hands it back filtered. Two
+further shapes count because they are strictly narrower: a predicate on the
+**authenticated principal's own identity**, and a key this request already
+validated against the caller's tenant (`_fetch_run(db, run_id, user.tenant_id)`
+before reading that run's events). Raw SQL is parsed too, with docstrings
+excluded so prose describing a query is not read as one.
+
+Cases that cannot be decided statically sit on a **shrink-only ratchet**. Each
+entry carries a reason; an entry whose statement has since been scoped fails
+the build as *stale*, so exemptions come out as code is fixed; and
+`MAX_RATCHET` is asserted against the table's length, so adding one means
+raising a number in the diff rather than appending a line nobody reads.
+
+### MSSP parent/child links require the child's consent
+
+A managed provider can hold other tenants as children (`tenants.parent_tenant_id`), which grants the parent real authority over them: rule packs, per-rule overrides, notes and delegations are all keyed on the child's tenant id, and an override with `action: "exclude"` removes a detection rule from the ruleset that child's hunts run against.
+
+Because that authority is real, the link cannot be created unilaterally. `POST /api/v1/mssp/children/{child_id}/onboard` requires the child to have invited that specific parent:
+
+1. An admin of the tenant being adopted calls `PATCH /api/v1/tenants/me/settings` (gated on `settings:write`, and it only ever writes the caller's own row) with `settings.mssp_parent_invite` set to the parent's tenant UUID.
+2. The parent calls the onboard endpoint. The invite is consumed on success, so it is single-use and a stale value cannot re-adopt a tenant that later left.
+
+Without a matching invite the endpoint answers `403` and nothing is written. The four child-scoped write routes (`/mssp/overrides`, `/mssp/notes`, `/mssp/delegations`, `/mssp/rule-packs/{id}/assign`) independently verify that the named child really is the caller's, and answer `404` — never `403` — when it is not, so they cannot be used to discover which tenant UUIDs exist.
+
+:::note What this replaced
+The guard on these routes was a function named `_ensure_mssp_parent` whose body was `pass`, and onboarding's only check was a `409` when the target already had a parent. Every standalone tenant on a deployment was therefore adoptable by any authenticated user, after which that user could disable named detection rules inside it. See the `[Unreleased]` section of the changelog.
+:::
 
 ## Audit logging
 
@@ -303,6 +520,8 @@ When you move from `pnpm aisoc:demo` to a production deployment, walk through th
 - [ ] Configure SSO (OIDC or SAML) and disable local password login for human users — leave it on only for break-glass platform admins.
 - [ ] Require WebAuthn/passkeys for any role that triggers destructive playbook actions or credential changes.
 - [ ] Confirm `FORCE ROW LEVEL SECURITY` is set on every tenant-partitioned table (verify with `\d+ <tablename>` in `psql`).
+- [ ] Confirm `DATABASE_URL` points at the DML-only runtime role and `DATABASE_MIGRATION_URL` at the owner: `python scripts/check_runtime_db_role.py --dsn "$DATABASE_URL" --owner-dsn "$DATABASE_MIGRATION_URL"`. Without this, `FORCE` above is checking a box that the connecting role walks straight past.
+- [ ] Set `AISOC_APP_DB_PASSWORD` to a fresh secret before applying the migration chain, so the runtime role is never left on the `changeme` literal `002_rls.sql` created it with.
 - [ ] Set up an external log sink for the audit log (Splunk, Elastic, Loki) — the in-DB log is the source of truth, but a copy in your SIEM is good practice.
 - [ ] Configure `AISOC_TRUSTED_PROXIES` to the CIDR(s) of your ingress / load balancer so `actor_ip` is sourced from `X-Forwarded-For` instead of the immediate TCP peer. Leave empty if the API is exposed directly to clients.
 - [ ] Schedule a periodic `verify_chain()` job against an offsite read replica or a CSV export of the `audit_log` table and alert on any verification failure.
@@ -311,9 +530,67 @@ When you move from `pnpm aisoc:demo` to a production deployment, walk through th
 - [ ] Enable mTLS between services if you're running on Kubernetes with a mesh.
 - [ ] Subscribe to the AiSOC GitHub Security Advisories for vulnerability notifications.
 
+## The LLM input contract
+
+Every prompt that leaves AiSOC for a third-party model passes a fail-closed
+validator first. It is a **minimum-leak** control: it aborts a call that is
+about to ship raw OCSF, vendor log lines, Sysmon XML or secret-shaped values
+outside the deployment. It is *not* an injection sanitizer — that is
+`PromptInjectionGuard`, which detects and demotes rather than refusing.
+
+The rules live once, in `services/agents/app/llm/contract_rules.py`, and are
+vendored byte-identically to `services/api/app/_vendor/llm_contract_rules.py`
+(gated by `scripts/sync_vendored_llm_contract.py --check`). One classifier
+rather than two: a prompt refused by one service and accepted by the other
+reads as a bug in the refusal.
+
+Enforcement is governed by `AISOC_AGENTS_LLM_CONTRACT_ENFORCED` (default on)
+for both services, so it cannot be left enabled on one path and disabled on the
+other.
+
+Routing an LLM call:
+
+| How you call the model | Use |
+|---|---|
+| LangChain chat model in `services/agents` | `safe_ainvoke` / `safe_astream` / `make_safe_chat_model` |
+| Raw HTTP in `services/agents` | `app.llm.contract.safe_chat_completions_request` |
+| Raw HTTP in `services/api` | `app.services.llm_safety.safe_chat_completions_request` |
+
+Two CI gates in `services/agents/tests/test_llm_contract_no_bypass.py` enforce
+this. The first walks the AST for `.ainvoke` / `.astream`; the second flags a
+file that both names a completions endpoint and issues its own POST.
+
+:::warning Why the second gate exists
+The first gate proved the LangChain path was clean and said nothing about the
+other way to reach a model. `services/agents/app/api/explain.py` POSTed to a
+completions URL with raw `httpx` and was invisible to it for several releases,
+under a test named "no bypass" — and **every** LLM call in `services/api` did
+the same, because that service had no contract at all. The module this
+documentation used to describe as living there did not exist in the tree.
+
+Both are fixed, and the gate now asks the question that catches the shape
+rather than the one that catches the library.
+:::
+
 ## Static analysis (CodeQL)
 
-GitHub CodeQL runs on every pull request and on a nightly schedule against `main`. As of the v8.0 wave-1 push the Python alert count on `main` is zero, and we treat that as a CI gate — a new alert breaks the security workflow and blocks the next release.
+GitHub CodeQL (`.github/workflows/codeql.yml`) analyses `javascript-typescript`, `python` and `go` on every push to `main`, on every pull request targeting `main`, and on a weekly schedule (Mondays, 03:00 UTC).
+
+**The invariant: zero *open* CodeQL alerts on `main`, at every severity — `note` included.** It is enforced by `.github/workflows/codeql-alert-gate.yml`, which runs `scripts/check_codeql_alerts.py`. Precisely what that means:
+
+- **Every severity counts.** `note`, `warning` and `error` all break the gate, and so do alerts that carry no `security_severity_level` at all (quality queries generally do not). There is no threshold to sit underneath.
+- **Dismissed alerts are excluded, and counted out loud.** Dismissal is GitHub's audited escape hatch: it records the actor, the reason and the timestamp, and it requires write access. We use it for roughly twenty accepted-risk `py/request-without-cert-validation` findings on the on-prem appliance clients (Splunk, FortiGate, PAN-OS, osctrl, FleetDM, MISP): those clients default to `verify=True` and only disable verification on an explicit operator opt-in, which self-signed and internal-CA appliances require. They are dismissed `won't fix` with CA-bundle pinning recorded as the future alternative. The gate prints how many dismissals it excluded on every run, so a silent mass-dismissal is visible in its own output rather than hidden behind a green tick.
+- **An unanalysed ref is a failure, not a pass.** The gate requires a CodeQL analysis for *each* declared language, pinned to the commit that triggered the run, and it fails if the newest analysis is more than ten days old. Zero alerts because nothing ran is the answer it exists to refuse.
+- **It runs on `push` to `main`, not only on pull requests,** plus a `workflow_run` trigger after CodeQL finishes and a daily schedule.
+- **Scorecard findings are out of scope.** Scorecard uploads SARIF to the same code-scanning page under its own tool name (`PinnedDependenciesID`, `TokenPermissionsID` and friends). They are a different policy with a different owner; the gate reports them and does not gate on them.
+
+`scripts/check_codeql_alerts.py --self-test` injects an alert at each severity plus every shape of vacuous pass — no analysis, a dropped language, a frozen analysis, mixed `codeql-action` pins, a PR-only trigger — and requires the gate to catch each one. CI runs that self-test immediately before the gate itself, on the same tree.
+
+:::warning This invariant was stated for four months before anything enforced it
+This section used to read "the Python alert count on `main` is zero, and we treat that as a CI gate — a new alert breaks the security workflow". No mechanism existed. `codeql.yml` uploads SARIF, and `github/codeql-action/analyze` does not fail a build on findings; `main` has no branch protection, so "Code scanning results" was not a required check either; and `security.yml`'s only hard job is the claim-to-gate matrix. Nothing in the repository queried the code-scanning API.
+
+It was found the way these things are always found: two alerts — [#893](https://github.com/beenuar/AiSOC/security/code-scanning/893) (`py/unused-global-variable`) and [#896](https://github.com/beenuar/AiSOC/security/code-scanning/896) (`py/print-during-import`), both `note` — sat open on `main` while this page said the count was zero. The scan itself was healthy and current; the enforcement was imaginary. The sentence above now describes a job that exists, and the gate's self-test is what keeps it that way.
+:::
 
 Two patterns are worth documenting because they came up repeatedly during the sweep that drove the alert count to zero:
 

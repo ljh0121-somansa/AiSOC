@@ -227,6 +227,7 @@ async def execute_lake_query(
     *,
     timeout_seconds: float | None = None,
     extra_settings: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
 ) -> LakeQueryResult:
     """Run a rewritten lake SQL statement and return columns + rows.
 
@@ -261,6 +262,13 @@ async def execute_lake_query(
         :data:`DEFAULT_QUERY_SETTINGS`. Used by the lake endpoints to
         layer in per-tenant overrides (e.g. tighter row caps for
         unprivileged roles).
+    params:
+        Values for ``%(name)s`` placeholders, bound by the driver. Callers
+        that build SQL from untrusted input — an analyst's hunt question, for
+        instance — bind their values here so no user text is ever
+        concatenated into the statement. This includes the tenant predicate:
+        binding it as a parameter is stronger than injecting a literal and
+        hoping the rewrite survived.
 
     Returns
     -------
@@ -301,6 +309,7 @@ async def execute_lake_query(
         # which we need so the API can echo a stable column ordering.
         return client.execute(
             sql,
+            params or {},
             with_column_types=True,
             settings=merged_settings,
         )
@@ -422,3 +431,49 @@ async def fetch_lake_schema(
         by_table[key].append({"name": name, "type": ctype, "comment": comment or ""})
 
     return [{"table": fq, "columns": cols} for fq, cols in by_table.items()]
+
+
+async def init_lake_schema() -> None:
+    """Converge the lake schema at startup.
+
+    `clickhouse/001_init.sql` runs only in the container entrypoint, and
+    only on a volume that has never been initialised. `lake_writer`
+    self-heals with `CREATE TABLE IF NOT EXISTS`, which is a no-op once the
+    table exists. Neither adds a column to an existing deployment, so a
+    schema change lands on fresh installs and silently does not land
+    anywhere else — invisible until a query selects a column that is not
+    there, long after the deploy that was meant to add it.
+
+    Non-strict on purpose, matching the Neo4j equivalent: a migration
+    failure must not take the API down, because the lake is a query surface
+    and the rest of the platform works without it. It is logged at
+    ``error`` and the pending list stays readable for diagnostics, so a
+    degraded start is visible rather than assumed.
+    """
+    from app.db.lake_migrations import pending_ids, run_migrations  # noqa: PLC0415
+
+    try:
+        client = await get_clickhouse_client()
+    except LakeQueryNotConfiguredError:
+        logger.info("clickhouse not configured — skipping lake migrations")
+        return
+    except Exception as exc:  # noqa: BLE001 - an unreachable lake is not fatal
+        logger.warning("clickhouse unreachable at startup: %s", exc)
+        return
+
+    try:
+        applied = await run_migrations(client, strict=False)
+        pending = await pending_ids(client)
+    except Exception as exc:  # noqa: BLE001 - same reasoning
+        logger.error("lake migrations could not run: %s", exc)
+        return
+
+    if applied:
+        logger.info("ClickHouse lake migrations applied: %s", ", ".join(applied))
+    if pending:
+        logger.error(
+            "ClickHouse lake migrations still pending after startup: %s — lake-backed features may query columns that do not exist",
+            ", ".join(pending),
+        )
+    else:
+        logger.info("ClickHouse lake schema up to date")

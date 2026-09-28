@@ -3,9 +3,11 @@
 from fastapi import APIRouter
 
 from app.api.v1.endpoints import (
+    agent_tools,
     agents,
     airgap,
     alert_explain,
+    alert_writeback,
     alerts,
     api_keys,
     approvals,
@@ -14,6 +16,7 @@ from app.api.v1.endpoints import (
     audit,
     auth,
     autonomy_policy,
+    branding,
     business_context,
     cases,
     community,
@@ -28,6 +31,8 @@ from app.api.v1.endpoints import (
     detection_rules,
     easm,
     effective_permissions,
+    email_approval,
+    evaluations,
     federated,
     feedback,
     fusion,
@@ -44,9 +49,11 @@ from app.api.v1.endpoints import (
     investigations,
     knowledge_base,
     lake,
+    live_actions,
     llm_credentials,
     llm_status,
     marketplace,
+    mcp_servers,
     metrics,
     mssp,
     nl_detection,
@@ -55,6 +62,7 @@ from app.api.v1.endpoints import (
     oncall,
     passkeys,
     phishing,
+    playbook_steps,
     playbooks,
     plugins,
     posture,
@@ -66,15 +74,19 @@ from app.api.v1.endpoints import (
     report_builder,
     reports,
     rule_tuning,
+    sandbox,
     saved_hunts,
     saved_views,
+    scim_tokens,
     shifts,
     sla,
     stix_taxii,
     tenant_provision,
+    tenant_skills,
     tenants,
     threat_intel,
     translation,
+    usage,
     waitlist,
 )
 
@@ -86,9 +98,13 @@ api_router.include_router(alerts.router)
 # Structured AI explainer (POST /alerts/{id}/explain) — single-shot
 # JSON envelope counterpart to the agent service's NDJSON stream.
 api_router.include_router(alert_explain.router)
+# Two-way SIEM loop (POST /alerts/{id}/source-writeback) — AiSOC's verdict
+# written back onto the notable / signal / offense that raised the alert.
+# Dry-run by default; AISOC_SIEM_WRITEBACK_EXECUTE opts in to the vendor call.
+api_router.include_router(alert_writeback.router)
 api_router.include_router(cases.router)
 # Attack-chain timeline (T3.3 — v8.0 parallel team plan).
-# Backs apps/web/src/app/(app)/cases/[id]/attack-chain/page.tsx with a
+# Backs the attack-chain view in apps/web/src/components/cases/CaseWorkspace.tsx with a
 # ranked timeline (graph-distance + temporal proximity + risk overlap)
 # of every alert that shares an entity with the case's seed alert,
 # plus the side-by-side entity graph the right column renders.
@@ -100,6 +116,7 @@ api_router.include_router(connectors.router)
 # operator back on /onboarding.
 api_router.include_router(oauth.router)
 api_router.include_router(tenants.router)
+api_router.include_router(usage.router)
 api_router.include_router(detection_rules.router)
 # Frontend-shape facade: /api/v1/detection/rules + /api/v1/detection/test
 api_router.include_router(detection_compat.router)
@@ -111,13 +128,31 @@ api_router.include_router(detection_proposals.router)
 # Mutations stamp suppression_config and write detection.tuning.* audit log.
 api_router.include_router(rule_tuning.router)
 api_router.include_router(federated.router)
+# The typed surface an investigation agent reaches a customer's SIEM, EDR,
+# IdP and cloud audit trail through. Deliberately beside `federated`: it
+# reuses that endpoint's fan-out rather than building a second one, and adds
+# the typed query, the per-tenant advertisement and the caps an agent needs
+# and a console does not.
+api_router.include_router(agent_tools.router)
 api_router.include_router(graph.router)
 api_router.include_router(playbooks.router)
+# One playbook step, graded on its own capability, through the same governed
+# dispatch a manually-approved action takes. The engine has no vault and no
+# tenant session, so this is where a step turns into a real vendor call.
+api_router.include_router(playbook_steps.router)
 api_router.include_router(plugins.router)
 api_router.include_router(community.router)
 api_router.include_router(marketplace.router)
+api_router.include_router(mcp_servers.router)
+# Gap-closure Phase 6.1 and 6.2: tenant-authored investigation skills:
+# authored in YAML, validated against the tools this tenant's agent can
+# actually call, backtested through the Phase 1 replay with and without the
+# skill, and only then activated. The agents service resolves the active set
+# on the path of an investigation.
+api_router.include_router(tenant_skills.router)
 api_router.include_router(rbac.router)
 api_router.include_router(audit.router)
+api_router.include_router(branding.router)
 api_router.include_router(compliance.router)
 api_router.include_router(metrics.router)
 # Pipeline health snapshot — v1.5 SOC Console parity.
@@ -147,6 +182,13 @@ api_router.include_router(replay.public_router)
 # edges in Neo4j. Backs apps/web/src/app/(app)/identity/permissions.
 api_router.include_router(effective_permissions.router)
 
+# Signed email-approval links (T3.6). Unauthenticated by necessity — the
+# recipient is in a mail client, not a session — so the HMAC token is the
+# credential. `app/services/email_approval.py` had minted URLs pointing at
+# /v1/actions/email-decide, which no router served, so every approve and deny
+# button in a rendered email linked to a 404.
+api_router.include_router(email_approval.router)
+
 # Cost dashboard — WS-H1 (buyer-value plan).
 # Aggregates LLM spend / token volume from aisoc_run_costs joined with
 # investigation_runs, plus action counts from audit_log and BYOK savings
@@ -159,11 +201,21 @@ api_router.include_router(oncall.router)
 api_router.include_router(approvals.router)
 api_router.include_router(passkeys.router)
 
+# The live-action registry, proxied for the browser. Upstream it sits behind
+# a service token, so before this every route that answers "what can AiSOC do
+# to my estate" was reachable only by another service. Discovery and dry-run
+# only: a live dispatch goes through the approval path so an approver is
+# bound to it.
+api_router.include_router(live_actions.router)
+
 # Per-user saved views — WS-F3 (analyst quality-of-life).
 # Backs the saved-views menu on Alerts/Cases/Investigations/Playbooks
 # list pages. Per-user-per-tenant CRUD; tenant scoping via RLS, user
 # scoping in the API layer (every query filters on user_id).
 api_router.include_router(saved_views.router)
+# Administering SCIM credentials, which is a console action. The SCIM
+# surface those credentials authenticate is mounted at /scim/v2 in main.py.
+api_router.include_router(scim_tokens.router)
 
 # Wave 3 — operational maturity
 api_router.include_router(assets.router)
@@ -213,6 +265,16 @@ api_router.include_router(saved_hunts.router)
 
 # Email-security + phishing-triage workflow (Tier 3)
 api_router.include_router(phishing.router)
+
+# File + URL analysis behind one provider contract. Hash lookup is always
+# allowed; uploading a customer file is off by default, per tenant per
+# provider, and air-gapped mode permits local providers only.
+api_router.include_router(sandbox.router)
+
+# Gap-closure Phase 1.4 — replay evaluation: triage measured against this
+# tenant's own analysts on their own closed findings. Distinct from
+# `replay.router` above, which publishes a redacted ledger to a share link.
+api_router.include_router(evaluations.router)
 
 # Knowledge-base + RAG over org docs/runbooks (Tier 3)
 api_router.include_router(knowledge_base.router)

@@ -69,6 +69,22 @@ class LiveActionStatus(str, Enum):
     # invoked: the tier/blast policy blocked it outright, or it needs a human.
     BLOCKED = "blocked"
     PENDING_APPROVAL = "pending_approval"
+    #: The vendor accepted the request, the work started, and the outcome is
+    #: not known yet. Nothing failed and nothing is finished.
+    #:
+    #: Added because two executors had no honest state to land in and so were
+    #: unreachable through governed dispatch. ``chatops_verify`` delivers a
+    #: prompt and waits for a person to click; ``capture_forensics`` queues an
+    #: acquisition that MDE completes minutes later. Both returned the legacy
+    #: ``ActionStatus.RUNNING``, which ``_to_live_status`` collapsed into
+    #: SUCCEEDED along with everything else that was not FAILED — reporting an
+    #: unanswered question and an uncollected package as completed actions.
+    #:
+    #: Distinct from PENDING_APPROVAL, which means the opposite: nothing ran,
+    #: because policy wants a human first. Here the vendor was touched and the
+    #: caller has to come back — post-action verification deliberately does not
+    #: run against this state, since there is not yet an effect to read back.
+    AWAITING_COMPLETION = "awaiting_completion"
 
 
 class LiveActionRequest(BaseModel):
@@ -105,6 +121,15 @@ class LiveActionRequest(BaseModel):
     auth_config: dict[str, Any] | None = None
     dry_run: bool = False
 
+    #: How sure the caller is that the finding justifying this action is real,
+    #: 0..1. The capability contract says what the verb does to an estate; this
+    #: says how good the reason is. ``approval_matrix`` needs both.
+    #:
+    #: ``None`` is not "no opinion", it is the lowest band — the matrix treats
+    #: it that way on purpose, because defaulting permissive turns a scoring
+    #: bug into an autonomous containment.
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+
     # Provenance — these are filled in by the API layer / agent runner so
     # the executor's structured logs can be correlated back to the case or
     # playbook that triggered it. They are optional because plugin authors
@@ -112,6 +137,10 @@ class LiveActionRequest(BaseModel):
     # synthetic UUIDs.
     case_id: UUID | None = None
     playbook_run_id: UUID | None = None
+    #: The step that asked for this, when the caller is a playbook. Carried so
+    #: the audit trail names the step rather than only the run: a playbook can
+    #: contain several actions and "run X did something" is not an audit trail.
+    playbook_step_id: str = ""
     tenant_id: UUID | None = None
     requested_by: str = "system"
 
@@ -159,3 +188,20 @@ class LiveActionDescriptor(BaseModel):
     description: str
     source: str  # "builtin" | "plugin"
     requires_credentials: bool = True
+    #: What this verb does to the estate if the finding is wrong, and whether
+    #: a human has to authorise it. Both read from ``CAPABILITY_CONTRACTS``
+    #: at discovery time rather than declared per executor, because the
+    #: contract belongs to the capability and a per-executor copy is how one
+    #: vendor's arm comes to be graded more generously than another's.
+    #:
+    #: Published here because ``services/api`` needs to know which verbs are
+    #: reads before it will let an investigation agent call one, and the
+    #: alternative was a second copy of the classification in that service.
+    #: A mirror of a safety classification is a mirror that eventually
+    #: disagrees, and the generous copy is the one that gets used.
+    #:
+    #: Empty for a capability with no contract entry, which is a plugin verb.
+    #: An empty impact must never be read as read-only; the API's read door
+    #: requires the exact string ``read_only``.
+    impact: str = ""
+    approval: str = ""

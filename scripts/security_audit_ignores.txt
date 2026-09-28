@@ -9,150 +9,120 @@
 # Example:
 # python|CVE-2026-12345|Upstream fix not released; tracked in issue #123|2026-07-15
 
-# ── 2026-05-28 triage (expire 2026-08-25) ────────────────────────────────────
-# cryptography==42.0.8 advisories (CVE-2024-12797, CVE-2026-26007,
-# GHSA-h4gh-qq45-vh27, PYSEC-2026-35) are NOT ignored — fixed by bumping the
-# connectors/osquery-tls floor to >=44.0.1 so they resolve to the clean 48.x
-# line already used by the api/actions services.
+# ── 2026-09-23 re-triage — the list is now empty ─────────────────────────────
+# All 42 entries that stood here were re-verified against OSV and against the
+# versions the repo actually resolves, rather than against the claims in their
+# own reason strings. Every one of them was resolvable, so none was carried
+# forward. Nothing is suppressed today.
 #
-# Everything below has no patched release available (packages already at their
-# newest version) or is a framework-capped transitive dep where a bump is both
-# risky and ineffective. Time-boxed for re-evaluation within 90 days.
+# The entries were re-checked ahead of the 2026-10-05 ecdsa expiry because
+# `load_ignores` fails closed: a lapsed entry aborts `validate-ignores` before
+# any ecosystem is scanned, which reds every open PR and leaves `main`
+# stale-green. That has happened here before (twelve expired suppressions,
+# #650), so the list is re-read on a schedule rather than on a failure.
+#
+# Recording what was measured, because most of these reason strings had
+# quietly stopped being true and re-reading them would have produced another
+# round of date bumps rather than fixes:
+#
+#   • starlette (9 entries) claimed "slack-bot and teams-bot still cap fastapi
+#     <0.137, which resolves fastapi 0.136.1 / starlette 1.0.0". Neither cap
+#     exists: both pyproject files read fastapi >=0.111,<0.142 and both locks
+#     resolve fastapi 0.141.1 with starlette 1.6.0. services/agents resolves
+#     starlette 1.3.1. The highest fix among the nine is 1.3.1, so every
+#     service was already clean.
+#
+#   • idna CVE-2026-45409 claimed "only services/slack-bot still resolves
+#     3.13". slack-bot resolves 3.20, teams-bot 3.15, agents 3.18; the fix is
+#     3.15. (The CVE id is also not a resolvable OSV record — OSV carries this
+#     as GHSA-65pc-fj4g-8rjx / PYSEC-2026-215 with the CVE as an alias.)
+#
+#   • langchain / langgraph (9 entries) claimed pins of langchain <0.4.0,
+#     langchain-openai <0.4.0 and langgraph <1.1.0 blocking a "0.3 to 1.x
+#     migration". That migration has already happened: the pins read
+#     langchain >=1.3.9, langchain-core >=1.2.22, langgraph >=1.0.10,
+#     langgraph-checkpoint >=4.1.1, langgraph-sdk >=0.3.15, and the lock
+#     resolves 1.4.2 / 1.6.4 / 1.2.12 / 4.2.0 / 0.4.5 respectively.
+#     langchain-text-splitters (PYSEC-2026-77) is not in the tree at all.
+#
+#   • langchain-core (4 entries) claimed the same blocked major bump. The lock
+#     resolves 1.6.4; the fixes are 1.2.11 and 1.2.22.
+#
+#   • weasyprint (3) and anyio (5) claimed they were "pinned by the committed
+#     services/agents lock, needs a lock refresh". That lock already carries
+#     weasyprint 70.0 and anyio 4.15.1, which are the fixed versions.
+#
+#   • pydantic-settings claimed "slack-bot/teams-bot still resolve 2.14.1".
+#     Both resolve 2.15.0; the fix is 2.14.2.
+#
+#   • cryptography (3 entries) claimed the fix was "held by the <50 and <49
+#     version caps". No such cap exists anywhere — every pin reads <51 — and
+#     services/agents resolves 50.0.1, which is the fixed line.
+#
+#   • aiohttp (3 entries) claimed 3.14.1 awaiting a lock refresh; the locks
+#     resolve 3.14.3, which is the fix. h2 claimed 4.3.0; agents resolves
+#     4.4.1, which is the fix.
+#
+#   • image-size (2 pnpm entries) claimed the advisory "reports no patched
+#     release (patched_versions "<0.0.0"), so an override has no clean
+#     target". GHSA-5p2g-fcmc-qvqq and GHSA-w3rx-r6r6-pgpr both record a
+#     vulnerable range of "<= 2.0.2", and npm has published 2.0.3 and 2.0.4;
+#     OSV reports both as unaffected. `first_patched_version` being null in
+#     the GitHub advisory is not the same claim as no fix existing, and
+#     reading it as such kept two high-severity advisories suppressed for a
+#     fix that was already on the registry. A pnpm override now pins
+#     >=2.0.4 <3, which @docusaurus/mdx-loader's ^2.0.2 range accepts.
+#
+#   • ecdsa PYSEC-2026-1325 (CVE-2024-23342, Minerva timing attack on P-256)
+#     was the one entry whose "no patched version available" was true: OSV
+#     records the affected range as introduced at 0 with no fixed event,
+#     because upstream states python-ecdsa offers no side-channel resistance
+#     and will not fix it. It was also true that ecdsa was unconditional under
+#     python-jose. So the dependency was removed instead of re-suppressed:
+#     services/api now uses PyJWT, which it already depended on for the OIDC
+#     and SAML paths, and python-jose, ecdsa and rsa all leave the tree.
+#
+# Verification for the empty list: all 20 Python targets were exported exactly
+# as `run_pip_audit` does and every resolved pin checked against OSV — zero
+# advisories, zero unscanned. `pnpm audit` reports zero advisories with the
+# image-size override (two high without it). `govulncheck` reports zero
+# findings across all six Go modules.
+#
+# Add entries back only with a justification that names the version actually
+# resolved and the fix that is genuinely out of reach. An expiry is a
+# re-review date, not a snooze.
 
-# pnpm — all three packages are already at their latest published versions
-# (serialize-javascript 6.0.2, fast-uri 3.1.0, babel plugin 7.29.0); no fixed
-# release exists. fast-uri/babel are build/tooling-only transitive deps.
-pnpm|GHSA-5c6j-r48x-rmvq|serialize-javascript 6.0.2 is latest; no patched release; not used to serialize untrusted input|2026-08-25
-pnpm|GHSA-q3j6-qgpj-74h6|fast-uri 3.1.0 is latest; ReDoS advisory has no fixed version; transitive build/tooling dep|2026-08-25
-pnpm|GHSA-v39h-62p7-jpjc|fast-uri 3.1.0 is latest; ReDoS advisory has no fixed version; transitive build/tooling dep|2026-08-25
-pnpm|GHSA-fv7c-fp4j-7gwp|@babel/plugin-transform-modules-systemjs 7.29.0 is latest; build-time only, not shipped to runtime|2026-08-25
-
-# starlette — transitive via fastapi (capped <0.137). CVE-2024-47874 and
-# CVE-2025-54121 are fixed in 1.0.0 but reaching it requires a risky
-# framework-wide fastapi bump; PYSEC-2026-161 affects 1.0.0 too, so a bump
-# would not clear the audit. Tracked for a coordinated fastapi/starlette upgrade.
-python|PYSEC-2026-161|starlette advisory affects all releases incl. 1.0.0 (latest); no fixed version available|2026-08-25
-python|CVE-2024-47874|starlette multipart DoS; fixed in 1.0.0 but capped by fastapi<0.137; tracked for fastapi bump|2026-08-25
-python|CVE-2025-54121|starlette multipart DoS; fixed in 1.0.0 but capped by fastapi<0.137; tracked for fastapi bump|2026-08-25
-
-# langchain/langgraph — freshly disclosed 2026 advisories with no non-breaking
-# fix in the pinned 0.3.x / 1.0.x lines yet. Tracked for upstream patch.
-python|PYSEC-2026-76|langchain-openai 0.3.35 freshly disclosed; no non-breaking fix in 0.3.x line yet|2026-08-25
-python|PYSEC-2026-77|langchain-text-splitters 0.3.11 freshly disclosed; no non-breaking fix in 0.3.x line yet|2026-08-25
-python|PYSEC-2026-83|langgraph 1.0.1 freshly disclosed; awaiting patched 1.0.x release|2026-08-25
-python|CVE-2026-27794|langgraph-checkpoint 3.0.1 freshly disclosed; awaiting patched release|2026-08-25
-
-# idna — deep transitive dep (httpx/requests/email-validator); freshly
-# disclosed, no fixed version available yet.
-python|CVE-2026-45409|idna 3.13 freshly disclosed; transitive dep, no fixed version available yet|2026-08-25
-
-# ── 2026-06-27 triage (expire 2026-09-25) ────────────────────────────────────
-# esbuild GHSA-gv7w-rqvm-qjhr was WITHDRAWN by GitHub on 2026-06-17 (advisory
-# reclassified as not exploitable). pnpm audit still surfaces withdrawn
-# advisories from its cached DB, so suppress until the upstream DB refresh.
-pnpm|GHSA-gv7w-rqvm-qjhr|esbuild advisory withdrawn 2026-06-17 by GitHub; reclassified as not exploitable|2026-09-25
-
-# starlette — additional fresh disclosures stacking on top of the existing
-# CVE-2024-47874 / CVE-2025-54121 / PYSEC-2026-161 entries above. Fixed in
-# starlette 1.1.0–1.3.1 but still capped by fastapi<0.137 in services/api,
-# services/agents, services/actions. The open dependabot PRs #317/#319/#320
-# lift that cap to <0.139; once those land plus a coordinated starlette
-# bump, all six can be removed in one pass.
-# Both CVE and GHSA forms are listed because pip-audit may report either as
-# the primary id depending on the advisory source.
-python|CVE-2026-48817|starlette HTTPEndpoint dispatch via getattr (fixed in 1.1.0); blocked by fastapi<0.137 cap, tracked for starlette bump|2026-09-25
-python|GHSA-x746-7m8f-x49c|starlette HTTPEndpoint dispatch via getattr (fixed in 1.1.0); blocked by fastapi<0.137 cap, tracked for starlette bump|2026-09-25
-python|CVE-2026-48818|starlette SSRF via UNC paths on Windows (fixed in 1.1.0); Linux-only deployment, blocked by fastapi<0.137 cap|2026-09-25
-python|GHSA-wqp7-x3pw-xc5r|starlette SSRF via UNC paths on Windows (fixed in 1.1.0); Linux-only deployment, blocked by fastapi<0.137 cap|2026-09-25
-python|CVE-2026-54282|starlette hostname poisoning (low severity, fixed in 1.3.0); blocked by fastapi<0.137 cap, tracked for starlette bump|2026-09-25
-python|GHSA-jp82-jpqv-5vv3|starlette hostname poisoning (low severity, fixed in 1.3.0); blocked by fastapi<0.137 cap, tracked for starlette bump|2026-09-25
-python|CVE-2026-54283|starlette urlencoded form DoS (fixed in 1.3.1); blocked by fastapi<0.137 cap, tracked for starlette bump|2026-09-25
-python|GHSA-82w8-qh3p-5jfq|starlette urlencoded form DoS (fixed in 1.3.1); blocked by fastapi<0.137 cap, tracked for starlette bump|2026-09-25
-
-# pydantic-settings — fixed in 2.14.2 (a patch bump within ^2.x). The agents
-# service caps to ^2.1.0 and api uses ^2.2.1, both of which would resolve to
-# 2.14.2; pip-audit's bundled DB may still be referencing 2.14.1. Suppress
-# briefly while we float the pin and let the next poetry lock pick up 2.14.2.
-python|GHSA-4xgf-cpjx-pc3j|pydantic-settings symlink follow (fixed in 2.14.2); patch bump tracked, waiting on next poetry lock refresh|2026-09-25
-
-# langchain / langgraph-checkpoint / langgraph-sdk — newly disclosed Q2/Q3
-# 2026 advisories that all require MAJOR version bumps (langchain 0.3 → 1.3,
-# langgraph 0.2 → 4.x). Those bumps have known breaking API changes and need
-# dedicated PRs with regression coverage; out of scope for an audit unblock.
-python|GHSA-gr75-jv2w-4656|langchain path traversal in file-search middleware (fixed in 1.3.9); requires langchain 0.3 → 1.3 major bump, tracked for dedicated PR|2026-09-25
-python|CVE-2026-48775|langgraph-checkpoint unsafe JSON deserialization (fixed in 4.1.1); requires langgraph 0.2 → 4.x major bump, tracked for dedicated PR|2026-09-25
-python|GHSA-fjqc-hq36-qh5p|langgraph-checkpoint unsafe JSON deserialization (fixed in 4.1.1); requires langgraph 0.2 → 4.x major bump, tracked for dedicated PR|2026-09-25
-python|CVE-2026-48776|langgraph-sdk unsafe URL path construction (fixed in 0.3.15); transitive via langgraph, blocked by same major bump as CVE-2026-48775|2026-09-25
-python|GHSA-w39p-vh2g-g8g5|langgraph-sdk unsafe URL path construction (fixed in 0.3.15); transitive via langgraph, blocked by same major bump as CVE-2026-48775|2026-09-25
-
-# ── 2026-07-11 triage (expire 2026-10-05) ────────────────────────────────────
-# ecdsa 0.19.2 is the latest published release (2026-03-26) and already carries
-# the CVE-2026-33936 DER-parsing fix. PYSEC-2026-1325 still flags 0.19.2, so
-# there is no newer release to upgrade to. ecdsa is a hard transitive dependency
-# of python-jose[cryptography] (pulled in regardless of the crypto extra) used by
-# the API JWT layer; it is never used to parse untrusted attacker-supplied DER
-# private keys. Removing it requires migrating the auth layer off python-jose to
-# PyJWT (already a dep) — a regression-prone change tracked for a dedicated PR.
-python|PYSEC-2026-1325|ecdsa 0.19.2 is latest release; no patched version available; transitive via python-jose[cryptography]; tracked for python-jose to PyJWT migration|2026-10-05
-
-# ── 2026-07-13 triage (expire 2026-10-11) ────────────────────────────────────
-# langchain-core prompt-loading path traversal (langchain_core.prompts.loading
-# reads files from paths in deserialized config dicts). Fixed only in
-# langchain-core 1.2.22 — a major bump from our pinned 0.3.x line with breaking
-# API changes, blocked by the same langchain 0.3 → 1.x migration tracked above
-# (GHSA-gr75-jv2w-4656 et al.). The vulnerable prompts.loading module is not
-# imported anywhere in this codebase (verified via repo-wide grep).
-# Both PYSEC and GHSA forms listed since pip-audit may report either as primary.
-python|PYSEC-2026-2193|langchain-core prompts.loading path traversal (fixed in 1.2.22); requires langchain 0.3 → 1.x major bump, module unused in codebase; tracked with langchain migration PR|2026-10-11
-python|GHSA-qh6h-p6c9-ff54|langchain-core prompts.loading path traversal (fixed in 1.2.22); requires langchain 0.3 → 1.x major bump, module unused in codebase; tracked with langchain migration PR|2026-10-11
-
-# langchain-core SSRF via image_url token counting in
-# ChatOpenAI.get_num_tokens_from_messages (low severity, freshly disclosed).
-# Fixed only in langchain-core 1.2.11 — same langchain 0.3 → 1.x major bump as
-# the entries above. The affected method is not called anywhere in this
-# codebase (verified via repo-wide grep for get_num_tokens_from_messages /
-# image_url), so no untrusted image URL ever reaches it.
-python|PYSEC-2026-2562|langchain-core SSRF in ChatOpenAI.get_num_tokens_from_messages (low; fixed in 1.2.11); requires langchain 0.3 → 1.x major bump, method unused in codebase; tracked with langchain migration PR|2026-10-11
-python|GHSA-2g6r-c272-w58r|langchain-core SSRF in ChatOpenAI.get_num_tokens_from_messages (low; fixed in 1.2.11); requires langchain 0.3 → 1.x major bump, method unused in codebase; tracked with langchain migration PR|2026-10-11
-
-# websocket-driver DoS (freshly disclosed) reaches the tree only via
-# apps/docs → webpack-dev-server 5.2.3 → sockjs → websocket-driver. It is a
-# dev-server-only transitive dependency of the Docusaurus docs site: it never
-# runs in production, is never exposed to untrusted network input in CI, and
-# webpack-dev-server 5.x (the latest major) still resolves the vulnerable
-# version — no non-breaking fix exists. Tracked for the next webpack-dev-server
-# upgrade.
-pnpm|GHSA-xv26-6w52-cph6|websocket-driver DoS via apps/docs webpack-dev-server (dev-server only, not shipped/prod-exposed); no fix in webpack-dev-server 5.x line|2026-10-15
-
-# ── 2026-07-30 triage (expire 2026-10-28) ────────────────────────────────────
-# Fresh high-severity advisories published after the last green main run
-# (2026-07-19). `pnpm audit` reports fixAvailable=false for every one of these:
-# the direct dependents cap the transitive version, so no clean in-tree
-# auto-fix exists. next (framework) + sharp (native binary) have patched
-# releases but their bumps must be verified individually (App Router behaviour /
-# native rebuild matrix), so each real remediation is tracked for a dedicated
-# PR rather than folded into a dependency-audit unblock.
-
-# next — 4 high advisories all fixed in 16.2.11 (a patch inside our 16.2.x
-# line). Low-risk version-wise but touches both the apps/web and apps/docs App
-# Routers, so tracked for a dedicated PR gated on a full web build + e2e run.
-pnpm|GHSA-6gpp-xcg3-4w24|next middleware/proxy bypass (fixed in 16.2.11); patch bump tracked for a dedicated PR gated on web build+e2e|2026-10-28
-pnpm|GHSA-m99w-x7hq-7vfj|next App Router Server Components DoS (fixed in 16.2.11); patch bump tracked for a dedicated PR gated on web build+e2e|2026-10-28
-pnpm|GHSA-89xv-2m56-2m9x|next Server Actions SSRF (fixed in 16.2.11); patch bump tracked for a dedicated PR gated on web build+e2e|2026-10-28
-pnpm|GHSA-p9j2-gv94-2wf4|next rewrites SSRF (fixed in 16.2.11); patch bump tracked for a dedicated PR gated on web build+e2e|2026-10-28
-
-# sharp — libvips inherited CVEs, fixed in 0.35.0. sharp ships a prebuilt native
-# binary; the bump needs a platform rebuild matrix, tracked for a dedicated PR.
-pnpm|GHSA-f88m-g3jw-g9cj|sharp libvips inherited CVEs (fixed in 0.35.0); native-binary bump tracked for a dedicated PR; build-time image generation, no untrusted runtime input|2026-10-28
-
-# Transitive build/tooling deps (SVG/CSS/YAML/URI/glob processing pulled in by
-# the web + docs toolchains). pnpm reports fixAvailable=false for each because
-# the capping dependents have not shipped updated pins; tracked for overrides
-# once upstream releases them.
-pnpm|GHSA-52cp-r559-cp3m|js-yaml YAML merge-key quadratic DoS; pnpm reports no auto-fix (3.x line unfixed, consumers pinned); transitive build/tooling dep|2026-10-28
-pnpm|GHSA-2p49-hgcm-8545|svgo removeScripts residual-script (fixed 3.3.4 upstream); pnpm reports no auto-fix; build-time SVG optimization transitive dep|2026-10-28
-pnpm|GHSA-6g55-p6wh-862q|postcss arbitrary file read (fixed 8.5.12 upstream); pnpm reports no auto-fix; build-time CSS processing transitive dep|2026-10-28
-pnpm|GHSA-r28c-9q8g-f849|postcss source-map path traversal (fixed 8.5.18 upstream); pnpm reports no auto-fix; build-time CSS processing transitive dep|2026-10-28
-pnpm|GHSA-mh99-v99m-4gvg|brace-expansion unbounded-expansion DoS; pnpm reports no auto-fix (consumers pinned); transitive build/tooling glob dep|2026-10-28
-pnpm|GHSA-v2hh-gcrm-f6hx|fast-uri host confusion (<=3.1.3, no fixed release yet); transitive build/tooling dep (fastify/ajv stack)|2026-10-28
-pnpm|GHSA-4c8g-83qw-93j6|fast-uri host confusion via failed IP parse; co-resolves with GHSA-v2hh (no fixed release); transitive build/tooling dep|2026-10-28
+# ── 2026-09-24 — apps/mobile, a second install root the audit never saw ──────
+# The two image-size entries below look like the pair dismissed above and are a
+# different case. That one was @docusaurus/mdx-loader holding ^2.0.2 in the root
+# workspace, where 2.0.4 is a drop-in. This one is metro, and the fix really is
+# out of reach:
+#
+#   • apps/mobile resolves image-size 1.2.1, pulled only by metro 0.83.3.
+#   • No patched 1.x exists — 1.2.1 is the last 1.x and the fix landed in 2.0.3.
+#   • Every metro release through the current latest (0.87.1) still declares
+#     image-size ^1.0.2.
+#   • metro/src/Assets.js calls the callable default export at lines 68 and 173
+#     — `(0, _imageSize.default)(content)` — which image-size 2.x replaced with
+#     named exports. An override here does not bump a version, it breaks asset
+#     resolution at bundle time.
+#   • Dependabot's own updater reaches the same verdict independently:
+#     security_update_not_possible, latest-resolvable 1.2.1,
+#     lowest-non-vulnerable 2.0.3, conflicting-dependencies [].
+#
+# Both advisories are denial of service only (CVSS A:H, C:N/I:N) via infinite
+# loops in the JXL/HEIF and ICNS parsers. Reaching them needs a malicious image
+# inside this repository's own asset tree, which presupposes commit access, and
+# the impact is a hung developer bundler. No runtime, server or user-input path
+# reaches this code.
+#
+# Why they were invisible rather than accepted is the part worth keeping:
+# `pnpm audit` ran only at the repo root, and apps/mobile is a deliberately
+# separate install root, so this arm reported a clean workspace while two high
+# advisories stood open. run_pnpm_audit now discovers every directory holding a
+# pnpm-lock.yaml, so a third install root is covered the day it appears rather
+# than the day someone remembers it exists.
+#
+# Retire these when metro adopts image-size >= 2.0.3.
+pnpm|GHSA-5p2g-fcmc-qvqq|apps/mobile resolves image-size 1.2.1 through metro 0.83.3; no 1.x fix exists, metro through 0.87.1 still requires ^1.0.2, and image-size 2.x drops the callable default export metro calls in Assets.js. DoS-only and build-time, reachable only from an image already committed to this repo|2026-12-23
+pnpm|GHSA-w3rx-r6r6-pgpr|apps/mobile resolves image-size 1.2.1 through metro 0.83.3; no 1.x fix exists, metro through 0.87.1 still requires ^1.0.2, and image-size 2.x drops the callable default export metro calls in Assets.js. DoS-only and build-time, reachable only from an image already committed to this repo|2026-12-23

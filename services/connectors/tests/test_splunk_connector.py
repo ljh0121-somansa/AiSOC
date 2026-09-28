@@ -285,9 +285,10 @@ def test_splunk_test_endpoint_fastapi_client():
     from fastapi.testclient import TestClient
     from app.api.router import router
 
+    from app.security.tenant_scope import require_console_or_service_auth
     test_app = FastAPI()
+    test_app.dependency_overrides[require_console_or_service_auth] = lambda: None
     test_app.include_router(router, prefix="/api/v1")
-
     respx.get(f"{BASE}/services/server/info").mock(
         return_value=httpx.Response(200, json={"entry": [{"content": {"version": "9.1.0"}}]})
     )

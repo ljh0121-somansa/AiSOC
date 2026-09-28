@@ -71,12 +71,21 @@ import re
 import sys
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+# `scripts/` is on sys.path when this file is run as a program, but not when a
+# test loads it by path with importlib. gate_toolkit sits beside it either way.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from gate_toolkit import repo_root, self_test_if_requested
+
+self_test_if_requested(__file__)
+
+REPO_ROOT = repo_root()
 DETECTIONS_DIR = REPO_ROOT / "detections"
 OUT_MANIFEST = REPO_ROOT / "marketplace" / "curated.json"
 OUT_REPORT = REPO_ROOT / "apps" / "docs" / "docs" / "detections" / "coverage.md"
@@ -268,8 +277,14 @@ NATIVE_CATEGORIES = {
     "data-exfil",
 }
 
-# Imported tier directories. Quarantined rules (under ``_quarantine/``)
-# are never curated since they don't execute on the engine yet.
+# Imported tier directories. A rule that does not execute is never curated —
+# but "does not execute" is decided by asking the engine, not by reading the
+# path. ``_quarantine/`` stopped meaning "cannot run" when the Sigma compiler
+# began translating rules where they sat: 1,724 files under that directory are
+# now loaded and fire. Curating by directory name skipped every one of them,
+# so the coverage page was selecting from a corpus smaller than the one that
+# runs. ``build_marketplace.py`` and ``detection_truth_table.py`` both moved to
+# the engine as the authority for the same reason.
 IMPORTED_TIERS: dict[str, str] = {
     "sigma-imports": "sigmahq",
     "car-imports": "mitre-car",
@@ -413,15 +428,11 @@ def _detect_executable_body(data: dict[str, Any]) -> bool:
         return False
     # Also need at least one selection or a condition that doesn't ref
     # missing identifiers.
-    has_selection = any(
-        k for k in detection.keys() if k != "condition" and k != "timeframe"
-    )
+    has_selection = any(k for k in detection.keys() if k != "condition" and k != "timeframe")
     return has_selection or bool(detection.get("condition"))
 
 
-def _parse_rule(
-    path: Path, *, tier: str, source: str, quarantined: bool
-) -> Rule | None:
+def _parse_rule(path: Path, *, tier: str, source: str, quarantined: bool) -> Rule | None:
     """Load a YAML rule file and return a :class:`Rule`.
 
     Returns ``None`` for rules that fail to parse, are quarantined,
@@ -454,13 +465,23 @@ def _parse_rule(
     if isinstance(category, str):
         category = category.strip().lower() or None
     if not category:
+        # A rule the engine loads has a category in the compiled ruleset,
+        # which is the one the engine evaluates it under. Prefer that over
+        # anything inferred from where the file sits: the Sigma corpus is
+        # written flat under `_quarantine/` with no `category:` key, so the
+        # parent-directory fallback bucketed 135 curated rules under a
+        # literal category named `_quarantine` and published it.
+        category = compiled_categories().get(str(rule_id))
+    if not category:
         # For imported tiers, the directory above the file is the
         # category bucket the importer picked.
         category = path.parent.name.strip().lower() or None
         # Some imports are direct children of e.g. sigma-imports/ with no
         # category subdir — those have category == 'sigma-imports' from
-        # the parent name; null those out so they don't bucket-leak.
-        if category in IMPORTED_TIERS:
+        # the parent name; null those out so they don't bucket-leak. The
+        # same applies to `_quarantine`, which is a lifecycle location and
+        # was never a category.
+        if category in IMPORTED_TIERS or category == "_quarantine":
             category = None
 
     techniques, tactics = _normalise_techniques(data.get("tags"))
@@ -589,54 +610,91 @@ def _score(rule: Rule) -> tuple[float, list[str]]:
 # ─── Discovery ──────────────────────────────────────────────────────────────
 
 
+@lru_cache(maxsize=1)
+def _compiled_rules() -> dict[str, dict[str, Any]]:
+    """Every rule the detection engine loads, keyed by id.
+
+    Empty when neither artefact is present, in which case callers fall back
+    to the directory layout rather than curating from nothing.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for name in ("detection_ruleset.json", "detection_ruleset_imported.json"):
+        path = REPO_ROOT / "services" / "fusion" / "app" / "data" / name
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for rule in data.get("rules") or []:
+            if rule.get("id"):
+                out[str(rule["id"])] = rule
+    return out
+
+
+def engine_rule_ids() -> frozenset[str]:
+    """Ids the detection engine loads, across both compiled rulesets."""
+    return frozenset(_compiled_rules())
+
+
+@lru_cache(maxsize=1)
+def compiled_categories() -> dict[str, str]:
+    """Rule id -> the category the engine evaluates that rule under."""
+    return {
+        rule_id: str(rule["category"]).strip().lower()
+        for rule_id, rule in _compiled_rules().items()
+        if isinstance(rule.get("category"), str) and rule["category"].strip()
+    }
+
+
 def discover_rules() -> list[Rule]:
-    """Walk every detection tier and return parsed, classified rules."""
+    """Parsed, classified rules that are candidates for curation.
+
+    A candidate is a rule the detection engine loads. Curating anything else
+    puts a rule that cannot fire into a page that promises coverage, which is
+    the failure this repository guards against everywhere else. The engine is
+    also the only authority that agrees with the truth table: the previous
+    filter read ``_quarantine/`` off the path, and that stopped meaning
+    "cannot run" once the Sigma compiler began translating rules in place.
+
+    With no compiled ruleset on disk the filter is skipped rather than
+    curating from nothing — a fresh checkout that has not exported the ruleset
+    still produces a report, and the count says how many it considered.
+    """
     rules: list[Rule] = []
+    loaded = engine_rule_ids()
+
+    def _keep(rule: Rule | None) -> None:
+        if rule is None:
+            return
+        if loaded and rule.rule_id not in loaded:
+            return
+        rules.append(rule)
 
     # Native tiers
     for cat in sorted(NATIVE_CATEGORIES):
         cat_dir = DETECTIONS_DIR / cat
         if not cat_dir.exists():
             continue
-        for path in sorted(cat_dir.rglob("*.yaml")):
-            r = _parse_rule(path, tier="native", source="core", quarantined=False)
-            if r:
-                rules.append(r)
-        for path in sorted(cat_dir.rglob("*.yml")):
-            r = _parse_rule(path, tier="native", source="core", quarantined=False)
-            if r:
-                rules.append(r)
+        for ext in ("*.yaml", "*.yml"):
+            for path in sorted(cat_dir.rglob(ext)):
+                _keep(_parse_rule(path, tier="native", source="core", quarantined=False))
 
-    # Imported tiers — only NON-quarantined
+    # Imported tiers
     for tier_dir, source_name in IMPORTED_TIERS.items():
         root = DETECTIONS_DIR / tier_dir
         if not root.exists():
             continue
         for ext in ("*.yaml", "*.yml"):
             for path in sorted(root.rglob(ext)):
-                try:
-                    rel = path.relative_to(root).parts
-                except ValueError:
-                    continue
-                quarantined = bool(rel) and rel[0] == "_quarantine"
-                if quarantined:
-                    continue
-                r = _parse_rule(
-                    path, tier="imported", source=source_name, quarantined=False
-                )
-                if r:
-                    rules.append(r)
+                _keep(_parse_rule(path, tier="imported", source=source_name, quarantined=False))
 
     # Community tier — opt-in, treated as supplementary not core
     community_dir = DETECTIONS_DIR / "community"
     if community_dir.exists():
         for ext in ("*.yaml", "*.yml"):
             for path in sorted(community_dir.rglob(ext)):
-                r = _parse_rule(
-                    path, tier="community", source="community", quarantined=False
-                )
-                if r:
-                    rules.append(r)
+                _keep(_parse_rule(path, tier="community", source="community", quarantined=False))
 
     return rules
 
@@ -671,7 +729,7 @@ def select_curated(
     for r in eligible:
         for fid in r.families:
             per_family[fid].append(r)
-    for fid, lst in per_family.items():
+    for lst in per_family.values():
         lst.sort(key=lambda r: (-r.quality_score, r.rule_id))
 
     selected: dict[str, Rule] = {}
@@ -690,13 +748,7 @@ def select_curated(
 
     # Top-up if union is below min_total.
     if len(selected) < min_total:
-        remaining = [
-            r
-            for r in sorted(
-                eligible, key=lambda r: (-r.quality_score, r.rule_id)
-            )
-            if r.rule_id not in selected
-        ]
+        remaining = [r for r in sorted(eligible, key=lambda r: (-r.quality_score, r.rule_id)) if r.rule_id not in selected]
         for r in remaining:
             if len(selected) >= min_total:
                 break
@@ -720,12 +772,7 @@ def select_curated(
 
 
 def _utc_now() -> str:
-    return (
-        dt.datetime.now(dt.UTC)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def build_manifest(
@@ -804,11 +851,10 @@ def build_report(manifest: dict[str, Any]) -> str:
     lines.append("---")
     lines.append("title: Detection Coverage")
     lines.append("description: |")
-    lines.append("  AiSOC v1.0 ships a curated set of MITRE ATT&CK-mapped")
-    lines.append("  detections covering the eight buyer-prioritised threat")
-    lines.append("  families. This page is generated from the on-disk corpus")
-    lines.append("  via ``scripts/curate_detections.py`` — it is the source")
-    lines.append("  of truth for what we promise in v1.0.")
+    lines.append("  A curated selection of MITRE ATT&CK-mapped detections")
+    lines.append("  covering eight buyer-prioritised threat families, chosen")
+    lines.append("  from the rules the detection engine actually loads and")
+    lines.append("  generated by ``scripts/curate_detections.py``.")
     lines.append("sidebar_position: 2")
     lines.append("---")
     lines.append("")
@@ -816,13 +862,23 @@ def build_report(manifest: dict[str, Any]) -> str:
     lines.append("")
     lines.append(f"Generated: `{manifest['generated']}`")
     lines.append("")
+    lines.append("This page is a **curated selection**, not the size of the corpus.")
+    lines.append("It picks the highest-scoring rules per threat family from the set")
+    lines.append("the engine loads, so its numbers are smaller than the executable")
+    lines.append("total by design. For the corpus figures — executable, on disk, and")
+    lines.append("why they differ — see")
+    lines.append("[the detection truth table](https://github.com/beenuar/AiSOC/blob/main/docs/detections/truth-table.md).")
+    lines.append("")
+    lines.append("Candidates are the rules whose ids appear in the compiled ruleset,")
+    lines.append("which is the same authority the truth table uses. It used to be the")
+    lines.append("directory layout, and that stopped being the same thing once the")
+    lines.append("Sigma compiler began translating rules where they sat: rules under")
+    lines.append("`_quarantine/` that the engine loads were skipped for their path.")
+    lines.append("")
     lines.append("## Headline numbers")
     lines.append("")
-    lines.append(f"- **Curated v1.0 detections**: `{s['selected']}` (target: ≥ {s['min_total']})")
-    lines.append(
-        f"- **Total rules considered**: `{s['considered']}` "
-        f"(quality floor: {s['quality_floor']})"
-    )
+    lines.append(f"- **Curated detections**: `{s['selected']}` (target: ≥ {s['min_total']})")
+    lines.append(f"- **Executable rules considered**: `{s['considered']}` (quality floor: {s['quality_floor']})")
     lines.append(f"- **Unique MITRE techniques covered**: `{s['unique_techniques']}`")
     lines.append("")
 
@@ -830,12 +886,9 @@ def build_report(manifest: dict[str, Any]) -> str:
     lines.append("")
     lines.append("| Family | Count | Target | Covered |")
     lines.append("|---|---|---|---|")
-    for fid, info in manifest["families"].items():
+    for info in manifest["families"].values():
         check = "✅" if info["covered"] else "❌"
-        lines.append(
-            f"| **{info['label']}** | {info['count']} | "
-            f"≥ {info['min_target']} | {check} |"
-        )
+        lines.append(f"| **{info['label']}** | {info['count']} | ≥ {info['min_target']} | {check} |")
     lines.append("")
 
     lines.append("## Distribution")
@@ -859,7 +912,7 @@ def build_report(manifest: dict[str, Any]) -> str:
     lines.append("")
     lines.append(
         "The curated rule IDs are listed in "
-        "[`marketplace/curated.json`](https://github.com/aisoc-platform/aisoc/blob/main/marketplace/curated.json) "
+        "[`marketplace/curated.json`](https://github.com/beenuar/AiSOC/blob/main/marketplace/curated.json) "
         "under each family. Every entry has a `path` field pointing at the "
         "on-disk YAML. Run `pnpm marketplace:curate --check` in CI to enforce "
         "drift; run `python3 scripts/curate_detections.py` locally to regenerate."
@@ -919,18 +972,12 @@ def main() -> int:
         return 0
 
     # Quality gate: every family must be covered, total must hit min.
-    ok = stats["selected"] >= args.min and all(
-        info["covered"] for info in manifest["families"].values()
-    )
+    ok = stats["selected"] >= args.min and all(info["covered"] for info in manifest["families"].values())
 
     if args.check:
-        existing = (
-            OUT_MANIFEST.read_text(encoding="utf-8") if OUT_MANIFEST.exists() else ""
-        )
+        existing = OUT_MANIFEST.read_text(encoding="utf-8") if OUT_MANIFEST.exists() else ""
         report = build_report(manifest)
-        existing_report = (
-            OUT_REPORT.read_text(encoding="utf-8") if OUT_REPORT.exists() else ""
-        )
+        existing_report = OUT_REPORT.read_text(encoding="utf-8") if OUT_REPORT.exists() else ""
 
         def _strip_generated(s: str) -> str:
             try:
@@ -943,21 +990,15 @@ def main() -> int:
         def _strip_md_generated(s: str) -> str:
             return re.sub(r"Generated: `[^`]+`", "Generated: `<ts>`", s)
 
-        if (
-            _strip_generated(existing) != _strip_generated(serialised)
-            or _strip_md_generated(existing_report) != _strip_md_generated(report)
+        if _strip_generated(existing) != _strip_generated(serialised) or _strip_md_generated(existing_report) != _strip_md_generated(
+            report
         ):
             print(
-                "marketplace/curated.json or coverage.md is stale. Run: "
-                "pnpm marketplace:curate",
+                "marketplace/curated.json or coverage.md is stale. Run: pnpm marketplace:curate",
                 file=sys.stderr,
             )
             return 2
-        print(
-            f"curation up to date "
-            f"({stats['selected']} curated, "
-            f"{manifest['stats']['unique_techniques']} techniques)."
-        )
+        print(f"curation up to date ({stats['selected']} curated, {manifest['stats']['unique_techniques']} techniques).")
         return 0 if ok else 1
 
     OUT_MANIFEST.parent.mkdir(parents=True, exist_ok=True)
@@ -965,11 +1006,7 @@ def main() -> int:
     OUT_REPORT.parent.mkdir(parents=True, exist_ok=True)
     OUT_REPORT.write_text(build_report(manifest), encoding="utf-8")
 
-    uncovered = [
-        info["label"]
-        for info in manifest["families"].values()
-        if not info["covered"]
-    ]
+    uncovered = [info["label"] for info in manifest["families"].values() if not info["covered"]]
     print(
         f"Wrote curated manifest: selected={stats['selected']} "
         f"techniques={manifest['stats']['unique_techniques']} "

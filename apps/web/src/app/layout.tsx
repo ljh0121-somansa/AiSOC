@@ -7,6 +7,7 @@ import { ThemeProvider } from '@/components/theme/ThemeProvider';
 import { themeBootstrapScript } from '@/components/theme/themeScript';
 import { docs } from '@/lib/docs';
 import { DISCOVERY_KEYWORDS, getPublicSiteUrl } from '@/lib/site';
+import { CONNECTOR_COUNT } from '@/data/connectorCount';
 
 const inter = Inter({
   subsets: ['latin'],
@@ -43,18 +44,18 @@ export const metadata: Metadata = {
   openGraph: {
     title: 'AiSOC — Free, Open-Source AI Security Operations Center',
     description:
-      'Self-hostable AI SOC with real-time threat detection, alert fusion, purple-team drills, MITRE ATT&CK investigation, and detection-as-code. MIT-licensed. Try the live demo at tryaisoc.com.',
+      'Self-hostable AI SOC with real-time threat detection, alert fusion, purple-team drills, MITRE ATT&CK investigation, and detection-as-code. MIT-licensed.',
     type: 'website',
     siteName: 'AiSOC',
     url: siteUrl,
     locale: 'en_US',
     images: [
       {
-        url: '/og-image.svg',
+        url: '/og-image.png',
         width: 1200,
         height: 630,
         alt: 'AiSOC — open-source AI SOC platform for security operations teams',
-        type: 'image/svg+xml',
+        type: 'image/png',
       },
     ],
   },
@@ -62,7 +63,7 @@ export const metadata: Metadata = {
     card: 'summary_large_image',
     title: 'AiSOC — Free Open-Source AI SOC Platform',
     description:
-      'AI-powered SOC: threat detection, alert fusion, purple team, MITRE ATT&CK mapping, detection-as-code, and eval harness in CI. Self-host for free — tryaisoc.com.',
+      'AI-powered SOC: threat detection, alert fusion, purple team, MITRE ATT&CK mapping, detection-as-code, and eval harness in CI. Self-host for free.',
     site: '@aisoc_dev',
     creator: '@aisoc_dev',
   },
@@ -100,10 +101,7 @@ const jsonLd = {
       logo: `${siteUrl}/favicon.svg`,
       description:
         'Community-driven, MIT-licensed AI security operations platform with a public demo and self-host path.',
-      sameAs: [
-        'https://github.com/beenuar/AiSOC',
-        'https://tryaisoc.com',
-      ],
+      sameAs: ['https://github.com/beenuar/AiSOC'],
       contactPoint: {
         '@type': 'ContactPoint',
         contactType: 'technical support',
@@ -129,7 +127,7 @@ const jsonLd = {
       installUrl: docs('quickstart'),
       releaseNotes: 'https://github.com/beenuar/AiSOC/releases',
       featureList: [
-        'Click-and-connect 26 security sources (EDR, SIEM, cloud, IAM, SaaS) with encrypted credential vault',
+        `Click-and-connect ${CONNECTOR_COUNT} security sources (EDR, SIEM, cloud, IAM, SaaS) with encrypted credential vault`,
         'Real-time threat detection and alert fusion',
         'Entity risk-based alerting (RBA) queue',
         'Autonomous alert triage agent with confidence-scored verdicts',
@@ -147,13 +145,13 @@ const jsonLd = {
         'STIX 2.1 / TAXII 2.1 publishing and air-gap deployment configuration',
         'Self-hosted deployment with Docker Compose',
       ],
-      screenshot: `${siteUrl}/og-image.svg`,
+      screenshot: `${siteUrl}/og-image.png`,
     },
     {
       '@type': 'WebSite',
       name: 'AiSOC',
       url: siteUrl,
-      description: 'Open-source AI-powered Security Operations Center — tryaisoc.com',
+      description: 'Open-source AI-powered Security Operations Center',
       potentialAction: {
         '@type': 'SearchAction',
         target: `${siteUrl}/search?q={search_term_string}`,

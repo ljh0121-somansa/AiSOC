@@ -113,13 +113,16 @@ def resolve_effective_permissions(
       the API endpoint after the result is built — keeping this function
       pure makes it trivial to unit-test.
     * Either ``snapshot`` or ``snapshot_loader`` must produce a non-empty
-      dict for full providers; scaffolds raise ``NotImplementedError``
-      regardless.
+      dict. Every registered resolver reports ``coverage: "full"``; there are
+      no scaffolds left, which this line claimed for several releases after
+      they were implemented. A provider registered without a resolver raises
+      ``NotImplementedError``, which the endpoint logs at ``error`` rather
+      than treating as an expected state.
     """
 
     resolver_cls = SUPPORTED_PROVIDERS.get(provider)
     if resolver_cls is None:
-        raise ValueError(f"unknown provider {provider!r}; supported: " f"{sorted(SUPPORTED_PROVIDERS)}")
+        raise ValueError(f"unknown provider {provider!r}; supported: {sorted(SUPPORTED_PROVIDERS)}")
 
     resolver = resolver_cls()
     if snapshot is None:

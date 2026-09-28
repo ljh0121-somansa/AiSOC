@@ -109,21 +109,34 @@ import json
 import os
 import re
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Annotated, Any
 
 import structlog
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from fastapi import HTTPException
 from fastapi import status
 
 from app.core.rate_limit import RateLimitDecision, TokenBucketLimiter
+from app.llm.contract import LLMContractViolation, safe_chat_completions_request
 from app.security.llm_resolver import LlmConfig, resolve_llm_config
+from app.security.tenant_scope import (
+    TenantPrincipal,
+    require_console_or_service_auth,
+    scoped_tenant_or_403,
+)
 
 logger = structlog.get_logger()
 
 router = APIRouter(prefix="/api/v1", tags=["explain"])
+
+#: The console reaches this service directly through a Next rewrite, sending
+#: the first-party access token as a bearer credential. The tenant comes from
+#: that verified token; a `tenant_id` on the request is only ever a filter,
+#: intersected with it, so naming a foreign tenant is a 403 rather than a
+#: selector for somebody else's investigation.
+ScopedPrincipal = Annotated[TenantPrincipal, Depends(require_console_or_service_auth)]
 
 
 # ---------------------------------------------------------------------------
@@ -557,8 +570,6 @@ async def _llm_summary(
             )
 
     try:
-        import httpx
-
         base = llm_config.base_url.rstrip("/")
         url = f"{base}/chat/completions" if base.endswith("/v1") else f"{base}/v1/chat/completions"
         model = llm_config.model
@@ -596,17 +607,26 @@ async def _llm_summary(
             },
         ]
 
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(
-                url,
-                headers={"Authorization": f"Bearer {llm_config.api_key}"},
-                json={"model": model, "messages": messages, "max_tokens": 320},
-            )
-            resp.raise_for_status()
-            raw_content = resp.json()["choices"][0]["message"]["content"].strip()
-            clean_content = raw_content.split("</think>", 1)[-1]
-            return clean_content
+        # T2.3 — this was the one LLM call in services/agents that bypassed
+        # the contract. It POSTed with raw httpx, and the no-bypass gate only
+        # walked the AST for `.ainvoke` / `.astream`, so a raw-HTTP call was
+        # invisible to it. `safe_chat_completions_request` exists for exactly
+        # this shape and is already used by copilot.py and the NL translator.
+        body = await safe_chat_completions_request(
+            api_key=llm_config.api_key,
+            model=model,
+            messages=messages,
+            url=url,
+            timeout=20.0,
+            max_tokens=320,
+        )
+        raw_content = str(body["choices"][0]["message"]["content"]).strip()
+        clean_content = raw_content.split("</think>", 1)[-1]
+        return clean_content
 
+    except LLMContractViolation as exc:
+        logger.warning("explain.llm_contract_violation", reason=exc.reason)
+        return fallback
     except Exception as exc:
         logger.warning("explain.llm_error", error=str(exc))
         raise HTTPException(
@@ -682,7 +702,7 @@ async def _stream_explanation(req: ExplainRequest, llm_config: LlmConfig) -> Asy
 
 
 @router.post("/explain")
-async def explain(req: ExplainRequest, request: Request) -> StreamingResponse:
+async def explain(req: ExplainRequest, request: Request, principal: ScopedPrincipal) -> StreamingResponse:
     """Stream an OCSF + MITRE-grounded explanation of an alert as NDJSON.
 
     Each request consumes one token from a per-tenant bucket (see the
@@ -692,6 +712,10 @@ async def explain(req: ExplainRequest, request: Request) -> StreamingResponse:
     throttle. The body is still NDJSON so an SSE/EventSource client
     that ignores status codes still gets a structured failure.
     """
+    # Resolved before the rate-limit bucket is touched: the bucket is keyed
+    # per tenant, so an unauthorised tenant must not be able to drain another
+    # tenant's quota on the way to being refused.
+    req.tenant_id = str(scoped_tenant_or_403(principal, req.tenant_id))
     limiter = _get_explain_limiter()
     decision: RateLimitDecision | None = None
     if limiter is not None:

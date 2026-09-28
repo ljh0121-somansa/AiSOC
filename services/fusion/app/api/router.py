@@ -1,12 +1,23 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.models.alert import AnalystFeedback, FusedAlert, FusionDecision, RawAlert
+from app.security.tenant_scope import (
+    TenantPrincipal,
+    require_console_or_service_auth,
+    scoped_tenant_or_403,
+)
 from app.workers.consumer import FusionWorker
+
+#: The console reaches this service *directly* through a Next rewrite when
+#: `FUSION_URL` is set, so these routes are internet-reachable and must
+#: establish the tenant from the caller's credential rather than from a query
+#: parameter. See app/security/tenant_scope.py.
+ScopedPrincipal = Annotated[TenantPrincipal, Depends(require_console_or_service_auth)]
 
 router = APIRouter()
 
@@ -31,7 +42,7 @@ async def metrics():
 
 
 @router.get("/ml/status")
-async def ml_status():
+async def ml_status(principal: ScopedPrincipal):
     """Return current ML model training status."""
     if _worker_ref is None or _worker_ref.engine is None:
         raise HTTPException(status_code=503, detail="Fusion worker not ready")
@@ -39,7 +50,7 @@ async def ml_status():
 
 
 @router.post("/ml/feedback")
-async def submit_feedback(feedback: AnalystFeedback):
+async def submit_feedback(feedback: AnalystFeedback, principal: ScopedPrincipal):
     """Submit analyst feedback to improve ML ranker."""
     if _worker_ref is None or _worker_ref.engine is None:
         raise HTTPException(status_code=503, detail="Fusion worker not ready")
@@ -48,7 +59,7 @@ async def submit_feedback(feedback: AnalystFeedback):
 
 
 @router.post("/ml/retrain")
-async def trigger_retrain():
+async def trigger_retrain(principal: ScopedPrincipal):
     """Manually trigger ML model retraining."""
     if _worker_ref is None or _worker_ref.engine is None:
         raise HTTPException(status_code=503, detail="Fusion worker not ready")
@@ -62,7 +73,7 @@ async def trigger_retrain():
 
 
 @router.post("/process", response_model=FusedAlert)
-async def process_alert(alert: RawAlert) -> FusedAlert:
+async def process_alert(alert: RawAlert, principal: ScopedPrincipal) -> FusedAlert:
     """Run a single ``RawAlert`` through the full fusion pipeline.
 
     The Kafka consumer path (``FusionWorker``) is still the production
@@ -116,7 +127,8 @@ def _resolve_tenant_id(v: Any) -> UUID:
 
 @router.get("/entity-risk/queue")
 async def entity_risk_queue(
-    tenant_id: str,
+    principal: ScopedPrincipal,
+    tenant_id: UUID | None = None,
     limit: int = Query(default=25, ge=1, le=200),
     promoted_only: bool = False,
 ):
@@ -126,34 +138,44 @@ async def entity_risk_queue(
     enabled — analysts work the highest-risk entities and the contributing
     alerts are surfaced as evidence. Closes the 2026 KPI bar of
     ``alert-to-incident ratio ≥ 50:1``.
+
+    ``tenant_id`` is an optional *filter*, not a selector: it is intersected
+    with the credential's scope, so naming a tenant the caller does not hold
+    returns 403 rather than that tenant's queue. Omitting it reads the
+    caller's own tenant.
     """
-    t_id = _resolve_tenant_id(tenant_id)
+    scoped = scoped_tenant_or_403(principal, tenant_id)
     eng = _require_entity_risk()
-    records = await eng.top_entities(t_id, limit=limit, promoted_only=promoted_only)
+    records = await eng.top_entities(scoped, limit=limit, promoted_only=promoted_only)
     return {
-        "tenant_id": str(t_id),
+        "tenant_id": str(scoped),
         "threshold": eng.threshold,
         "entities": [r.to_dict() for r in records],
     }
 
 
 @router.get("/entity-risk/stats")
-async def entity_risk_stats(tenant_id: str):
+async def entity_risk_stats(principal: ScopedPrincipal, tenant_id: UUID | None = None):
     """Tenant-scoped queue stats for dashboards (banding, totals, threshold)."""
-    t_id = _resolve_tenant_id(tenant_id)
+    scoped = scoped_tenant_or_403(principal, tenant_id)
     eng = _require_entity_risk()
-    return {"tenant_id": str(t_id), **(await eng.stats(t_id))}
+    return {"tenant_id": str(scoped), **(await eng.stats(scoped))}
 
 
 @router.get("/entity-risk/{entity_type}/{entity_value}")
-async def entity_risk_detail(entity_type: str, entity_value: str, tenant_id: str):
+async def entity_risk_detail(
+    entity_type: str,
+    entity_value: str,
+    principal: ScopedPrincipal,
+    tenant_id: UUID | None = None,
+):
     """Return the full risk record (contributing alerts + severity histogram)
     for a single entity, used by the alert-detail drawer."""
+    scoped = scoped_tenant_or_403(principal, tenant_id)
     if entity_type == "ip":
         entity_type = "src_ip"
-    t_id = _resolve_tenant_id(tenant_id)
     eng = _require_entity_risk()
-    record = await eng.get(t_id, entity_type, entity_value)
+    record = await eng.get(scoped, entity_type, entity_value)
     if record is None:
         raise HTTPException(status_code=404, detail="entity_not_found")
     return record.to_dict()
@@ -165,7 +187,7 @@ async def entity_risk_detail(entity_type: str, entity_value: str, tenant_id: str
 
 
 @router.post("/confidence/score")
-async def score_confidence(alert: RawAlert):
+async def score_confidence(alert: RawAlert, principal: ScopedPrincipal):
     """Run an alert through the confidence + explainability scorer in
     isolation and return the rationale chain.
 

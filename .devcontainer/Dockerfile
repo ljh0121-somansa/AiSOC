@@ -9,7 +9,7 @@
 # drops first-boot from ~5 minutes to ~30 seconds.
 #
 # Layers, top to bottom:
-#   1. Base: javascript-node bookworm — Node 20 + pnpm-friendly debian
+#   1. Base: javascript-node bookworm — Node 22 + pnpm-friendly debian
 #   2. System packages: docker.io, python3.11 + uv, go, gh
 #   3. Workspace bootstrap: corepack-prepare pnpm, prime turbo/eslint caches
 #
@@ -20,7 +20,10 @@
 # `.github/workflows/devcontainer-coldstart.yml` asserts the boot KPI.
 ###############################################################################
 
-FROM mcr.microsoft.com/devcontainers/javascript-node:1-20-bookworm
+# Node 22, matching every workflow and both Node images. On 20 a contributor's
+# container ran a different runtime from the one CI tests and the one the web
+# image ships, and Node 20 left security support in April 2026.
+FROM mcr.microsoft.com/devcontainers/javascript-node:1-22-bookworm
 
 ARG TARGETARCH
 
@@ -87,9 +90,12 @@ RUN set -eux; \
 ENV PATH="/usr/local/go/bin:${PATH}"
 
 # ─── Python toolchain (uv + ruff) ───────────────────────────────────────────
-# `uv` is the canonical Python package manager for AiSOC services. Installing
-# it at image-build time means a fresh codespace can run `uv sync` against
-# `services/api/uv.lock` immediately, with no further network round-trips.
+# `ruff` is pinned to the range CI enforces. An unpinned ruff in the
+# devcontainer formats differently from `ruff format --check services/`,
+# so a contributor's first commit fails a gate they cannot reproduce.
+# `uv` is kept for ad-hoc use; the services install from `poetry.lock`
+# (there is no `uv.lock` in this tree, and the note that claimed one
+# sent people to a file that has never existed).
 #
 # We install via `pip` (with `--break-system-packages` to opt out of PEP 668)
 # rather than `pipx` so the binaries land in `/usr/local/bin` where they are
@@ -98,7 +104,7 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 # The previous pipx approach installed to `/root/.local/bin/`, which is
 # unreadable by `node` (uid 1000) and broke the cold-start KPI probe.
 RUN python3.11 -m pip install --break-system-packages --no-cache-dir \
-        uv ruff
+        uv "ruff>=0.16.8,<0.17"
 
 # ─── pnpm via corepack ──────────────────────────────────────────────────────
 RUN corepack enable \
@@ -113,6 +119,20 @@ RUN corepack enable \
 # minutes.
 RUN su node -c "pnpm config set store-dir /home/node/.local/share/pnpm/store \
              && pnpm store status >/dev/null 2>&1 || true"
+
+# ─── Docker socket access for the non-root user (issue #716) ────────────────
+#
+# `apt install docker.io` creates the `docker` group but puts nobody in it, so
+# `node` could not reach /var/run/docker.sock and every `docker` command
+# failed with a permission error that reads like a missing daemon. The
+# docker-in-docker feature does this too; baking the binaries without it left
+# the user locked out of the socket its own daemon creates.
+#
+# `|| true` on groupadd: the base image may already define the group, and a
+# duplicate is not a build failure.
+RUN groupadd --system docker 2>/dev/null || true; \
+    usermod -aG docker node; \
+    getent group docker
 
 USER node
 WORKDIR /workspaces/AiSOC

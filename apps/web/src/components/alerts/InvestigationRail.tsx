@@ -44,7 +44,9 @@ import {
   type RecommendedAction,
   type RelatedEntity,
 } from '@/lib/api';
+import { AttackStory } from './AttackStory';
 import { ExplainDrawer } from './ExplainDrawer';
+import { NarrativeMarkdown } from './NarrativeMarkdown';
 import { Skeleton } from '@/components/ui/Skeleton';
 
 // ─── Visual config ───────────────────────────────────────────────────────────
@@ -88,6 +90,7 @@ export interface InvestigationRailProps {
 // ─── Main component ──────────────────────────────────────────────────────────
 
 export function InvestigationRail({ alertId, onClose }: InvestigationRailProps) {
+  const [view, setView] = useState<RailView>('story');
   // The drawer is mounted on demand and closed by default; we don't
   // burn the LLM call until the analyst explicitly asks for it.
   const [deepExplainOpen, setDeepExplainOpen] = useState(false);
@@ -130,10 +133,26 @@ export function InvestigationRail({ alertId, onClose }: InvestigationRailProps) 
     <>
       <RailShell title={alert.title} onClose={onClose}>
         <RailHeader alert={alert} onDeepExplain={() => setDeepExplainOpen(true)} />
-        <NarrativeSection narrative={alert.narrative ?? null} />
-        <RelatedEntitiesSection entities={alert.relatedEntities ?? []} />
-        <MiniTimelineSection events={alert.miniTimeline ?? []} />
-        <RecommendedActionsSection actions={alert.recommendedActions ?? []} />
+        {/*
+         * Story first, detail behind a toggle. An analyst holds "what
+         * happened" in their head, not "what fields does this row have" —
+         * and the fields are still one click away, which is the right
+         * trade in the direction nobody was offering.
+         */}
+        <ViewToggle view={view} onChange={setView} />
+        {view === 'story' ? (
+          <div className="p-4">
+            <AttackStory alert={alert} showHeader={false} />
+          </div>
+        ) : (
+          <>
+            <AutomatedTriageSection alert={alert} />
+            <NarrativeSection narrative={alert.narrative ?? null} />
+            <RelatedEntitiesSection entities={alert.relatedEntities ?? []} />
+            <MiniTimelineSection events={alert.miniTimeline ?? []} />
+            <RecommendedActionsSection actions={alert.recommendedActions ?? []} />
+          </>
+        )}
       </RailShell>
       {/*
        * Deep Explain is mounted only when requested — keeping it inside the
@@ -149,6 +168,47 @@ export function InvestigationRail({ alertId, onClose }: InvestigationRailProps) 
         />
       )}
     </>
+  );
+}
+
+/** Which face of the rail is showing. */
+type RailView = 'story' | 'details';
+
+function ViewToggle({
+  view,
+  onChange,
+}: {
+  view: RailView;
+  onChange: (next: RailView) => void;
+}) {
+  const tabs: { id: RailView; label: string }[] = [
+    { id: 'story', label: 'Story' },
+    { id: 'details', label: 'Details' },
+  ];
+  return (
+    <div
+      className="flex gap-1 border-b border-gray-800/60 px-4 py-2"
+      role="tablist"
+      aria-label="Investigation view"
+    >
+      {tabs.map((tab) => (
+        <button
+          key={tab.id}
+          type="button"
+          role="tab"
+          aria-selected={view === tab.id}
+          onClick={() => onChange(tab.id)}
+          className={clsx(
+            'rounded px-2.5 py-1 text-xs transition-colors',
+            view === tab.id
+              ? 'bg-gray-800 text-gray-100'
+              : 'text-gray-500 hover:bg-gray-800/40 hover:text-gray-300',
+          )}
+        >
+          {tab.label}
+        </button>
+      ))}
+    </div>
   );
 }
 
@@ -229,7 +289,15 @@ function RailHeader({
   onDeepExplain: () => void;
 }) {
   return (
-    <div className="px-4 py-3 border-b border-gray-800/60 bg-gray-900/40">
+    // Labelled as a region so the summary metadata is addressable on its
+    // own. The source and severity also appear inside the story's evidence
+    // list, which is correct in both places but ambiguous without a
+    // landmark to distinguish them.
+    <div
+      className="px-4 py-3 border-b border-gray-800/60 bg-gray-900/40"
+      role="region"
+      aria-label="Alert summary"
+    >
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-gray-500">
         <span className="capitalize text-gray-300">{alert.severity}</span>
         <span>·</span>
@@ -283,17 +351,89 @@ function SectionHeader({ title, count }: { title: string; count?: number }) {
   );
 }
 
+/**
+ * What the auto-triage agent concluded, and how far to trust it.
+ *
+ * `services/agents` triages every fused alert and writes the verdict back to
+ * the row. Nothing rendered it: `normalizeAlert` dropped `ai_score`,
+ * `ai_summary` and `triage_groundedness` on the floor, so the product's
+ * headline capability produced tokens, cost and a ledger entry that no
+ * console surface showed.
+ *
+ * Three things are deliberate here.
+ *
+ * The rationale is rendered **verbatim**. The model's own text arrives
+ * prefixed `LLM auto-triage verdict:`; the deterministic fallback reads as a
+ * description of the signals it matched. Showing it unedited is what lets a
+ * reader tell which path answered, and the bundled local model falls back
+ * often enough that the distinction matters on a default install.
+ *
+ * Groundedness renders as **"not assessed"** when the column is null, never
+ * as 0. The deterministic path does not score it, and 0 would read as a
+ * verdict citing nothing real.
+ *
+ * An alert that has not been triaged yet says so, rather than rendering
+ * nothing — absent and pending are different facts, and only one of them is
+ * a reason to go and look at the agents service.
+ */
+function AutomatedTriageSection({ alert }: { alert: Alert }) {
+  const verdict = alert.disposition ?? null;
+  const rationale = (alert.aiSummary ?? '').trim();
+  const hasRun = Boolean(verdict || rationale || typeof alert.aiScore === 'number');
+
+  return (
+    <section className="px-4 py-4 border-b border-gray-800/40">
+      <SectionHeader title="Automated triage" />
+      {!hasRun ? (
+        <p className="text-xs text-gray-500">
+          Not triaged yet. Every fused alert is queued for the triage agent; if this stays empty,
+          check the agents service.
+        </p>
+      ) : (
+        <div className="space-y-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            {verdict && (
+              <span className="text-xs px-2 py-0.5 rounded border border-gray-700 bg-gray-800/60 text-gray-200">
+                {verdict.replace(/_/g, ' ')}
+              </span>
+            )}
+            {typeof alert.aiScore === 'number' && (
+              <span className="text-xs text-gray-400">
+                confidence {Math.round(alert.aiScore * 100)}/100
+              </span>
+            )}
+            <span className="text-xs text-gray-500">
+              groundedness{' '}
+              {typeof alert.triageGroundedness === 'number'
+                ? `${Math.round(alert.triageGroundedness * 100)}%`
+                : 'not assessed'}
+            </span>
+          </div>
+          {rationale && (
+            <p className="text-xs text-gray-300 leading-relaxed whitespace-pre-wrap">{rationale}</p>
+          )}
+          {alert.triageUngrounded && alert.triageUngrounded.length > 0 && (
+            <p className="text-xs text-amber-400">
+              Cited but not present in the evidence: {alert.triageUngrounded.join(', ')}
+            </p>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function NarrativeSection({ narrative }: { narrative: string | null }) {
   if (!narrative || !narrative.trim()) return null;
-  // Markdown-light: we preserve newlines so the deterministic
-  // paragraph + bullet structure produced by `narrative.build_narrative`
-  // renders without us pulling in a full Markdown engine.
+  // `build_narrative` emits a markdown-light dialect. Preserving newlines in a
+  // `whitespace-pre-wrap` paragraph preserved the *markup* too, so the rail
+  // showed analysts "**Medium** alert: … on **Finance & Legal #2**". The
+  // renderer covers that dialect and escapes everything, which matters because
+  // the narrative embeds attacker-influenceable entity names.
   return (
     <section className="px-4 py-4 border-b border-gray-800/40">
       <SectionHeader title="Narrative" />
-      <p className="text-sm text-gray-300 whitespace-pre-wrap leading-relaxed">
-        {narrative}
-      </p>
+      <NarrativeMarkdown source={narrative} />
     </section>
   );
 }

@@ -30,7 +30,7 @@
 // Author: Beenu Arora <beenu@cyble.com>
 
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
 // ─── Mocks ───────────────────────────────────────────────────────────────────
@@ -126,7 +126,7 @@ const RELATED_ENTITIES: RelatedEntity[] = [
     type: 'user',
     value: 'alice@example.com',
     label: 'Alice (Finance)',
-    pivotPath: '/graph/user/alice%40example.com',
+    pivotPath: '/graph?entity=user%3Aalice%40example.com',
   },
   {
     kind: 'principal',
@@ -137,7 +137,7 @@ const RELATED_ENTITIES: RelatedEntity[] = [
     kind: 'network',
     type: 'ip',
     value: '10.0.0.7',
-    pivotPath: '/graph/ip/10.0.0.7',
+    pivotPath: '/graph?entity=ip%3A10.0.0.7',
   },
   {
     kind: 'workflow',
@@ -229,6 +229,19 @@ beforeEach(() => {
   swrState.isLoading = false;
   explainDrawerProps.lastProps = null;
 });
+
+/**
+ * Render the rail and switch to the Details face.
+ *
+ * Story is the default view now, so the section tests below — narrative,
+ * entities, timeline, actions — have to ask for the face that shows them.
+ * The toggle itself is covered at the end of the file.
+ */
+function renderDetails(onClose: () => void = vi.fn()) {
+  const result = render(<InvestigationRail alertId="ALERT-W6-0001" onClose={onClose} />);
+  fireEvent.click(screen.getByRole('tab', { name: 'Details' }));
+  return result;
+}
 
 // ─── Empty state ─────────────────────────────────────────────────────────────
 
@@ -323,10 +336,13 @@ describe('InvestigationRail — header', () => {
         name: /impossible travel — frankfurt then tokyo/i,
       }),
     ).toBeInTheDocument();
-    // Severity 'high' is unique — the fixture priorities are {critical, low,
-    // info}, so 'high' appears exactly once (in the severity span).
-    expect(screen.getByText('high')).toBeInTheDocument();
-    expect(screen.getByText('okta')).toBeInTheDocument();
+    // Scoped to the summary region. Severity and source legitimately appear
+    // again in the story's evidence list, so an unscoped query now matches
+    // twice — and asserting "somewhere on screen" would stop testing the
+    // header at all.
+    const summary = within(screen.getByRole('region', { name: 'Alert summary' }));
+    expect(summary.getByText('high')).toBeInTheDocument();
+    expect(summary.getByText('okta')).toBeInTheDocument();
     // Risk score is rounded — 87 stays 87, but the prefix is the contract.
     expect(screen.getByText(/^risk 87$/)).toBeInTheDocument();
   });
@@ -362,10 +378,86 @@ describe('InvestigationRail — header', () => {
 
 // ─── Loaded rail — narrative ─────────────────────────────────────────────────
 
+describe('InvestigationRail — automated triage section', () => {
+  // `services/agents` triages every fused alert and writes the verdict back
+  // onto the row. `normalizeAlert` dropped `ai_score`, `ai_summary` and
+  // `triage_groundedness`, so the one output of the AI the product leads with
+  // was metered, persisted, and rendered by nothing.
+  it('renders the verdict, the confidence and the rationale verbatim', () => {
+    swrState.data = buildAlert({
+      disposition: 'true_positive',
+      aiScore: 0.8,
+      aiSummary:
+        'LLM auto-triage verdict: true_positive · LLM confidence: 0.80 · Rationale: mass rename to .locked on the finance share.',
+    });
+    renderDetails();
+
+    const section = screen.getByText('Automated triage').closest('section')!;
+    expect(within(section).getByText('true positive')).toBeInTheDocument();
+    expect(within(section).getByText(/confidence 80\/100/)).toBeInTheDocument();
+    // Verbatim: the `LLM auto-triage verdict:` prefix is how a reader tells
+    // the model's own text from the deterministic fallback's.
+    expect(within(section).getByText(/LLM auto-triage verdict: true_positive/)).toBeInTheDocument();
+  });
+
+  it('says groundedness was not assessed rather than showing it as zero', () => {
+    // The deterministic path never scores groundedness, and the column is
+    // nullable for that reason. Rendering null as 0% would read as a verdict
+    // that cited nothing real — the opposite of what happened.
+    swrState.data = buildAlert({
+      disposition: 'likely_benign' as Alert['disposition'],
+      aiScore: 0.25,
+      aiSummary: 'high-severity keyword match in alert text · hostname present',
+      triageGroundedness: null,
+    });
+    renderDetails();
+
+    const section = screen.getByText('Automated triage').closest('section')!;
+    expect(within(section).getByText(/groundedness not assessed/)).toBeInTheDocument();
+    expect(within(section).queryByText(/groundedness 0%/)).toBeNull();
+  });
+
+  it('renders a real groundedness score when one was assessed', () => {
+    swrState.data = buildAlert({ aiScore: 0.9, aiSummary: 'verdict', triageGroundedness: 0.75 });
+    renderDetails();
+
+    expect(
+      within(screen.getByText('Automated triage').closest('section')!).getByText(/groundedness 75%/),
+    ).toBeInTheDocument();
+  });
+
+  it('names indicators the verdict cited but the evidence never held', () => {
+    swrState.data = buildAlert({
+      aiScore: 0.6,
+      aiSummary: 'verdict',
+      triageUngrounded: ['198.51.100.9', 'evil.example'],
+    });
+    renderDetails();
+
+    const section = screen.getByText('Automated triage').closest('section')!;
+    expect(within(section).getByText(/198\.51\.100\.9, evil\.example/)).toBeInTheDocument();
+  });
+
+  it('distinguishes "not triaged yet" from "nothing to show"', () => {
+    // Absent and pending are different facts, and only one of them is a
+    // reason to go and look at the agents service. Rendering nothing said
+    // neither.
+    swrState.data = buildAlert({
+      disposition: null,
+      aiScore: undefined,
+      aiSummary: undefined,
+    });
+    renderDetails();
+
+    expect(screen.getByText('Automated triage')).toBeInTheDocument();
+    expect(screen.getByText(/not triaged yet/i)).toBeInTheDocument();
+  });
+});
+
 describe('InvestigationRail — narrative section', () => {
   it('renders the narrative when present', () => {
     swrState.data = buildAlert();
-    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />);
+    renderDetails(vi.fn());
     expect(screen.getByText('Narrative')).toBeInTheDocument();
     expect(
       screen.getByText(/fusion promoted this alert because two sign-ins/i),
@@ -374,14 +466,36 @@ describe('InvestigationRail — narrative section', () => {
 
   it('omits the narrative section when narrative is null', () => {
     swrState.data = buildAlert({ narrative: null });
-    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />);
+    renderDetails(vi.fn());
     expect(screen.queryByText('Narrative')).toBeNull();
   });
 
   it('omits the narrative section when narrative is only whitespace', () => {
     swrState.data = buildAlert({ narrative: '   \n  ' });
-    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />);
+    renderDetails(vi.fn());
     expect(screen.queryByText('Narrative')).toBeNull();
+  });
+
+  it('renders the builder\u2019s markdown rather than showing it to the analyst', () => {
+    // `build_narrative` emits `**bold**`, backtick code spans and `- `
+    // bullets. The rail put the string in a `whitespace-pre-wrap` paragraph,
+    // which preserves the newlines and the markup alike, so this tab read
+    // "**Medium** alert: ... on **Finance & Legal #2**".
+    swrState.data = buildAlert({
+      narrative:
+        '**Medium** alert: Unusual sign-in on **Finance & Legal #2** from `okta`.\n\n' +
+        'Why we believe it:\n- Confidence: **low** (21/100)',
+    });
+    const { container } = renderDetails(vi.fn());
+
+    // Scoped to the section: the rail header also shows the connector name.
+    const narrative = screen.getByText('Narrative').closest('section')!;
+
+    expect(within(narrative).getByText('Medium').tagName).toBe('STRONG');
+    expect(within(narrative).getByText('Finance & Legal #2').tagName).toBe('STRONG');
+    expect(within(narrative).getByText('okta').tagName).toBe('CODE');
+    expect(within(narrative).getAllByRole('listitem').length).toBe(1);
+    expect(container.textContent).not.toContain('**');
   });
 });
 
@@ -390,7 +504,7 @@ describe('InvestigationRail — narrative section', () => {
 describe('InvestigationRail — related entities section', () => {
   it('renders related entities grouped by kind with a count', () => {
     swrState.data = buildAlert();
-    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />);
+    renderDetails(vi.fn());
 
     expect(screen.getByText(/related entities/i)).toBeInTheDocument();
     // 5 entities total in the fixture.
@@ -405,7 +519,7 @@ describe('InvestigationRail — related entities section', () => {
 
   it('renders the principal chips with their display labels', () => {
     swrState.data = buildAlert();
-    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />);
+    renderDetails(vi.fn());
     // Display label wins over raw value when present.
     expect(screen.getByText('Alice (Finance)')).toBeInTheDocument();
     // No label → fall back to raw value.
@@ -414,14 +528,14 @@ describe('InvestigationRail — related entities section', () => {
 
   it('wraps entities with pivotPath in a link and leaves the rest as plain chips', () => {
     swrState.data = buildAlert();
-    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />);
+    renderDetails(vi.fn());
 
     // The pivotable principal renders an anchor.
     const aliceLink = screen.getByText('Alice (Finance)').closest('a');
     expect(aliceLink).not.toBeNull();
     expect(aliceLink).toHaveAttribute(
       'href',
-      '/graph/user/alice%40example.com',
+      '/graph?entity=user%3Aalice%40example.com',
     );
 
     // The non-pivotable host does NOT render an anchor — `closest('a')` should
@@ -431,12 +545,12 @@ describe('InvestigationRail — related entities section', () => {
 
     // The network IP chip renders an anchor too.
     const ipLink = screen.getByText('10.0.0.7').closest('a');
-    expect(ipLink).toHaveAttribute('href', '/graph/ip/10.0.0.7');
+    expect(ipLink).toHaveAttribute('href', '/graph?entity=ip%3A10.0.0.7');
   });
 
   it('omits the section entirely when no related entities are returned', () => {
     swrState.data = buildAlert({ relatedEntities: [] });
-    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />);
+    renderDetails(vi.fn());
     expect(screen.queryByText(/related entities/i)).toBeNull();
   });
 
@@ -448,9 +562,7 @@ describe('InvestigationRail — related entities section', () => {
       { kind: 'principal', type: 'host', value: 'box-1' },
     ];
     swrState.data = buildAlert({ relatedEntities: shuffled });
-    const { container } = render(
-      <InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />,
-    );
+    const { container } = renderDetails();
 
     // The three group headers present in the fixture appear; the workflow
     // group is skipped because there are no workflow entities.
@@ -476,7 +588,7 @@ describe('InvestigationRail — related entities section', () => {
 describe('InvestigationRail — mini-timeline section', () => {
   it('renders the mini-timeline rows with badges, titles, and actors', () => {
     swrState.data = buildAlert();
-    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />);
+    renderDetails(vi.fn());
 
     expect(screen.getByText(/recent events/i)).toBeInTheDocument();
     expect(screen.getByText('(2)')).toBeInTheDocument();
@@ -506,14 +618,14 @@ describe('InvestigationRail — mini-timeline section', () => {
         },
       ],
     });
-    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />);
+    renderDetails(vi.fn());
     // The title still surfaces so the row isn't lost.
     expect(screen.getByText('Analyst added a note')).toBeInTheDocument();
   });
 
   it('omits the section when there are no timeline events', () => {
     swrState.data = buildAlert({ miniTimeline: [] });
-    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />);
+    renderDetails(vi.fn());
     expect(screen.queryByText(/recent events/i)).toBeNull();
   });
 });
@@ -523,7 +635,7 @@ describe('InvestigationRail — mini-timeline section', () => {
 describe('InvestigationRail — recommended actions section', () => {
   it('renders recommended actions with priority chips, rationale, and risk', () => {
     swrState.data = buildAlert();
-    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />);
+    renderDetails(vi.fn());
 
     expect(screen.getByText(/recommended actions/i)).toBeInTheDocument();
     expect(screen.getByText('(3)')).toBeInTheDocument();
@@ -570,7 +682,7 @@ describe('InvestigationRail — recommended actions section', () => {
         },
       ],
     });
-    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />);
+    renderDetails(vi.fn());
     // The chip still renders with the raw priority text — the fallback is
     // about the tone class, not about hiding the row.
     expect(screen.getByText('urgent')).toBeInTheDocument();
@@ -579,7 +691,7 @@ describe('InvestigationRail — recommended actions section', () => {
 
   it('omits the section when there are no recommended actions', () => {
     swrState.data = buildAlert({ recommendedActions: [] });
-    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />);
+    renderDetails(vi.fn());
     expect(screen.queryByText(/recommended actions/i)).toBeNull();
   });
 });
@@ -589,7 +701,7 @@ describe('InvestigationRail — recommended actions section', () => {
 describe('InvestigationRail — Deep Explain drawer', () => {
   it('does not mount the drawer on initial render', () => {
     swrState.data = buildAlert();
-    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />);
+    renderDetails(vi.fn());
     expect(screen.queryByTestId('explain-drawer-mock')).toBeNull();
     expect(explainDrawerProps.lastProps).toBeNull();
   });
@@ -597,7 +709,7 @@ describe('InvestigationRail — Deep Explain drawer', () => {
   it('mounts the drawer with the loaded alert when Deep Explain is clicked', async () => {
     const user = userEvent.setup();
     swrState.data = buildAlert();
-    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />);
+    renderDetails(vi.fn());
 
     await user.click(screen.getByRole('button', { name: /deep explain/i }));
 
@@ -609,7 +721,7 @@ describe('InvestigationRail — Deep Explain drawer', () => {
   it('closes the drawer when the drawer fires onClose', async () => {
     const user = userEvent.setup();
     swrState.data = buildAlert();
-    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />);
+    renderDetails(vi.fn());
 
     await user.click(screen.getByRole('button', { name: /deep explain/i }));
     expect(screen.getByTestId('explain-drawer-mock')).toBeInTheDocument();
@@ -624,7 +736,7 @@ describe('InvestigationRail — Deep Explain drawer', () => {
     const user = userEvent.setup();
     swrState.data = buildAlert();
     const onClose = vi.fn();
-    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={onClose} />);
+    renderDetails(onClose);
 
     await user.click(screen.getByRole('button', { name: /deep explain/i }));
     await user.click(screen.getByTestId('explain-drawer-close'));
@@ -640,7 +752,7 @@ describe('InvestigationRail — rail close button', () => {
     const user = userEvent.setup();
     swrState.data = buildAlert();
     const onClose = vi.fn();
-    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={onClose} />);
+    renderDetails(onClose);
 
     // The shell exposes one Close affordance — the loaded rail uses the same
     // aria-label as the loading shell, so we can target it the same way.
@@ -655,7 +767,7 @@ describe('InvestigationRail — rail close button', () => {
     // pins that contract so refactors don't accidentally short-circuit it.
     swrState.data = buildAlert();
     const onClose = vi.fn();
-    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={onClose} />);
+    renderDetails(onClose);
 
     expect(
       screen.getByRole('heading', { name: /impossible travel/i }),
@@ -676,7 +788,7 @@ describe('InvestigationRail — degrades gracefully on legacy envelopes', () => 
       miniTimeline: [],
       recommendedActions: [],
     });
-    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />);
+    renderDetails(vi.fn());
 
     // Header still renders.
     expect(
@@ -702,10 +814,42 @@ describe('InvestigationRail — degrades gracefully on legacy envelopes', () => 
       miniTimeline: undefined,
       recommendedActions: undefined,
     });
-    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />);
+    renderDetails(vi.fn());
     expect(screen.queryByText('Narrative')).toBeNull();
     expect(screen.queryByText(/related entities/i)).toBeNull();
     expect(screen.queryByText(/recent events/i)).toBeNull();
     expect(screen.queryByText(/recommended actions/i)).toBeNull();
+  });
+});
+
+// ─── View toggle ─────────────────────────────────────────────────────────────
+
+describe('InvestigationRail — story is the primary view', () => {
+  it('opens on the story, not the field list', () => {
+    swrState.data = buildAlert();
+    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />);
+    expect(screen.getByRole('tab', { name: 'Story' })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+    expect(screen.getByLabelText('Attack story')).toBeInTheDocument();
+  });
+
+  it('keeps the detail sections one click away', () => {
+    swrState.data = buildAlert();
+    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />);
+    expect(screen.queryByText('Narrative')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Details' }));
+    expect(screen.getByText('Narrative')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Attack story')).not.toBeInTheDocument();
+  });
+
+  it('can switch back', () => {
+    swrState.data = buildAlert();
+    render(<InvestigationRail alertId="ALERT-W6-0001" onClose={vi.fn()} />);
+    fireEvent.click(screen.getByRole('tab', { name: 'Details' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Story' }));
+    expect(screen.getByLabelText('Attack story')).toBeInTheDocument();
   });
 });

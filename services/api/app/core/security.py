@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import bcrypt
-from jose import jwt
+import jwt
 
 from app.core.config import settings
 
@@ -50,6 +50,13 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "settings:write",
         "lake:query",
         "lake:read_schema",
+        # The live-action registry: which vendors can perform which response
+        # verbs against this tenant's estate, and what a given action would
+        # do. `actions:execute` gates the dry-run preview only — a live
+        # containment goes through the approval path, where an approver is
+        # bound to the decision.
+        "actions:read",
+        "actions:execute",
     ],
     "soc_lead": [
         "alerts:read",
@@ -76,6 +83,8 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "settings:read",
         "lake:query",
         "lake:read_schema",
+        "actions:read",
+        "actions:execute",
     ],
     "soc_analyst": [
         "alerts:read",
@@ -95,6 +104,10 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "settings:read",
         "lake:query",
         "lake:read_schema",
+        # Analysts already hold playbooks:execute, and a dry run touches no
+        # vendor, so previewing a response is within the same envelope.
+        "actions:read",
+        "actions:execute",
     ],
     "threat_hunter": [
         "alerts:read",
@@ -115,6 +128,9 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "settings:read",
         "lake:query",
         "lake:read_schema",
+        # Read the registry to know what response is available for a finding;
+        # hunters hand off rather than respond, so no execute.
+        "actions:read",
     ],
     "viewer": [
         "alerts:read",
@@ -166,19 +182,44 @@ def get_password_hash(password: str) -> str:
 
 def create_access_token(data: dict[str, Any], expires_delta: timedelta | None = None) -> str:
     to_encode = data.copy()
+    issued_at = datetime.now(UTC)
     if expires_delta:
-        expire = datetime.now(UTC) + expires_delta
+        expire = issued_at + expires_delta
     else:
-        expire = datetime.now(UTC) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire, "type": "access"})
+        expire = issued_at + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire, "iat": issued_at, "type": "access"})
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
 def create_refresh_token(data: dict[str, Any]) -> str:
     to_encode = data.copy()
-    expire = datetime.now(UTC) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
-    to_encode.update({"exp": expire, "type": "refresh"})
+    issued_at = datetime.now(UTC)
+    expire = issued_at + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode.update({"exp": expire, "iat": issued_at, "type": "refresh"})
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def token_is_revoked(issued_at: Any, sessions_revoked_at: datetime | None) -> bool:
+    """Whether a token predates the principal's last session revocation.
+
+    ``iat`` is the only thing distinguishing a token minted before a
+    deprovisioning from one minted after it. A token with no ``iat`` at all
+    predates this claim being added and is treated as revoked whenever a
+    revocation exists, which fails closed: the alternative would let a token
+    from before the upgrade outlive the revocation that was supposed to end it.
+    """
+    if sessions_revoked_at is None:
+        return False
+    if issued_at is None:
+        return True
+    try:
+        minted = datetime.fromtimestamp(float(issued_at), tz=UTC)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return True
+    cutoff = sessions_revoked_at if sessions_revoked_at.tzinfo else sessions_revoked_at.replace(tzinfo=UTC)
+    # `<=` rather than `<`: `iat` has one-second resolution, so a token
+    # minted in the same second as the revocation must not survive it.
+    return minted <= cutoff
 
 
 def decode_token(token: str) -> dict[str, Any]:

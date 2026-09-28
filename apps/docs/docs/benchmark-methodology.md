@@ -98,9 +98,12 @@ it here in detail.
 The substrate suite drives deterministic code only:
 
 - **Keyword extractors** — pulled out of `services/agents/app/extractors/`
-- **Fusion grouping** — a faithful in-harness re-implementation of the
-  Tier 1/2/3 rules used by `services/fusion`, minus the DB-backed dedup
-  and the ML scorer
+- **Fusion grouping** — a four-tier scheme implemented inside the test,
+  keyed on `(rule_id, host, user)`. It is **not** the grouping
+  `services/fusion` runs, which keys on `{tenant}:{entity}:{tactic}`;
+  it is retained as a regression gate and its number does not describe
+  this product. See [Why there are two alert-reduction
+  numbers](./benchmark.md#why-there-are-two-alert-reduction-numbers)
 - **Report and plan templates** — the deterministic synthesisers used as
   fall-back when an LLM call fails
 - **Offline judges** — keyword-coverage and rubric-score checks
@@ -130,13 +133,13 @@ network round trips.
 | Dataset           | Same `synthetic_incidents.json` (deterministic) |
 | LLMs              | Configurable via env (`AISOC_BENCH_PROVIDER=openai\|anthropic\|ollama`) |
 | Telemetry captured | Wall-clock latency p50/p95/p99, prompt + completion tokens, USD cost |
-| CI gate           | [`.github/workflows/wet-eval-weekly.yml`](https://github.com/beenuar/AiSOC/blob/main/.github/workflows/wet-eval-weekly.yml) (T5.5) |
+| CI gate           | [`.github/workflows/wet-eval.yml`](https://github.com/beenuar/AiSOC/blob/main/.github/workflows/wet-eval.yml) (T5.5) |
 | Output            | `eval_report.json -> wet_eval` block + render to `apps/docs/static/eval/` |
 
 The weekly job pushes its results into the same `eval-results` branch as the
 substrate run, so historical trend lines stay in one place.
 
-Cross-link: [`wet-eval-weekly.yml`](https://github.com/beenuar/AiSOC/blob/main/.github/workflows/wet-eval-weekly.yml)
+Cross-link: [`wet-eval.yml`](https://github.com/beenuar/AiSOC/blob/main/.github/workflows/wet-eval.yml)
 is added by **T5.5** in the v8.0 plan. Until that lands, the per-template
 latency / token / USD cells on the benchmark page are placeholders rather
 than imputed numbers.
@@ -150,7 +153,8 @@ The summary, with class labels:
 | Suite | Class | Headline metric |
 |-------|-------|-----------------|
 | `mitre_accuracy` | Substrate self-check | Per-template macro accuracy of the keyword extractor |
-| `alert_reduction` | Real measurement | 1 000-alert noisy stream → fused incident count |
+| `alert_reduction` | Legacy — does not describe this product | 1 000-alert noisy stream → four-tier in-test grouping, retained as a regression gate ([why](./benchmark.md#why-there-are-two-alert-reduction-numbers)) |
+| alert reduction (product logic) | Real measurement | The same stream grouped with `RawAlert.correlation_key()`, the method `Correlator` calls |
 | `investigation_completeness` | Substrate self-check | Mean keyword coverage of the report template |
 | `response_quality` | Substrate self-check | Mean rubric score of the synthesised plan |
 | `playbook_completion_rate` | Operational coverage gate | Fraction of in-scope incidents with a matched playbook |

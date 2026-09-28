@@ -36,12 +36,21 @@ import json
 import re
 import sys
 from collections.abc import Iterable
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+# `scripts/` is on sys.path when this file is run as a program, but not when a
+# test loads it by path with importlib. gate_toolkit sits beside it either way.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from gate_toolkit import repo_root, self_test_if_requested
+
+self_test_if_requested(__file__)
+
+REPO_ROOT = repo_root()
 DETECTIONS_DIR = REPO_ROOT / "detections"
 PLAYBOOKS_PACKS_DIR = REPO_ROOT / "playbooks" / "packs"
 PLUGINS_DIR = REPO_ROOT / "plugins"
@@ -63,9 +72,20 @@ DETECTION_CATEGORIES = {
 
 # Top-level dirs under detections/ that are NOT native rule directories
 # but contain rules in some tier (we walk these separately).
+#
+# `playbooks` is here because `detections/playbooks/*.yaml` holds 25 response
+# playbooks — `trigger:`/`steps:`, no `detection:` block — and this walker
+# indexed every one of them as `"type": "detection"`. That is the whole of the
+# gap between the 7,016 this script published and the 6,991 the README, the
+# truth table and `detection_truth_table.py` all publish: the truth table's
+# own `SKIP_DIRS` has always held `{"fixtures", "playbooks"}`, so the two
+# walkers were reading the same tree and disagreeing about what a detection
+# is. They are indexed below as playbooks, which is what they are, so the
+# marketplace keeps them and neither count is inflated.
 DETECTION_NATIVE_SKIP = {
     "fixtures",
     "community",
+    "playbooks",
     "sigma-imports",
     "car-imports",
     "splunk-imports",
@@ -166,17 +186,39 @@ def detection_files() -> list[Path]:
     return files
 
 
+@lru_cache(maxsize=1)
+def engine_rule_ids() -> frozenset[str]:
+    """Ids the detection engine loads, across both compiled rulesets."""
+    ids: set[str] = set()
+    for name in ("detection_ruleset.json", "detection_ruleset_imported.json"):
+        path = REPO_ROOT / "services" / "fusion" / "app" / "data" / name
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        ids |= {str(r["id"]) for r in data.get("rules") or [] if r.get("id")}
+    return frozenset(ids)
+
+
 def imported_detection_files() -> list[tuple[Path, str, bool]]:
     """Return (path, source_name, is_quarantined) for every imported rule.
 
     Walks the tier directories declared in :data:`IMPORTED_TIER_DIRS`.
-    Rules nested under a ``_quarantine/`` directory are returned with
-    ``is_quarantined=True`` so the marketplace can surface them as
-    "imported, requires translation" instead of pretending they execute.
+
+    Quarantine used to be read off the directory name, and that stopped being
+    true when the Sigma compiler began translating rules in place: 1,724 files
+    still sit under ``_quarantine/`` and the engine loads every one of them. A
+    published figure calling those quarantined would understate the capability
+    in exactly the direction this repository normally guards the other way, and
+    the fix is the same one the truth table already applies — ask the engine,
+    not the path. A rule is quarantined when the engine does not load it.
     """
     out: list[tuple[Path, str, bool]] = []
     if not DETECTIONS_DIR.exists():
         return out
+    loaded = engine_rule_ids()
     for tier_dir, source_name in IMPORTED_TIER_DIRS.items():
         root = DETECTIONS_DIR / tier_dir
         if not root.exists():
@@ -186,8 +228,15 @@ def imported_detection_files() -> list[tuple[Path, str, bool]]:
                 rel = f.relative_to(root).parts
             except ValueError:
                 continue
-            quarantined = bool(rel) and rel[0] == "_quarantine"
-            out.append((f, source_name, quarantined))
+            in_quarantine_dir = bool(rel) and rel[0] == "_quarantine"
+            if in_quarantine_dir and loaded:
+                try:
+                    doc = yaml.safe_load(f.read_text(encoding="utf-8"))
+                except Exception:  # noqa: BLE001 — a bad file stays quarantined
+                    doc = None
+                rule_id = str(doc.get("id")) if isinstance(doc, dict) and doc.get("id") else ""
+                in_quarantine_dir = rule_id not in loaded
+            out.append((f, source_name, in_quarantine_dir))
     return out
 
 
@@ -195,6 +244,21 @@ def playbook_files() -> list[Path]:
     if not PLAYBOOKS_PACKS_DIR.exists():
         return []
     return sorted(PLAYBOOKS_PACKS_DIR.rglob("*.playbook.json"))
+
+
+def standalone_playbook_files() -> list[Path]:
+    """Response playbooks that live under ``detections/playbooks/``.
+
+    Same document shape as a pack entry — ``trigger``/``steps`` — written as
+    YAML and filed under the detections tree. They are not part of the v1
+    pack, so they are counted separately from it: ``stats.playbook_packs``
+    stays the pack figure the landing page quotes, and ``stats.playbooks``
+    is every playbook the marketplace indexes.
+    """
+    directory = DETECTIONS_DIR / "playbooks"
+    if not directory.exists():
+        return []
+    return sorted(directory.rglob("*.yaml"))
 
 
 def plugin_manifests() -> list[Path]:
@@ -286,8 +350,7 @@ def build_detection_item(
     }
     if quarantined:
         item["quarantine_reason"] = data.get("quarantine_reason") or (
-            "imported rule; upstream query language not directly executable "
-            "by the AiSOC engine yet"
+            "imported rule; upstream query language not directly executable by the AiSOC engine yet"
         )
     provenance = data.get("provenance")
     if isinstance(provenance, dict):
@@ -303,11 +366,10 @@ def build_detection_item(
     return item
 
 
-def build_playbook_item(
-    path: Path, *, source: str, tier: str
-) -> dict[str, Any] | None:
+def build_playbook_item(path: Path, *, source: str, tier: str, pack: bool = True) -> dict[str, Any] | None:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+        data = yaml.safe_load(text) if path.suffix in {".yaml", ".yml"} else json.loads(text)
     except Exception as exc:
         print(f"WARN: could not parse {path}: {exc}", file=sys.stderr)
         return None
@@ -318,9 +380,7 @@ def build_playbook_item(
     tags = normalise_tags(raw_tags)
     trigger_block = data.get("trigger") or {}
     trigger = trigger_block.get("on") if isinstance(trigger_block, dict) else None
-    severities = (
-        trigger_block.get("severity") if isinstance(trigger_block, dict) else None
-    )
+    severities = trigger_block.get("severity") if isinstance(trigger_block, dict) else None
     severity: str | None = None
     if isinstance(severities, list) and severities:
         # Pick the highest declared severity for display.
@@ -345,14 +405,13 @@ def build_playbook_item(
         "verified": tier == "stable",
         "source": source,
         "tier": tier,
+        "pack": pack,
         "enabled": True,
         "path": str(path.relative_to(REPO_ROOT)),
     }
 
 
-def build_plugin_item(
-    path: Path, *, source: str, tier: str | None = None
-) -> dict[str, Any] | None:
+def build_plugin_item(path: Path, *, source: str, tier: str | None = None) -> dict[str, Any] | None:
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
     except Exception as exc:
@@ -419,9 +478,7 @@ def collect_items() -> list[dict[str, Any]]:
 
     # Detections — imported tiers (one per upstream corpus)
     for f, src_name, quarantined in imported_detection_files():
-        item = build_detection_item(
-            f, source=src_name, tier="imported", quarantined=quarantined
-        )
+        item = build_detection_item(f, source=src_name, tier="imported", quarantined=quarantined)
         if item:
             items.append(item)
 
@@ -438,6 +495,10 @@ def collect_items() -> list[dict[str, Any]]:
             items.append(item)
     for f in community_playbook_files():
         item = build_playbook_item(f, source="community", tier="community")
+        if item:
+            items.append(item)
+    for f in standalone_playbook_files():
+        item = build_playbook_item(f, source="core", tier="stable", pack=False)
         if item:
             items.append(item)
 
@@ -459,10 +520,7 @@ def categories_block(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         {
             "id": "playbooks",
             "label": "Response Playbooks",
-            "description": (
-                "Automated incident-response workflows triggered by "
-                "alerts or manual invocation."
-            ),
+            "description": ("Automated incident-response workflows triggered by alerts or manual invocation."),
         },
         {
             "id": "detections",
@@ -495,7 +553,7 @@ def _tier_breakdown(items: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def _detection_tier_breakdown(items: list[dict[str, Any]]) -> dict[str, int]:
-    """Count detection items per tier — the main 'are we Wazuh-scale' headline."""
+    """Count detection items per tier — the main 'are we at open-source-SIEM scale' headline."""
     counts: dict[str, int] = {}
     for item in items:
         if item.get("type") != "detection":
@@ -524,12 +582,8 @@ def coverage_block(items: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "techniques": dict(sorted(techniques.items())),
         "unique_techniques": len(techniques),
-        "total_with_mitre": sum(
-            1 for i in items if i.get("mitre_techniques")
-        ),
-        "by_tier": {
-            tier: dict(sorted(tids.items())) for tier, tids in by_tier.items()
-        },
+        "total_with_mitre": sum(1 for i in items if i.get("mitre_techniques")),
+        "by_tier": {tier: dict(sorted(tids.items())) for tier, tids in by_tier.items()},
     }
 
 
@@ -539,23 +593,23 @@ def build_index() -> dict[str, Any]:
     return {
         "$schema": "https://example.com/schemas/marketplace/v1.json",
         "version": "1.0.0",
-        "generated": dt.datetime.now(dt.UTC)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z"),
+        "generated": dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "categories": categories_block(items),
         "stats": {
             "total": len(items),
             "playbooks": sum(1 for i in items if i["type"] == "playbook"),
+            # The v1 pack alone. Quoted on the landing page as "N playbook
+            # packs", so it must not absorb the standalone response playbooks
+            # under `detections/playbooks/`, which are playbooks but not part
+            # of the pack.
+            "playbook_packs": sum(1 for i in items if i["type"] == "playbook" and i.get("pack")),
             "detections": sum(1 for i in items if i["type"] == "detection"),
             "plugins": sum(1 for i in items if i["type"] == "plugin"),
             "verified": sum(1 for i in items if i.get("verified")),
             "community": sum(1 for i in items if i.get("source") == "community"),
             "by_tier": _tier_breakdown(items),
             "detections_by_tier": _detection_tier_breakdown(items),
-            "quarantined": sum(
-                1 for i in items if i.get("quarantine_reason")
-            ),
+            "quarantined": sum(1 for i in items if i.get("quarantine_reason")),
         },
         "mitre_coverage": coverage_block(items),
         "items": items,
@@ -593,16 +647,8 @@ def main() -> int:
         return 0
 
     if args.check:
-        existing_primary = (
-            OUTPUT_PRIMARY.read_text(encoding="utf-8")
-            if OUTPUT_PRIMARY.exists()
-            else ""
-        )
-        existing_public = (
-            OUTPUT_PUBLIC.read_text(encoding="utf-8")
-            if OUTPUT_PUBLIC.exists()
-            else ""
-        )
+        existing_primary = OUTPUT_PRIMARY.read_text(encoding="utf-8") if OUTPUT_PRIMARY.exists() else ""
+        existing_public = OUTPUT_PUBLIC.read_text(encoding="utf-8") if OUTPUT_PUBLIC.exists() else ""
 
         # Compare ignoring `generated` timestamp.
         def _strip_generated(s: str) -> str:
@@ -616,20 +662,13 @@ def main() -> int:
             return json.dumps(obj, indent=2, sort_keys=False) + "\n"
 
         rebuilt_no_ts = _strip_generated(serialised)
-        if (
-            _strip_generated(existing_primary) != rebuilt_no_ts
-            or _strip_generated(existing_public) != rebuilt_no_ts
-        ):
+        if _strip_generated(existing_primary) != rebuilt_no_ts or _strip_generated(existing_public) != rebuilt_no_ts:
             print(
-                "marketplace/index.json is stale. Run: "
-                "pnpm marketplace:build",
+                "marketplace/index.json is stale. Run: pnpm marketplace:build",
                 file=sys.stderr,
             )
             return 1
-        print(
-            f"marketplace/index.json is up to date "
-            f"({index['stats']['total']} items)."
-        )
+        print(f"marketplace/index.json is up to date ({index['stats']['total']} items).")
         return 0
 
     write_index(index)

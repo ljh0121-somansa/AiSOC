@@ -13,12 +13,18 @@ on:
     paths:
       - "tests/isolation/**"
       - "services/api/app/services/lake_sql.py"
+      - "services/api/app/services/retro_hunt/**"
+      - "services/api/clickhouse/**"
+      - "services/fusion/app/services/lake_writer.py"
       - "services/ingest/internal/graph_ws/**"
       - ".github/workflows/isolation-live.yml"
   pull_request:
     paths:
       - "tests/isolation/**"
       - "services/api/app/services/lake_sql.py"
+      - "services/api/app/services/retro_hunt/**"
+      - "services/api/clickhouse/**"
+      - "services/fusion/app/services/lake_writer.py"
       - "services/ingest/internal/graph_ws/**"
       - ".github/workflows/isolation-live.yml"
   workflow_dispatch:
@@ -36,21 +42,30 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
       - name: Install clients + test deps
         # sqlglot MUST be pinned to the same range the API service ships
-        # (`>=23,<27`): the ClickHouse test runs the production
-        # lake_sql.rewrite_for_tenant, and sqlglot >= 27 silently stops
-        # injecting the tenant WHERE predicate (the tenant-isolation break this
-        # very gate exists to catch). test_lake_sql.py guards the pin itself.
+        # (`>=30,<31`): the ClickHouse test runs the production
+        # lake_sql.rewrite_for_tenant, so a version this job resolves and the
+        # image does not is a different isolation guarantee than the one under
+        # test. `scripts/check_sqlglot_pin.py` is what keeps the two equal.
+        #
+        # The historical break is why the pin is enforced rather than
+        # suggested: sqlglot 27 renamed the SELECT's FROM argument key, the
+        # table walk found nothing, and every single-table query came back
+        # with no tenant predicate, no allowlist check and no table-function
+        # ban — reported as success. `lake_sql._from_clause` now resolves the
+        # clause by node type rather than by key name, so that specific
+        # rename cannot recur; the agreement requirement stands because the
+        # next AST change will not announce itself either.
         run: >-
           pip install --quiet
-          pytest pytest-asyncio structlog "sqlglot>=23,<27"
+          pytest pytest-asyncio structlog "sqlglot>=30,<31"
           neo4j "redis>=5,<6" clickhouse-driver "kafka-python>=2,<3"
 
       # Single-container stores run as `services:`-style `docker run` so we can
@@ -114,6 +129,17 @@ jobs:
           ISOLATION_CLICKHOUSE_PORT: "9000"
           ISOLATION_KAFKA_BROKERS: localhost:9092
         run: python -m pytest tests/isolation/test_live_stores.py -v --tb=short
+
+      # Gap-closure Phase 8.1's done-when clause, which is a statement about a
+      # pair of tenants and so cannot be proven offline: an indicator is found
+      # for the tenant whose recorded lake rows hold it and not for the one
+      # whose do not. The rows come from the production lake writer and the
+      # query from the production generator, so a wrong column fails here.
+      - name: Retro-hunt sweep matches recorded lake data
+        env:
+          ISOLATION_CLICKHOUSE_HOST: localhost
+          ISOLATION_CLICKHOUSE_PORT: "9000"
+        run: python -m pytest tests/isolation/test_retro_hunt_live.py -v --tb=short
 
       - name: Capture forensics on failure
         if: failure()

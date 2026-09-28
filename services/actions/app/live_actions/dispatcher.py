@@ -31,17 +31,40 @@ so individual executors never have to think about them:
 from __future__ import annotations
 
 import os
+from dataclasses import replace
+from typing import Any
 from uuid import uuid4
 
 import structlog
 
 from app.models.action import ActionRequest, ActionType
-from app.services.autonomy_safety import AutonomyDecision, AutonomyMode, decide
+from app.services.approval_matrix import evaluate_contract
+from app.services.autonomy_safety import (
+    _BLAST_ORDER,
+    ACTION_BLAST_RADIUS,
+    AutonomyDecision,
+    AutonomyMode,
+    BlastRadius,
+    RollbackCapability,
+    decide,
+    rollback_capability,
+)
 from app.services.credential_resolver import resolve_params
-from app.services.maturity import MaturityTier
+from app.services.maturity import _AUTO_ALLOWED_AT_TIER, MaturityTier
+from app.services.tenant_policy import TenantPolicy, resolve_tenant_policy
+from app.services.verification import PostActionVerifier, VerificationOutcome
 
 from . import registry
+from .capability_contracts import CAPABILITY_CONTRACTS
+from .contract import ActionImpact, ApprovalRequirement, Reversal
 from .models import LiveActionRequest, LiveActionResult, LiveActionStatus
+
+#: The highest tier an earned grant may lift a tenant to. L3 permits MINIMAL,
+#: LOW and MEDIUM blast radius and stops there, so no track record on triage
+#: agreement can make a HIGH-blast containment unattended. `force_auto`, which
+#: is a human writing down a decision about one verb rather than an inference
+#: from agreement, still goes to L4.
+EARNED_TIER_CEILING = MaturityTier.L3_REMEDIATE
 
 logger = structlog.get_logger(__name__)
 
@@ -76,7 +99,19 @@ def _action_type_for(request: LiveActionRequest, executor: object) -> ActionType
         return None
 
 
-def _govern(request: LiveActionRequest, action_type: ActionType) -> AutonomyDecision:
+async def _govern(request: LiveActionRequest, action_type: ActionType) -> AutonomyDecision:
+    """Resolve the autonomy verdict from the *tenant's* policy.
+
+    This used to be `decide(action_request, tier=configured_tier())`: one
+    deployment-wide environment variable for every tenant, with the
+    `whitelisted` flag left at its default of False so the L4 break-glass path
+    for HIGH-blast-radius actions was unreachable. A tenant who selected L2 in
+    the console got whatever the operator had exported.
+
+    Now the tier, the per-action overrides and the whitelist all come from the
+    tenant's stored policy, falling back to the environment only when there is
+    no database to read.
+    """
     action_request = ActionRequest(
         incident_id=request.case_id or uuid4(),
         tenant_id=request.tenant_id or uuid4(),
@@ -85,7 +120,294 @@ def _govern(request: LiveActionRequest, action_type: ActionType) -> AutonomyDeci
         parameters=request.params,
         requested_by=request.requested_by,
     )
-    return decide(action_request, tier=configured_tier())
+    policy = await resolve_tenant_policy(request.tenant_id)
+
+    # A tenant override is a deliberate, explicit instruction for one action
+    # type, so it outranks the tier ladder in both directions.
+    override = policy.action_overrides.get(action_type.value, {}) or {}
+    if override.get("block"):
+        return _override_decision(
+            action_type,
+            policy,
+            AutonomyMode.BLOCKED,
+            f"action type '{action_type.value}' is blocked by tenant policy",
+        )
+    if override.get("force_auto"):
+        # The override lifts the *tier ceiling* — that is what it is for — so
+        # the contract is graded as though the tenant were at L4. It does not
+        # lift the contract's own floors: a verb declared `analyst` or
+        # `mandatory_human`, or one whose impact is never autonomous, stays
+        # gated. `ActionContract.approval` says the tenant's autonomy policy
+        # "can raise this but never lower it", and before the contract was
+        # consulted on this path an override could lower it silently.
+        return _apply_capability_contract(
+            request,
+            _override_decision(
+                action_type,
+                policy,
+                AutonomyMode.AUTO,
+                f"action type '{action_type.value}' is force-auto by tenant policy",
+            ),
+            tier_label="L4",
+        )
+
+    # Gap-closure Phase 2.3. A tenant that has run this verb's alert classes in
+    # shadow and agreed with its own analysts often enough, over a large enough
+    # sample with enough of it malicious, holds an earned grant. The grant
+    # raises the *tier ceiling* exactly as `force_auto` does, and for the same
+    # reason: it is the ceiling that is being argued about, not the contract.
+    #
+    # It stops at L3, where `force_auto` goes to L4. `force_auto` is a human
+    # writing down a decision about one verb; a grant is an inference from
+    # agreement on triage verdicts. That is evidence about the agent's
+    # judgement, and it is not evidence that a HIGH-blast containment was the
+    # right call. L3 permits MINIMAL, LOW and MEDIUM blast and stops there, so
+    # no track record can make `isolate_host` unattended.
+    #
+    # `_apply_capability_contract` still runs on top, so a verb declared
+    # `analyst` or `mandatory_human` stays gated however good the numbers are:
+    # the contract's floors may be raised and never lowered.
+    earned = policy.earned_autonomy_for(action_type.value)
+    effective_tier = policy.tier
+    if earned and policy.tier < EARNED_TIER_CEILING:
+        effective_tier = EARNED_TIER_CEILING
+
+    decision = decide(
+        action_request,
+        tier=effective_tier,
+        whitelisted=policy.is_whitelisted(action_type.value, request.target),
+    )
+    if effective_tier is not policy.tier:
+        # Say which grant did it, and whether it was earned or overruled into
+        # existence. An incident review quotes this sentence, and "autonomous
+        # on a measured track record" and "autonomous because somebody
+        # overruled the gate" are the same action and different findings.
+        earned_phrase = "an operator override of the promotion gate" if earned == "operator_override" else "a measured track record"
+        decision = replace(
+            decision,
+            reason=(
+                f"{decision.reason}; tier ceiling raised from {policy.tier.name} to "
+                f"{effective_tier.name} for '{action_type.value}' under {earned_phrase}"
+            ),
+        )
+
+    return _apply_capability_contract(
+        request,
+        decision,
+        tier_label=_tier_label(effective_tier),
+    )
+
+
+def _tier_label(tier: object) -> str:
+    """Map a ``MaturityTier`` onto the ``L0``..``L4`` labels the matrix uses."""
+    name = getattr(tier, "name", None)
+    if isinstance(name, str) and name.startswith("L"):
+        return name.split("_")[0]
+    return "L1"
+
+
+#: Blast radius implied by a capability's declared impact, for the verbs that
+#: have a contract and no ``ActionType``. ``ACTION_BLAST_RADIUS`` is keyed on
+#: ``ActionType``, so those verbs resolved to nothing and skipped governance
+#: altogether — ``revoke_session`` is MODERATE-impact identity disruption and
+#: was executing with no tier check, no blast check and no contract applied.
+#: The mapping is the conservative reading of the same two ladders.
+_IMPACT_BLAST: dict[ActionImpact, BlastRadius] = {
+    ActionImpact.READ_ONLY: BlastRadius.MINIMAL,
+    ActionImpact.LOW: BlastRadius.LOW,
+    ActionImpact.MODERATE: BlastRadius.MEDIUM,
+    ActionImpact.HIGH: BlastRadius.HIGH,
+    ActionImpact.SEVERE: BlastRadius.CRITICAL,
+    ActionImpact.IRREVERSIBLE: BlastRadius.CRITICAL,
+}
+
+
+async def _govern_by_contract_alone(request: LiveActionRequest) -> AutonomyDecision:
+    """Baseline verdict for a capability with a contract and no ``ActionType``.
+
+    Built from the tenant's tier and the contract's own impact so that
+    :func:`_apply_capability_contract` has something to raise. Without this a
+    contracted verb outside the legacy enum reached its executor with no
+    governance at all, which is the worst of both vocabularies: declared
+    dangerous and dispatched unchecked.
+    """
+    contract = CAPABILITY_CONTRACTS[request.capability]
+    blast = _IMPACT_BLAST[contract.impact]
+    policy = await resolve_tenant_policy(request.tenant_id)
+    allowed = _AUTO_ALLOWED_AT_TIER.get(policy.tier, set())
+    mode = AutonomyMode.AUTO if blast in allowed else AutonomyMode.QUEUED_APPROVAL
+    baseline = AutonomyDecision(
+        mode=mode,
+        blast_radius=blast,
+        tier=policy.tier,
+        rollback=(RollbackCapability.REVERSIBLE if contract.reversal is Reversal.PLATFORM else RollbackCapability.UNSUPPORTED),
+        requires_verification=(mode is AutonomyMode.AUTO and _BLAST_ORDER[blast] >= _BLAST_ORDER[BlastRadius.MEDIUM]),
+        reason=(
+            f"capability '{request.capability}' has no legacy ActionType; graded from its "
+            f"contract ({contract.impact.value} impact) under tier {policy.tier.name}"
+        ),
+    )
+    return _apply_capability_contract(request, baseline, tier_label=_tier_label(policy.tier))
+
+
+def _apply_capability_contract(
+    request: LiveActionRequest,
+    decision: AutonomyDecision,
+    *,
+    tier_label: str,
+) -> AutonomyDecision:
+    """Raise the autonomy verdict to whatever the capability contract demands.
+
+    ``decide()`` answers one question — is this verb's *blast radius* inside
+    the tenant's tier. The capability contract answers the other two, and this
+    dispatcher never asked them: what the verb does to an estate when the
+    finding is wrong (``impact``), and whether the reason is good enough
+    (``confidence``). ``approval_matrix.evaluate`` combines them and has been
+    wired into ``POST /actions`` since the approval gate was fixed; the
+    registry-driven path next to it still decided on blast radius alone, so
+    the same verb was graded differently depending on which door it came
+    through.
+
+    Composition rule is the matrix's own: each input may raise a requirement
+    and none may lower it. This function therefore never turns a QUEUED or
+    BLOCKED verdict into an AUTO one — it can only move in the safe direction,
+    which is why switching it on cannot make anything execute that did not
+    before.
+
+    A capability with no contract is left to blast radius and recorded at
+    debug, not guessed at. ``scripts/check_action_contract.py`` fails the
+    build when a registered executor has none, so this is a real absence
+    rather than a silent default.
+    """
+    contract = CAPABILITY_CONTRACTS.get(request.capability)
+    if contract is None:
+        logger.debug(
+            "live_action.no_capability_contract",
+            capability=request.capability,
+            note="blast radius decides alone; impact is unknown for this verb",
+        )
+        return decision
+
+    # The whole grading, in one shared call. This used to short-circuit
+    # READ_ONLY + AUTOMATIC before reaching the matrix, because the matrix's
+    # tier ceiling was `None` at L1 and put a pure read in the analyst queue.
+    # The legacy door had no such bypass, so `search_siem` executed here and
+    # queued there. The ceiling is fixed at its source now, so the bypass is
+    # gone and both doors read the same answer out of the same function.
+    verdict = evaluate_contract(
+        contract=contract,
+        confidence=request.confidence,
+        tier=tier_label,
+    )
+
+    if verdict.is_blocked:
+        return replace(
+            decision,
+            mode=AutonomyMode.BLOCKED,
+            reason=verdict.reason,
+            requires_verification=False,
+        )
+
+    if verdict.requirement == ApprovalRequirement.AUTOMATIC:
+        # The matrix is content. Whatever blast radius decided stands.
+        return decision
+
+    if decision.mode is AutonomyMode.AUTO:
+        # The only direction this function moves: an action the tier would
+        # have auto-executed, held because impact and confidence say so.
+        # Verification goes with it — nothing ran, so there is no effect to
+        # read back.
+        return replace(
+            decision,
+            mode=AutonomyMode.QUEUED_APPROVAL,
+            reason=verdict.reason,
+            requires_verification=False,
+        )
+
+    if decision.mode is AutonomyMode.QUEUED_APPROVAL:
+        # Already gated. Keep the matrix's reason, which names impact and
+        # confidence — more use to an approver than "blast radius exceeded".
+        return replace(decision, reason=verdict.reason)
+
+    return decision
+
+
+def _override_decision(
+    action_type: ActionType,
+    policy: TenantPolicy,
+    mode: AutonomyMode,
+    reason: str,
+) -> AutonomyDecision:
+    """Build a decision for an explicit per-action tenant override."""
+    blast = ACTION_BLAST_RADIUS.get(action_type, BlastRadius.HIGH)
+    return AutonomyDecision(
+        mode=mode,
+        blast_radius=blast,
+        tier=policy.tier,
+        rollback=rollback_capability(action_type),
+        # A force-auto override still earns verification at MEDIUM blast and
+        # above: choosing to skip the approval queue is not the same as
+        # choosing to skip the proof that the action took effect.
+        requires_verification=(mode is AutonomyMode.AUTO and blast is not BlastRadius.MINIMAL),
+        reason=f"{reason} (source: {policy.source})",
+    )
+
+
+async def _verify_effect(
+    request: LiveActionRequest,
+    result: LiveActionResult,
+    action_type: ActionType,
+    log: Any,
+) -> LiveActionResult:
+    """Re-query the vendor and record whether the action actually took effect.
+
+    Three outcomes, all recorded honestly on ``result.details``:
+
+    * ``verified``   — a confirming query ran and the effect is present.
+    * ``failed``     — a confirming query ran and the effect is absent. The
+      action reported success and did not take, which is a genuine alarm, so
+      the result status is downgraded to FAILED rather than left COMPLETED.
+    * ``unverified`` — no probe exists for this action/vendor, or credentials
+      were absent. Reported as-is; never upgraded to a confirmation.
+
+    A verifier crash can never fail the action itself — the action already
+    happened, and losing the record of it would be worse than not verifying.
+    """
+    verifier = PostActionVerifier()
+    try:
+        # `request.params` already carries the resolved vendor credentials by
+        # this point: auth_config was translated and cleared before dispatch.
+        outcome = await verifier.verify(action_type, request.target or "", dict(request.params))
+    except Exception as exc:  # noqa: BLE001 — verification must not mask a completed action
+        log.warning("live_action.verification_crashed", error=str(exc))
+        details = dict(result.details)
+        details["verification"] = "unverified"
+        details["verification_reason"] = f"verifier raised {type(exc).__name__}"
+        return result.model_copy(update={"details": details})
+
+    details = dict(result.details)
+    details["verification"] = outcome.outcome.value
+    details["verification_reason"] = outcome.reason
+    log.info(
+        "live_action.verified",
+        verification=outcome.outcome.value,
+        reason=outcome.reason,
+    )
+
+    if outcome.outcome is VerificationOutcome.FAILED:
+        # The vendor accepted the call and the effect is not there. Saying
+        # SUCCEEDED here is how a SOC ends up believing a host is contained
+        # when it is not.
+        return result.model_copy(
+            update={
+                "status": LiveActionStatus.FAILED,
+                "details": details,
+                "error": result.error or f"action reported success but verification failed: {outcome.reason}",
+                "summary": f"{result.summary} — VERIFICATION FAILED: {outcome.reason}",
+            }
+        )
+
+    return result.model_copy(update={"details": details})
 
 
 def _not_executed(request: LiveActionRequest, status: LiveActionStatus, decision: AutonomyDecision) -> LiveActionResult:
@@ -144,8 +466,8 @@ async def dispatch(request: LiveActionRequest) -> LiveActionResult:
     # possible — so governance applies to would-be real executions only.
     decision: AutonomyDecision | None = None
     action_type = _action_type_for(request, executor)
-    if action_type is not None and not request.dry_run:
-        decision = _govern(request, action_type)
+    if not request.dry_run and (action_type is not None or request.capability in CAPABILITY_CONTRACTS):
+        decision = await (_govern(request, action_type) if action_type is not None else _govern_by_contract_alone(request))
         log = log.bind(autonomy_mode=decision.mode.value, blast=decision.blast_radius.value)
         if decision.mode is AutonomyMode.BLOCKED:
             log.warning("live_action.blocked_by_policy", reason=decision.reason)
@@ -192,6 +514,33 @@ async def dispatch(request: LiveActionRequest) -> LiveActionResult:
         details.setdefault("blast_radius", decision.blast_radius.value)
         details.setdefault("autonomy_reason", decision.reason)
         result = result.model_copy(update={"details": details})
+
+    # ── Post-action verification ──────────────────────────────────────────
+    #
+    # The policy layer has always computed `requires_verification` for any
+    # auto-executed action at MEDIUM blast or above, and this dispatcher then
+    # discarded it: the field was never read, and PostActionVerifier had no
+    # caller anywhere outside its own test. So the product could show that a
+    # containment call was accepted, and never that containment took effect —
+    # which is the single capability the market treats as the dividing line
+    # between recommending and responding.
+    #
+    # Verification runs only for a real execution that actually succeeded. A
+    # dry run and a SIMULATED result have nothing to verify, and a failed
+    # execution is already an honest negative.
+    if decision is not None and decision.requires_verification and not request.dry_run and result.status is LiveActionStatus.SUCCEEDED:
+        if action_type is not None:
+            result = await _verify_effect(request, result, action_type, log)
+        else:
+            # Probes are keyed on ActionType, so a contracted verb outside the
+            # legacy enum has none. Say so rather than leaving the field blank:
+            # an absent `verification` key and a verified one are indis-
+            # tinguishable to a reader, and the honest answer here is that
+            # nothing checked.
+            details = dict(result.details)
+            details["verification"] = "unverified"
+            details["verification_reason"] = f"no probe is registered for '{request.capability}'; it has no ActionType to key one on"
+            result = result.model_copy(update={"details": details})
 
     log.info(
         "live_action.completed",

@@ -7,6 +7,8523 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [12.0.0] - 2026-09-27
+
+### BREAKING
+
+Two services now **refuse to serve rather than serve unauthenticated**, and one
+role loses a permission it was never meant to have. Each was a reported
+vulnerability; the upgrade action for all three is the same one command.
+
+- **The actions service returns 503 on every mutating route until
+  `AISOC_ACTIONS_SERVICE_TOKEN` is set.** It previously skipped authentication
+  entirely whenever that token was empty and `AISOC_DEV_MODE` was set — and
+  compose defaults that flag to `1` while nothing generated the token, so every
+  stock install dispatched `isolate_host`, `disable_user`, `block_ip` and
+  `run_script` to anything that could reach the port (GHSA-g4h7-p63q-r8r4).
+
+- **The realtime edge rejects every connection until
+  `AISOC_REALTIME_JWT_SECRET` is set, and its `/internal/*` routes return 503
+  until `REALTIME_INTERNAL_TOKEN` is set.** Ticket verification previously fell
+  back to a constant committed to this repository, and the `/internal/*` guard
+  treated an unset token as authorized (GHSA-4m55-xhcm-wjcr,
+  GHSA-mqjp-pcpr-7c37).
+
+- **A `viewer` token can no longer write to cases.** `cases:write` is now
+  enforced on all nine write routes in `cases.py`, where it had been enforced
+  nowhere despite being withheld from `viewer` deliberately
+  (GHSA-3r28-vqm2-6g6c).
+
+**What to do.** Run `make up` (or `make env`). `scripts/ensure_env.py` backfills
+every generated secret into an **existing** `.env`, not only a new one, so the
+documented path repairs itself and nothing else is required.
+
+**If you do not deploy with `make up`** — Helm, Terraform, or your own compose —
+generate the three values and set them on the `api`, `actions` and `realtime`
+services before upgrading. `.env.example` documents each one and which services
+must share it. A deployment that upgrades without them keeps running and stops
+responding on those routes, which is the intended failure and the reason this
+is a major.
+
+### Added
+
+- **Auto-triage now sees the last few analyst decisions on an alert of this
+  shape, and the identity behind it** (gap-closure Phase 6.3, completing the
+  three context sources).
+
+  **What this adds that organisation memory does not.** Institutional memory
+  already reads compiled statements, and compiling is the point of it: a reason
+  has to recur across independent analysts before it becomes a durable claim
+  about the estate, and that threshold should not be lowered. It also means a
+  disagreement recorded **once** is invisible there. `aisoc_analyst_feedback`
+  is append-only, one row per tagged disagreement, so it can answer "the last
+  N" at all — the override row cannot, because it is upserted per signature and
+  holds the latest decision with no history.
+
+  A decision tagged against the same **rule** is ordered ahead of one matched
+  on a shared entity, because the rule is the more specific claim.
+
+  Both sources are point-in-time under replay, on the same `TriageContextReader`
+  seam the runbooks use, and the cutoff is proven against a **live store**
+  rather than a stub — an ORM-level filter that a stub satisfies is the half
+  that has already been wrong once in this programme.
+- **A hunting agent that turns a hypothesis into a plan, and cannot write a
+  query while doing it** (gap-closure Phase 8.3).
+
+  **The gap.** Hunting was a library of hunts somebody had already written. An
+  analyst with a hypothesis that nobody had turned into a hunt had no path from
+  the sentence to the evidence.
+
+  **Why the model does not write SQL.** The obvious build is to let the model
+  emit a query and to sanitise what comes back. That makes the safety of the
+  system a property of a filter, tested against the payloads somebody thought
+  of. Instead the model fills a plan whose fields and operators are **closed
+  enums in the schema it is handed** — 17 fields, 8 operators — and
+  `hunt_plan_sql.compile_plan` renders those into SQL with every model-supplied
+  value as a bound parameter. There is no string the model can produce that
+  becomes SQL text, so injection is not filtered, it is unrepresentable.
+
+  `scripts/check_hunt_agent_boundary.py` reads the enum, the compiler and the
+  ClickHouse DDL together and fails when any of the three drifts from the other
+  two — a field added to the enum but absent from the table matches nothing
+  forever, which is a silent wrong answer rather than an error. It was proven
+  against three injected faults: an open enum, a query-shaped property, and a
+  field the DDL does not declare.
+
+  **A lake that could not answer is not zero findings.** The unavailable branch
+  carries a reason and **no `rows` key at all**, so a caller reading `rows`
+  raises rather than receiving an empty list it would report as a clean estate.
+  Findings, no findings and could not check stay three outcomes.
+
+  The route authorises on `lake:query`. `hunts:read` reads plausibly and does
+  not exist in `ROLE_PERMISSIONS`, so it would have been a silent 403 on every
+  deployment.
+
+- **The hunt corpus grew from 5 hunts to 68, and the grading that covers it
+  stopped being satisfiable by accident** (gap-closure Phase 8.4).
+
+  **The corpus.** 63 new hunts across the ATT&CK tactics and the log sources
+  AiSOC ships connectors for: Windows Security and Sysmon, Linux auditd, AWS
+  CloudTrail, GCP audit, Kubernetes audit, Okta and Entra ID, Microsoft 365
+  and Google Workspace, Snowflake, Salesforce, Slack, Zoom, Confluence,
+  GitHub and GitLab audit, Vault, Duo, Jamf, Netskope, Tailscale, osquery,
+  DNS, proxy, firewall, VPN and the AI gateway. Every one ships a positive
+  and a negative synthetic scenario and is graded by
+  `services/agents/tests/test_hunt_corpus.py`.
+
+  **What 68 means, and what it does not.** Each hunt was replayed against its
+  scenario and observed to fire. That is not a claim any of them fires on a
+  given deployment's telemetry, which depends on whether that deployment's
+  connectors emit the fields the hunt names. `hunts/README.md` says so rather
+  than leaving the count to imply the stronger claim.
+
+  **The grading was satisfiable without testing anything.** A hunt passed when
+  it fired on its positive scenario and not on its negative, and the second
+  half is free: a negative drawn from a different log source never fires on
+  any hunt, so a corpus of those reports a perfect false-positive rate while
+  grading only the hunt's aim. This is the same circularity as the roughly
+  600 detection fixtures synthesised from the rule they test.
+
+  `scripts/check_hunt_scenarios.py` closes it. It runs the production hunt
+  matcher over both scenarios and requires the negative to differ from its
+  positive in **exactly one indicator field**, that field not being the one
+  selecting the log source, with a near-miss floor beneath it. The rule is the
+  one the adversarial injection corpus already uses for its clean twins. It
+  found **8 violations on its first run against a corpus that was passing the
+  existing grading**, three of them in hunts that predate this phase: the DNS
+  tunnelling, OAuth mass-consent and anomalous role-assumption negatives each
+  differed from their positive in two clauses, so none of them said which
+  clause the hunt was actually discriminating on. All eight were rewritten to
+  invert one clause and hold the rest constant.
+
+  **`scripts/run_hunt_evals.py` now exists.** `hunts/README.md` had told
+  contributors to run it before opening a PR for months, and it had never been
+  written, so the one instruction a contributor was most likely to follow
+  failed at the shell. It is a thin wrapper over the `hunt_corpus` suite in
+  `scripts/run_evals.py` rather than a second scorer, for the reason
+  `scripts/run_model_matrix.py` is a wrapper: two scorers for one corpus drift,
+  and then two numbers describe the same thing and disagree. Its `--self-test`
+  parses its own source and asserts it imports neither the hunt engine nor the
+  loader, so it cannot score even if someone later wanted it to.
+
+- **A release policy, enforced in both directions, and a `stable` channel that
+  does not cross a major on its own** (gap-closure Phase 12.3).
+
+  **The gap.** Nothing stated what a version number meant, which tags moved on
+  their own, how long a release kept getting security fixes, or how much
+  warning a removal carried. `apps/docs/docs/operations/release-policy.md` now
+  says all four: a major only when an operator must act, `stable` alongside
+  `latest`, security fixes on the current minor and the previous one for 90
+  days after it is superseded, and a deprecation that warns at the point of
+  use one minor ahead of removal.
+
+  **The gate is two-directional**, because the one-directional gate is this
+  repository's most common failure. A major bump requires a `### BREAKING`
+  section, **and** a `### BREAKING` section requires a major bump. The second
+  arm matters at least as much: semantic versioning is the only signal most
+  automated upgrade tooling reads, and a minor is the version people let a bot
+  merge unattended, so a break announced on a minor arrives through an
+  unreviewed dependency update. `scripts/check_release_policy.py` proves each
+  arm by injecting that exact violation, and proves they are independent by
+  checking that breaking one leaves the other silent. It runs on every pull
+  request through `governance.yml` and again with `--tag` in `release.yml`
+  before any artefact is published. Eight majors below the 10.0.0 policy floor
+  carry no breaking section; they are printed as exempt on every run rather
+  than skipped quietly, because published history is not rewritten.
+
+  **`stable` is not a synonym for `latest`.** `latest` moves on every release,
+  majors included, so a deployment that pulls by tag is dragged across a
+  breaking change by a tag whose name promises the opposite. `stable` advances
+  on a minor or a patch and stops at a major until a maintainer dispatches the
+  release workflow with `promote_stable: true`. The rule lives in a shell
+  block that runs a handful of times a year, so
+  `tests/test_release_channel_tags.py` lifts that block out of the workflow
+  and executes it under bash for each combination rather than describing it a
+  second time.
+
+- **An upgrade test that carries data across the migration chain** (gap-closure
+  Phase 12.3). A fresh install applies every migration to an empty schema,
+  which is the one case that cannot go wrong. `.github/workflows/upgrade-test.yml`
+  runs on every pull request touching a migration: the previous minor's
+  **published image** applies its own chain, `scripts/upgrade_fixture.sql`
+  seeds a tenant, a user, one alert per severity tier and a case, and then
+  this tree's chain is applied over the populated schema by that same runner.
+  It asserts every migration on disk is recorded as applied, that the
+  pre-upgrade rows are still readable **by id** rather than only by count
+  (a table dropped and repopulated passes a count check), that the DML-only
+  runtime role can still read them, and that a second run applies nothing.
+  Exercised locally across 81 migrations from v11.1.0 to this tree.
+
+- **The Helm chart is published where the documentation says it is**
+  (gap-closure Phase 12.3). `apps/docs/docs/deployment/kubernetes.md` told
+  operators to run `helm show chart oci://ghcr.io/beenuar/aisoc`, and no chart
+  has ever been pushed there: the command answers `not found`. A published
+  command is a claim like any other. `release.yml` gained a `chart-publish`
+  job that packages and lints on every run so the chart cannot quietly stop
+  being publishable, re-checks that `appVersion` names images that exist,
+  pushes to `oci://ghcr.io/beenuar/charts` on a tag, and then resolves the
+  pushed chart rather than trusting the push step's exit code.
+
+- **Auto-triage now reads the tenant's own runbooks, cites the chunks it was
+  given, and stays point-in-time when a replay measures it** (gap-closure
+  Phase 6.3, knowledge-base half).
+
+  **The gap.** AiSOC has held a knowledge base since runbook ingest shipped:
+  `services/api/app/api/v1/endpoints/knowledge_base.py`, full-text indexed,
+  with a console for putting runbooks, playbooks and SOPs into it. Nothing in
+  `services/agents` had ever read it. A SOC that wrote down how it handles a
+  password-spray alert still got a verdict produced in ignorance of that
+  document. This is the sixth thing this programme has found built with no
+  caller, and like the others the fix was wiring rather than a new subsystem:
+  retrieval is the API's own query and ranking, so a chunk triage was given is
+  one an analyst searching by hand would have found.
+
+  **What shipped.** `GET /kb/runbooks/for-triage`, service-token only, takes a
+  query and an optional `as_of`, and returns the best-matching runbook chunks
+  together with how many it refused. `app/context/knowledge_base.py` is the
+  agents-side reader, reached through `TriageContextReader` like every other
+  durable context source. Up to three chunks reach the prompt, each carrying a
+  marker; the verdict's confidence basis records, per marker, the document id,
+  the title and the chunk index, so a citation resolves to the text it claims
+  to rest on rather than to a forty-chunk document. A rationale citing a
+  marker no retrieved chunk carries is named on the basis rather than left
+  reading like a citation that resolves.
+
+  **How the text is contained, and why more than a skill gets.** A tenant
+  skill is typed by one `settings:write` holder into parsed, capped fields. A
+  runbook is longer, often imported in bulk from a wiki or a vendor advisory,
+  edited by more people, and reaches the prompt as prose that routinely quotes
+  attacker output while doing its job. So a chunk gets the containment an MCP
+  reply gets: capped, fenced in the run's nonce, labelled inline as data, and
+  scanned. The scan runs on the **raw** text, and that order is load-bearing:
+  the sanitiser rewrites "ignore all previous instructions" to a redaction
+  marker, so a guard run afterwards reads a clean string and the loudest
+  payload family would have scored zero forever while the counter reported a
+  clean library. A test pinned to exactly that payload is what caught it. The
+  guard's worth is stated honestly rather than by its tuned figure: against 28
+  payloads authored after its last hardening it detects 2, so the fence and
+  the standing system rule are what hold when it misses. A flagged chunk is
+  dropped rather than demoting the case, because demoting on a poisoned
+  *library document* would hand anyone who can write a runbook a way to switch
+  off auto-close across the tenant.
+
+  **A second kind of replay freeze.** The three existing context stores are
+  small enough for a replay to capture whole. A knowledge base is not, so the
+  freeze is a cutoff the frozen reader supplies and the store applies, and the
+  store reports what it refused. That count is the whole point: a cutoff that
+  matched nothing and a cutoff that threw away fifty documents return the same
+  empty list, so without it a method note would be describing a freeze it
+  never demonstrated. A reply that names no cutoff is recorded as
+  `cutoff_not_honoured` rather than counted as frozen, because a store that
+  ignores the parameter returns a perfectly well-formed reply and the echo is
+  the only evidence.
+
+  **The gate.** `scripts/check_triage_context_freeze.py` now reads
+  `CONTEXT_FREEZE_KINDS`, which classifies every context source, and applies a
+  different rule to each kind: a cutoff source's protocol method may not
+  accept the instant from its caller, its frozen implementation must bind
+  `as_of` to the snapshot's `split_at`, and a snapshot source's frozen
+  implementation may await nothing, which is what stops a source being
+  reclassified into whichever kind its implementation happens to satisfy.
+  Twelve regressions were injected into a detached copy of the tree and all
+  twelve are caught, each required to fail with a message naming the real
+  fault. `tests/isolation/test_kb_retrieval_cutoff_live.py` runs the route's
+  own statement against a real Postgres, because every offline test of this
+  freeze proves the reader asks for a cutoff and none of them proves the store
+  applies one.
+
+- **A tenant can now teach the investigation agent what is normal in its own
+  estate, and every verdict that guidance steered says which version of it
+  steered them** (gap-closure Phase 6.1 and 6.2).
+
+  **The gap.** Investigation strategies were hard-coded. The ten built-ins
+  encode how an attack behaves in general, which is the only thing a built-in
+  can encode, and there was no way for a customer to write down the thing a
+  built-in cannot know: that the encoded PowerShell on FIN-APP-03 at 03:00 is
+  the finance reconciliation batch. A tenant with that knowledge had nowhere
+  to put it and re-learned it by hand on every repeat.
+
+  **What shipped.** A skill is a YAML document authored in the console,
+  following the business-context pattern. It carries match conditions
+  (techniques, rule ids, sources, keywords), the plan and expected pivots a
+  `Strategy` carries, plus the four things that are statements about one
+  organisation rather than about attackers: what is normal here, what verdict
+  that normality implies, what evidence has to be in hand before the verdict is
+  allowed, and what pulls the alert back to a human anyway. When a skill
+  matches it supplies the investigation plan instead of the built-in and its
+  guidance reaches the triage prompt; when none matches, selection is
+  untouched.
+
+  **Shaped like a detection rule, not like a settings page.** A skill steers a
+  verdict, so six months after a disputed auto-close "which text was steering
+  the agent that day" has to have an answer. It has an owner, a server-assigned
+  version and a required expiry, and `aisoc_tenant_skill_versions` is an
+  append-only history so the `skill@vN` recorded on the verdict resolves back
+  to the text. `version:` is refused as a document key, because two authorities
+  for what version 3 is would eventually disagree.
+
+  **The lifecycle refusals are the point.** A content edit bumps the version,
+  drops the skill to draft and detaches its reports, because a backtest is a
+  statement about specific text and carrying it across an edit is how a report
+  comes to describe something nobody is running. Activation requires a backtest
+  of the exact version being activated, and both halves of it, since a
+  candidate score with no baseline beside it is a number rather than a
+  comparison. The rule is written into a database CHECK, into the store's
+  refusal and onto the docs page, and `scripts/check_tenant_skill_contract.py`
+  fails the build if it leaves any of the three.
+
+  **The backtest is the Phase 1 replay, not a second one.** Two evaluations
+  over the same window, seed and resample count: baseline with the tenant's
+  other active skills, candidate with those plus this one. Nothing here
+  re-implements replay, scoring or reporting.
+
+  **Validation reads the tenant's real tools.** `expected_pivots` must name a
+  built-in lake pivot, a Phase 4 customer-product tool whose product this
+  tenant has connected, or a tool on an MCP server this tenant has registered,
+  enabled and allowlisted. The customer half makes the same three reads
+  `GET /agent-tools/backends` makes, so the set a skill is validated against is
+  the set the agent binds rather than a second opinion about it. When the
+  action registry is unreachable a known tool name is accepted and the response
+  says the check could not be made, because refusing would tell an author their
+  EDR is not connected when a different service was briefly down.
+
+  **Measured:** the offline eval harness is unchanged on every axis
+  (`mitre_accuracy` 0.970, macro 0.964; `alert_reduction` 0.753;
+  `investigation_completeness` 0.943; `response_quality` 1.000), which is the
+  expected result and the one worth stating: the synthetic corpus has no tenant
+  skills, so a skill-free deployment behaves byte for byte as it did.
+  `services/agents` 1390 to 1423 tests, `services/api` 2970 to 3007.
+
+- **Per-organisation white-label branding, with uploaded assets treated as a
+  security boundary** (gap-closure Phase 13.2).
+
+  **The gap.** A managed-service provider had no way to present AiSOC as its
+  own product. The name, the palette and the support contacts were the
+  platform's, in every console its customers opened and on every report it
+  forwarded to their board.
+
+  **What ships.** One row per operator organisation sets product name, colours,
+  support contacts and sender name, resolved field by field so an organisation
+  that sets a name and no colours renders its name against the platform
+  palette rather than losing the one field it configured. Applied to the
+  console shell and to the executive digest in HTML and PDF.
+
+  **Why the assets are bytes and not a URL.** The plan says stored locally and
+  never fetched from a third party, and the reason is not convenience. A remote
+  logo is an outbound request made by whatever renders it: by every console
+  that draws it, and for a PDF by the *server*, which turns a customer-supplied
+  address into a server-side request forgery primitive. The test asserts the
+  rendered report contains no external URL at all, rather than asserting one
+  particular attribute is absent.
+
+  **Why an SVG is sanitised against an allowlist.** SVG is XML with a scripting
+  model, and a logo uploaded by a customer administrator is rendered inside
+  consoles and inside reports other people open. A denylist of `<script>`
+  passes while `<foreignObject>` renders arbitrary HTML, so only drawing
+  elements and presentation attributes survive; everything else is dropped with
+  its subtree. Event handlers go by shape rather than enumeration, a paint
+  reference may only point inside the same document, and a file declaring a
+  `DOCTYPE` or an `ENTITY` is refused on a byte scan **before** parsing, which
+  removes both entity-expansion denial-of-service variants rather than bounding
+  them. Detection is on the bytes as well as the declared content type, because
+  the uploader controls that header and skipping the sanitiser is the whole
+  attack. 29 cases, written as attacks; a benign logo is asserted to survive
+  intact, because a sanitiser that removes everything is safe and useless.
+
+- **Usage metering computed from the rows that record the work** (gap-closure
+  Phase 13.3).
+
+  **The gap.** There was no per-tenant record of what a deployment had
+  actually done: alerts, triages by path, investigations, tokens, measured
+  model cost, response actions, connectors and seats.
+
+  **How it is measured, and why that shape.** Ten meters, each a `SELECT`
+  against the table holding the evidence, evaluated when somebody asks. Not a
+  counter table incremented as things happen: a counter drifts from the table
+  it summarises and nothing notices, which is what made `cases_closed_7d` and
+  `mttr_hours` wrong on real data while their tests passed. It is also what
+  makes the acceptance checkable, since a counter can only be tested against
+  itself. Every assertion in the test counts rows independently and compares;
+  the daily series summed must equal one query over the whole window, and the
+  fixture seeds an alert at exactly midnight so a closed interval would
+  double-count it. `GET /api/v1/usage/reconciliation` exposes the same
+  comparison so an operator can run it against their own rows.
+
+  **Honesty.** `events_ingested` lives in the ClickHouse lake, a `full`-profile
+  service, and reads "not measured" with the reason in both the API response
+  and the CSV header. Never `0`: zero is a measurement, and a reader who sees
+  it concludes no events arrived rather than that nothing looked. No pricing
+  logic, gated by `check_whitelabel_metering.py` reading the meter
+  declarations. Linked to the existing entitlement limits, returned alongside
+  the counts, so a usage screen and a quota screen cannot disagree about the
+  same rows.
+
+- **SCIM 2.0 provisioning, scoped by its credential and tested against two
+  identity providers that disagree with each other** (gap-closure Phase 13.1).
+
+  **The gap.** AiSOC already had OIDC and SAML, so a person could sign in from
+  a corporate directory. Nothing created the account first, kept its
+  attributes current, or ended its access when the person left. An
+  administrator did that by hand, per tenant, and a leaver kept whatever they
+  had until somebody remembered.
+
+  **What ships.** `/scim/v2` serves Users, Groups, ServiceProviderConfig,
+  ResourceTypes and Schemas with filtering and PATCH, authenticated by a
+  per-organisation bearer token stored as a SHA-256 digest and rotatable with
+  a grace window so a rotation does not take the integration down while an
+  administrator pastes the new secret across. Directory groups map onto the
+  roles `ROLE_PERMISSIONS` enforces; a group whose name resolves to nothing is
+  recorded, audited and confers no privilege, and no group name can reach
+  `platform_admin`, `admin` or `api_service`. Every operation writes to the
+  hash-chained audit log naming the credential that performed it, because the
+  actor of a SCIM change is a machine.
+
+  **How it was measured.** Not against a paraphrase of RFC 7644. Okta and
+  Entra both implement the specification and differ in five places, and
+  `test_scim_provisioning.py` carries their request shapes verbatim: `op`
+  lowercase against capitalised, a missing `path` with an object value against
+  an explicit path, member removal through a path filter against a value
+  array, `userName` omitted in favour of `emails`, and a deactivation arriving
+  as the string `"False"` rather than the boolean. That last one is the
+  consequential difference: `bool("False")` is `True`, so the obvious
+  implementation accepts the request, deactivates nothing, and returns 200
+  while the provider records the deprovisioning as successful. Both providers'
+  full sequences (create, update, group membership, deactivate) run end to
+  end, 54 tests in all.
+
+  **The gates that keep it closed.** `scripts/check_scim_contract.py`
+  (`isolation.yml`) compares the discovery documents against the route table
+  in both directions, so a capability advertised with no route and a route no
+  document advertises both fail; it asserts each of the eight mutating
+  handlers still reaches the audit helper, and that `main.py` mounts the
+  router at all. `test_scim_mounted.py` reads `app.openapi()` from the real
+  application, refusing an empty inventory before asserting membership,
+  because `include_router` does not populate `app.routes` on the pinned
+  FastAPI and an inventory assertion can otherwise measure nothing.
+  `docs/decisions/0008-scim-trust-boundary.md` records why the tenant comes
+  from the credential and can come from nowhere else.
+
+- **The investigation agent can reach the customer's own tools, and says so
+  when it cannot** (gap-closure Phase 4.1, 4.3 and 4.4). Six typed tools:
+  federated search across every SIEM a tenant has connected, and reads of
+  their EDR host record, EDR detections, identity sign-ins, cloud audit trail
+  and endpoint telemetry.
+
+  **The gap.** Deep investigation bound eleven lake pivots and four enrichment
+  calls and nothing else, so the agent could reason only over AiSOC's own
+  event lake. Anything the estate held and AiSOC never ingested was invisible,
+  and on the default `core` profile there is no lake at all.
+
+  **The model never composes query text, and that is a security boundary.** An
+  indicator an agent passes came out of a process command line, a file name or
+  a ticket body, all of which are attacker-influenced, so a model relaying one
+  into SPL, KQL or ES-QL is one injected instruction away from an arbitrary
+  query over a customer's telemetry. No tool accepts a query, a field name or
+  free text. The agent names an indicator *type* from a closed set of nine and
+  the API resolves the field per backend, from each vendor's own normalized
+  schema. Tested on the JSON schema the model is handed rather than on the
+  implementation, because the schema is what constrains a model. Defender
+  advanced hunting genuinely takes KQL, so the KQL is four named templates the
+  executor owns and an unknown template is refused before the credential is
+  read.
+
+  **Hardened at the shared choke point while we were there.** Every federated
+  translator interpolated `indicator.field` into its query language unquoted,
+  which is correct for an identifier and not for arbitrary text, and three of
+  the four interpolated the *value* unquoted for `contains`, `starts_with` and
+  `ends_with` so the wildcard would work. `Indicator.__post_init__` now
+  refuses a field name that is not an identifier, and the three substring
+  operators quote their pattern. Fixed at the one place every translator goes
+  through rather than four times, and it protects the console path too, which
+  is where a human already types a free-form field name.
+
+  **A read failure reaches the model as "could not check".** Every failure
+  path says so in words, and the tests assert the wording as well as the
+  flag, because the flag is for code and the wording is what the model reads:
+  the reason must contain "lookup failure" and "NOT checked" and must not
+  contain "no results". A genuine zero-row answer says it IS evidence of
+  absence *for the sources that answered and that window*, and a partly-failed
+  search keeps its own outcome rather than being rounded to a clean one.
+
+  **Only configured backends are advertised.** A tenant with a Splunk and an
+  Okta is offered those two tools and no EDR tools. What is not connected goes
+  into the prompt as prose, and a tenant with nothing connected gets no tools
+  plus two gap sentences, because a model offered a tool that answers
+  "no integration" burns a turn of a bounded loop and some models narrate the
+  attempt as though it returned something.
+
+  **Tool calls now reach the Investigation Ledger.** `run_with_tools` built a
+  trace and nothing carried it anywhere durable, so an investigation's own
+  record held a narrative and a pivot count with no evidence of which tools
+  produced them. Each call is now a `tool_call` ledger row with its arguments.
+  The obvious route was `InvestigatorState.log_tool_call`, and it would have
+  been a no-op: two similarly-named state classes exist and the production
+  caller passes the one with no audit log, so a version written behind a
+  `hasattr` guard would have passed a test that constructed the other.
+
+  **The acceptance bar, and the three ways it could have passed vacuously.**
+  A recorded CrowdStrike detection with Splunk and CrowdStrike mocked reaches
+  at least three pivots, and the assertion counts distinct **sources** rather
+  than tool names so three pivots on one source fails; a tool that answered
+  "could not check" is asserted absent from the pivot list so the bar cannot
+  be met by calling tools that all failed; and the ledger is asserted to hold
+  one row per call with its arguments, at sequence numbers that cannot collide
+  with the graph runner's, since `record_event` drops a conflicting row
+  silently and the ledger would still look complete.
+
+- **An investigation can now read the vendor a tenant actually runs**
+  (gap-closure Phase 4.2). Seven new read-only executors: SentinelOne agents
+  and threats, Microsoft Defender alerts and an endpoint-telemetry search,
+  Microsoft Entra ID sign-ins with the ID Protection risk record, Google
+  Workspace login audit, and AWS CloudTrail `LookupEvents`.
+
+  **The gap.** Three read verbs existed with one vendor arm each, which is a
+  CrowdStrike-and-Okta surface rather than a vendor-read surface. A tenant on
+  SentinelOne and Entra ID had the same investigation reach as a tenant with
+  no EDR at all, because the verb existed and nothing implemented it for
+  them: governed dispatch answered `executor_not_found`, which reads as a
+  broken deployment rather than as a capability nobody wrote.
+
+  **Five of the seven are new vendor arms on the three existing verbs**,
+  which is what declaring a contract per capability rather than per vendor
+  buys: they inherit the `READ_ONLY` classification automatically and cannot
+  drift low. Only the two whose subject is neither a host nor a principal
+  needed their own contract, `lookup_cloud_audit` and
+  `lookup_endpoint_telemetry`.
+
+  **A read failure is never an empty result**, and the tests assert the shape
+  rather than the intent. A host the vendor does not hold is `SUCCEEDED` with
+  `found: False`; a vendor that 5xxs is `FAILED` and carries **no** `count`,
+  `detections` or `found` key at all, because a `count: 0` reaching a model
+  is the strongest exonerating evidence there is and would be false. Entra's
+  ID Protection leg is licensed, so it may fail without taking the sign-ins
+  down and its absence reads as unknown rather than as no risk. Google
+  Workspace's 403 names the missing `admin.reports.audit.readonly` scope,
+  which is a configuration fact rather than an account with no logins.
+
+  **No caller supplies query text.** Defender advanced hunting takes KQL, and
+  these verbs are reachable from an investigation agent whose indicator was
+  lifted out of attacker-influenced alert text. So the KQL lives in the
+  executor as a closed set of four named templates, the caller passes a
+  template name plus one indicator plus a window, and an unknown template is
+  refused before the credential is even read. The accepted path is asserted
+  on the KQL that reaches the wire rather than on the argument, with a
+  hostile indicator appearing only in its escaped form. The same discipline
+  applies per grammar: OData doubles a single quote for Entra, and the
+  CloudTrail attribute key is checked against AWS's own closed vocabulary
+  rather than escaped at all.
+
+  **CloudTrail is read without adding boto3.** boto3 is not in the
+  `aisoc-actions` image (measured: `ModuleNotFoundError`, against 1.43.101 in
+  `aisoc-connectors`), and ADR-0007 has just published that image at 539 MB
+  after moving the service into CORE. `LookupEvents` is one signed JSON POST,
+  so the SigV4 signing is about sixty lines of `hmac` and `hashlib` and needs
+  nothing outside the standard library. The canonical request is pinned line
+  by line against the documented shape, `SignedHeaders` is parsed back out of
+  the header the client produced and every name asserted present on the
+  request, and the signing-key derivation is asserted sensitive to secret,
+  date and region in turn so a dropped link cannot pass as a plausible hex
+  string. **The live AWS path is unverified**: there is no funded AWS account
+  here, so a signature AWS itself accepts has not been observed, and the
+  documentation says so rather than implying otherwise.
+- **AiSOC's own MCP server gains triage verdicts, replay reports and a
+  dry-run-only action preview** (gap-closure Phase 5.6). Five new tools, 13 to
+  18.
+
+  The Investigation Ledger half of this phase was **already built**:
+  `aisoc_list_investigations`, `aisoc_get_investigation`,
+  `aisoc_replay_decision` and `aisoc_explain_step` have shipped for months.
+  Checking before building is the whole point, so it is recorded rather than
+  re-implemented.
+
+  New: `aisoc_get_triage_verdict` answers "what did AiSOC decide about this
+  alert, and should I believe it" without 30 unrelated columns competing for
+  the answer, keeps `confidence` (0 to 100) and `ai_score` (0 to 1) apart by
+  name with the scale stated, and says in words when nothing has triaged the
+  alert yet, because an absent verdict is not a benign verdict.
+  `aisoc_list_replay_reports` and `aisoc_get_replay_report` expose the one
+  number in this product measured on real data, serving the stored artefact
+  rather than re-rendering it so a withheld headline stays withheld.
+
+  **`aisoc_preview_action` previews and cannot perform.** The path it requests
+  is a module constant naming the dry-run route; `/dispatch` appears nowhere
+  in the server's source, and a test asserts that by reading the source rather
+  than by driving the handler, so a second action tool added later is caught
+  too. The API route behind it already forces `dry_run: true` server-side
+  whatever the body says. An MCP key is credential material that lives in an
+  editor's configuration file, and the distance between "preview" and
+  "perform" should not be one careless string.
+
+  **Every tool now publishes MCP behaviour annotations.** A client that takes
+  annotations seriously cannot tell "read-only" from "nobody said", and the
+  safe reading of silence is "not read-only", so a server publishing nothing
+  forces every operator to vouch for every tool by name. Seventeen of the
+  eighteen are read-only; `aisoc_run_investigation` is annotated as not
+  read-only rather than quietly marked otherwise, because that is the
+  direction of dishonesty a client cannot detect.
+
+  **The published tool count was ungated.** "13 tools" was written into six
+  documents and nothing compared any of them to the registry, while the claim
+  matrix named a CI job that pins the tool *set* and had never read a
+  document. `tests/published-count.test.ts` now compares all seven figures
+  against `ALL_TOOLS.length` in both directions, so a stale figure and a
+  deleted claim both fail.
+
+- **An MCP client, so an investigation can reach the tools a tenant already
+  runs, read-only and untrusted by default** (gap-closure Phase 5).
+
+  **The gap.** The investigation agent could reach AiSOC's own lake and
+  nothing else. Every security vendor now publishes an MCP server, and an
+  operator who has one had no way to let the agent use it.
+
+  **What shipped.** A per-tenant registry in `services/api` (migration
+  `069_mcp_servers.sql`, `/api/v1/mcp-servers`) holding the URL, a
+  vault-encrypted credential, an explicit tool allowlist, a timeout and a
+  response-size cap; and a client in `services/agents` on the official MCP
+  Python SDK, exact-pinned at `mcp==1.30.0`. Discovered tools map onto the
+  existing `Tool` dataclass as `mcp.<server>.<tool>` and are registered into
+  the existing tool loop, which is what makes them reachable from a real
+  investigation rather than from a test.
+
+  **The defaults, because an MCP server is third-party code reached over the
+  network whose replies land in the prompt that decides what the agent does
+  next.** Streamable HTTP only. stdio refused behind two separate switches,
+  because a stdio server is a local process this container would start, and
+  even then not implemented, so it is refused by name rather than silently
+  downgraded to HTTP. The tool allowlist defaults to empty, so a server saved
+  with no further thought advertises nothing. A tool the server annotates
+  `destructiveHint`, or which declares `readOnlyHint: false`, is refused
+  outright: the plan permits either a governed live action with a declared
+  capability contract or nothing at all, and since no MCP tool declares a
+  contract, the refusal names the door it would otherwise take.
+
+  **The allowlist is checked before dispatch, twice.** At discovery, where a
+  refused tool is never turned into something the model can see, and again at
+  dispatch through the same pure function over the same discovered
+  descriptor. `app/mcp/policy.py` is forbidden by gate from importing
+  anything that can open a socket, so no decision it takes can depend on
+  reaching the server, and a test hands the invoker a session factory that
+  raises on use to prove a refusal costs no network call.
+
+  **A malicious tool *description* is handled as an injection, not as
+  documentation.** The server supplies the description and the input schema,
+  and both are rendered into the prompt that chooses which tool to call, so
+  that payload arrives before any result does. The name, title, description
+  and every parameter description are scanned and a high-severity hit drops
+  the tool entirely rather than sanitising it. What survives is sanitised,
+  capped at 400 characters and marked as third-party text, and the schema is
+  projected down to `type`, typed `properties` and `required`, so `$ref`,
+  `default`, `examples` and arbitrary nesting never reach the prompt. The
+  projection is the load-bearing half, and the guard's own held-out
+  measurement is why: against 28 payloads authored after its last hardening
+  it detects **2**. It scores 0.96 on prose and 98.1% on the field-native
+  corpus it was tuned against, but an MCP server's payload is held-out data
+  by definition, so 7.1% is the figure that applies to a hostile server. The
+  docs page publishes the held-out figure beside the corpus one rather than
+  the flattering one alone.
+
+  **Results are capped on the socket, fenced with the run nonce, scanned and
+  ledgered.** The byte cap is enforced as bytes arrive rather than on the
+  parsed result, so an oversized reply is cut mid-response instead of read
+  into memory first, and a truncated result says so in words the model reads.
+  Every call, refusal and failure writes an Investigation Ledger event
+  carrying argument *names*, byte counts and the injection verdict, never
+  argument values or result text. Cost is recorded as
+  `not_applicable_no_model_call` rather than `0`, because an MCP call spends
+  a vendor's compute and no model tokens.
+
+  **The gate** is `scripts/check_mcp_client_policy.py`, wired into `ci.yml`.
+  It was proven able to fail against eight separate injected regressions,
+  including checking the annotation before the allowlist, defaulting stdio
+  on, removing the command allowlist, building a `Tool` with a raw callable
+  instead of the invoker, and deleting the SSRF guard from the connect path.
+
+  **Unverified, stated plainly.** `apps/docs/docs/operations/mcp-client.md`
+  lists the vendor MCP servers operators are most likely to have, and marks
+  every one of them unverified against a live vendor: none has been exercised
+  by this project, and the tool names given are examples to be replaced with
+  what the vendor's own `tools/list` publishes.
+
+
+- **`connectors` and `actions` now start on the default CORE profile, so the
+  investigation agent has somewhere to reach** (gap-closure Phase 4.5,
+  [ADR-0007](docs/decisions/0007-connectors-and-actions-in-core.md)).
+
+  **The gap, stated exactly.** The plan's finding was that on the profile
+  `make up` starts, the agent has no evidence source at all. The sharper
+  version is that CORE was not missing the capability, it was advertising
+  one it could not perform: `api` in CORE already sets
+  `CONNECTORS_SERVICE_URL: http://connectors:8003` and
+  `AISOC_ACTIONS_BASE_URL: http://actions:8085`, and
+  `AISOC_FEATURE_FED_SEARCH` defaults on, so federated search was enabled
+  and fanning out to a hostname that does not resolve while the live-actions
+  surface answered 502 naming two compose profiles.
+
+  **How it was measured, because CORE's 8 GB budget is not a suggestion.**
+  Images pulled fresh from GHCR and resident memory read with `docker stats`,
+  the same method as ADR-0006 on the same class of machine. `actions` is
+  539 MB of image and 45.99 MiB resident at cold start, 48.3 MiB after 40
+  hours; `connectors` is 586 MB and 71.45 MiB, 76.51 MiB after 40 hours.
+  Together **124.8 MiB, which is 1.5% of the budget**. Cross-checked against
+  `litellm` on the same host at 471 MiB, which ADR-0006 measured at 451 MiB,
+  so the method reproduces within about 4%. ADR-0006's trap was checked for
+  and is absent: `ollama` idles at 9.6 MiB and measures 2.96 GiB while
+  inferring, whereas neither service here moves more than 0.6 MiB under 100
+  requests, because both are network front ends holding no model and no
+  index. Both were also verified to boot and serve with **no configuration**:
+  `actions` answers its capability list and `connectors` all 84 connectors.
+
+  **What it does not fix, said plainly.** The lake and the graph are the
+  other half of the plan's sentence and they stay in `full`, because
+  ClickHouse and Neo4j are stateful stores with their own memory floors
+  rather than front ends, which is a different decision needing its own
+  measurement. So a CORE deployment's agent can now reach a configured
+  vendor and still cannot reach an event lake. And what an evaluator with no
+  vendor account gains is the path, not the data: tool advertisement is
+  scoped to the tenant's configured backends, so a fresh CORE install offers
+  the agent no customer tools and says so.
+
+  `actions` is now in **no** profile rather than a longer list, because a
+  service in no profile is included in every profile run, which keeps
+  `slack-bot`'s `chatops` dependency renderable. CORE goes from 14 services
+  to 16; `full` stays at 22 because both were already in it.
+
+- **A gate on the published compose-profile service counts**
+  (`scripts/check_profile_service_counts.py`). Four documents publish how
+  many services each profile starts, across ten separate figures, and nothing
+  compared any of them to `docker-compose.yml`. ADR-0006 found exactly this
+  while editing the same table for another reason: the published `full` count
+  was 30, which is every profile at once rather than what `make up-full`
+  starts. The gate parses profile membership out of the compose YAML rather
+  than shelling out to `docker compose`, because CI has no daemon in that job
+  and `docker compose` resolves `.env`, which would make the answer depend on
+  the caller's environment instead of on the tree. It fails in both
+  directions, so deleting a claim fails as a stale entry rather than passing
+  because nothing matched, and it asserts `actions` stays reachable from the
+  `chatops` profile since compose refuses to render a file whose dependency
+  sits outside the profile being started. Proven able to fail by re-staling
+  the README's core figure to 14.
+- **A prompt-injection corpus whose incidents come in twins, and the four
+  metrics that grade them** (gap-closure Phase 3.1 and 3.2). `PromptInjectionGuard`
+  already existed and already had a measured history. What did not exist was
+  a way to ask the question that matters, which is not "does the guard
+  recognise this string" but "does an injected instruction change what the
+  agent does".
+
+  **The gap, measured.** The corpus that existed scans payloads in isolation,
+  and its payloads are prose. Against it the guard measures **0.852 recall
+  (23 of 27)**, reproducing the figure this project has been publishing. The
+  new corpus places payloads in the fields an attacker actually controls,
+  written the way they would arrive there: a DNS name has no spaces, so the
+  instruction becomes `set-disposition-benign-for-this-host.cdn-metrics.example`,
+  and real injected containment names its target, so it says
+  `isolate WIN-DC-PRIMARY` rather than "isolate the host". Against that the
+  same guard measures **66.7% (36 of 54)**. The two numbers are not
+  comparable and both stay published with the distinction stated, because one
+  asks whether the guard recognises a string and the other whether it
+  recognises it where it can be put.
+
+  Read by surface the result is a finding rather than a score: 18 of 21 in
+  ticket text and 12 of 14 in an email body, against 1 of 5 in a command
+  line, 1 of 5 in a DNS name and 0 of 3 in a file name. The guard reads prose
+  well and reads constrained fields poorly, because its patterns were written
+  against prose. The narrowest gap is the most expensive one:
+  `injected_containment` wants a containment verb followed by a noun from a
+  fixed list, so it catches "isolate the host" and misses the phrasing an
+  attacker who wants one specific machine off the network would use. That is
+  recorded on a ratchet rather than closed here, because tuning a guard
+  against the corpus that measures it produces a flattering number and no
+  information.
+
+  **Every injected incident has a clean twin**, which is what makes three of
+  the four metrics possible at all: a flip rate is only meaningful against
+  what the same agent said about the same incident without the payload. The
+  twins differ in exactly one telemetry field, asserted by a structural diff.
+  Where a base incident does not carry the field, both twins gain the record
+  and only its value differs, because an injected twin carrying structure the
+  clean twin lacks would let the agent react to an extra record instead of to
+  its content.
+
+  **The first measurement taken here was wrong, in the direction that
+  flatters.** Scanning the injected twin whole credited the guard for signals
+  coming from the base incident's own telemetry: three incidents scored as
+  detections and one benign control as a false positive, in every case
+  without the guard having matched the payload. Worse, it produced 85.2%,
+  close enough to the prose corpus's 0.852 to have quietly confirmed the
+  number it was meant to challenge. A detection now requires a signal at the
+  injected field *and* no signal at that field in the clean twin, proven by
+  contaminating a base incident and asserting the pair stops counting.
+
+  **The three behavioural rates carry no number yet**, and that is
+  structural rather than editorial: an unmeasured rate holds no `value` at
+  all, so no formatter can round it to zero. They need a live model, which is
+  the weekly wet eval's job and needs a funded key that does not exist.
+
+  **Published, with what CI proves and what it does not stated on the page**
+  (gap-closure Phase 3.3). `scripts/check_injection_eval.py` is the single
+  entry point for both halves, so the per-PR gate and the weekly job cannot
+  hold two definitions of "detected". On every PR it enforces a floor on
+  guard detection, a ceiling on benign controls flagged, and an exact ratchet
+  naming every current blind spot by id, in both directions: a new miss
+  fails, and a recorded miss the guard starts catching also fails until it is
+  removed, so the list cannot decay into a description of a tree nobody
+  re-measured. It also fails when the committed benchmark page and a live
+  measurement disagree, because a figure copied into prose goes stale
+  silently and this page has published stale ones before.
+
+  What that green check proves is that a deterministic pattern matcher has
+  not regressed. What it does not prove is that a model resists injection,
+  because nothing on that path sends a payload to a model, and
+  `apps/docs/docs/benchmark.md` says so in those words rather than leaving a
+  reader to infer it. The live half runs in `wet-eval.yml`, inside the job
+  gated on its preflight, so an unconfigured repository shows *skipped*
+  rather than passed. That wiring is now asserted by a test proven to fail
+  when the gate is removed, because the workflow once reported success having
+  evaluated nothing for eight consecutive weeks.
+
+- **Shadow reconciliation now has a schedule, so a tenant whose analysts work
+  in their own SIEM accumulates a track record** (gap-closure Phase 2.1,
+  closing D15). `services/actions/app/services/shadow_reconcile.py` shipped
+  complete with eleven tests and no caller. Half of shadow mode therefore
+  worked and half of it only appeared to: agreement filled in for tenants
+  closing alerts in the AiSOC console, and a tenant closing theirs in Splunk
+  ES watched a scorecard that could never move. Phase 2's premise is that
+  autonomy is earned on a measured track record, so a track record that cannot
+  accumulate is the difference between the feature working and appearing to.
+
+  **How it was measured.** By grepping for callers of code the programme had
+  just written. The only files referencing the module were the module and its
+  own test. That is the repository's most-repeated defect shape and the check
+  its own history says to run before claiming anything.
+
+  **The shape was forced, not chosen.** `services/api` owns the vault and the
+  tenant session, `services/actions` owns the five readers and the matcher,
+  and no process can hold both because all three services package their code
+  as a top-level `app`. So the API resolves a connector's credentials and
+  posts them with a window to a new internal route, `POST /shadow/reconcile`
+  on actions, which reads and reconciles in one hop. That is the same round
+  trip `siem_writeback`, `/connectors/{id}/normalize` and `/replay/history`
+  already take, rather than a third pattern. The tenant travels on
+  `X-AiSOC-Tenant-ID` and is resolved through the vendored `tenant_scope`,
+  now in its tenth service, where a service token with no tenant header
+  resolves to an empty scope that refuses rather than widening.
+
+  **Four outcomes, because two is not enough.** A sweep that reports every
+  fault the same way turns a revoked API key into churn nobody reads. The
+  vendor's own status decides: 400, 401, 403 and 404 are permanent, name the
+  operator action, and stop that connector being polled until the connector
+  row is saved again, which is the one event that could have fixed it. A
+  timeout or a 5xx is transient and retried. A 429 has the vendor's own
+  `Retry-After` stored and honoured rather than guessed. And "nothing to do"
+  is a recorded state rather than an absence, because a sweep that silently
+  stopped and one with nothing to poll are otherwise indistinguishable from
+  outside, which is precisely how the original gap stayed invisible.
+
+  **Bounded work against somebody else's API.** Migration **068** adds
+  `aisoc_shadow_reconcile_state`, keyed per connector because two SIEMs have
+  two index lags and two credential lifetimes. Each carries a watermark that
+  advances to the latest closure actually seen rather than to the end of the
+  window asked for, so a vendor that indexes late does not have findings
+  stepped over; an empty window still advances it, minus an overlap, so quiet
+  hours are not re-read forever. A pass is capped per tick, a connector has a
+  floor between polls, and one window is capped so a connector blocked for a
+  month catches up in steps rather than asking for the month in one search.
+
+  **Default off**, per the standing rule that a feature which calls out ships
+  off. Two different people are involved: a tenant enabling shadow mode has
+  asked to be measured, and the operator decides whether the platform may
+  reach a third party on a timer. `GET /api/v1/health/shadow-reconciliation`
+  reports the subscription in every state including `disabled`, `not_measuring`
+  and `no_connector`, and reports closures read separately from closures
+  matched, because a healthy read count with zero matches is a wiring fault
+  and a read count of zero is a fact about the customer's week.
+
+  **The gate.** `test_the_deployed_lifespan_registers_the_sweep` is an AST
+  pass over `services/api/app/main.py` as it ships, in the spirit of the Phase
+  1.2 sink test: the defect being closed is "exists and nothing calls it", so
+  a test asserting a scheduler a test built would close nothing. It checks the
+  import, the task, that the task's `worker=` is the sweep's own `run_forever`,
+  and the job name the Redis lease is keyed on. It was proven capable of
+  failing by running it against `main`'s `app/main.py`. Claim matrix 167 rows
+  to 170, GATED 159 to 162.
+
+- **Replay evaluation reaches an operator: `aisoc replay`, an async API job,
+  an "Evaluate on your history" console page, and JSON, Markdown and PDF
+  export** (gap-closure Phase 1.4 and 1.5). Phases 1.1 through 1.3 built
+  readers that could list a customer's closed findings, a runner that could
+  replay them through the production triage path writing nothing, and a
+  scorer that could grade the result. None of the three had a caller. This is
+  the surface that drives them, and building it found a defect that three
+  green unit suites could not see.
+
+  **The shape was forced, not chosen.** No process can hold two of these
+  services: `services/actions` owns the SIEM credential path and the readers,
+  `services/agents` owns triage, `services/connectors` owns `normalize()`,
+  and all three package their code as a top-level `app`. So the API
+  orchestrates, which is what it already does for `/cases/{id}/investigate`
+  and for live actions, and two internal routes were added for it to drive:
+  `POST /replay/history` on actions and `POST /replay/run` on agents. Scoring
+  is the one link with no round trip, through a byte-identical mirror of
+  `packages/aisoc-benchmark` under `services/api/app/_vendor/`, because the
+  API image is built with `./services/api` as its context and nothing under
+  `packages/` exists at runtime.
+
+  **The defect the end-to-end run found.** `POST /connectors/{id}/normalize`
+  shipped in Phase 1.2 with no caller, and the client that builds its URL
+  omitted the `/api/v1` prefix the connectors service mounts its router
+  under. Every normalize request would have returned 404, so no replay could
+  have run on any deployment. The unit test covering that function asserted
+  the wrong URL and passed. It now reads the mount out of the connectors
+  service's own source with `ast` and compares in both directions.
+
+  **What the console does with a thin corpus.** No figure is rendered without
+  the count behind it: recall beside its malicious-case count, the headline
+  beside its answered-decision count, and the history read beside how many of
+  those findings carried an analyst label at all. Below the floor of malicious
+  cases the headline card reads "withheld" and prints the sentence explaining
+  why, rather than a dash or a zero. Zero would say the agent got every answer
+  wrong, which is a different fact with a different remedy.
+
+  **Reproducibility, stated precisely.** A report reproduces byte for byte
+  between two runs over the same pinned window, apart from the two wall-clock
+  latency figures, which measure the host. `strip_latency` lives beside the
+  renderer that emits that line so the two cannot drift, and is exposed as
+  `--exclude-latency` on the CLI and `exclude_latency=true` on the export
+  route. The export serves the artefact stored when the run completed rather
+  than re-rendering it, because a report re-rendered by a newer renderer is a
+  different artefact from the one the operator read.
+
+  **Measured.** Phase 1's "Done when" now holds end to end:
+  `tests/e2e/test_replay_cli_end_to_end.py` runs the CLI twice against a
+  mocked Splunk ES holding 200 recorded closed notables, through four
+  services started from the working tree, and the two reports are identical
+  as bytes. 200 findings read, 200 labelled, 60 replayed and graded, 40
+  malicious, headline printed rather than withheld. A second assertion
+  fetches both reports without the exclusion and fails if more than the one
+  latency line differs, so the comparison cannot pass on a stripped artefact
+  that hid something else. Suites: `services/actions` 767 to 780,
+  `services/agents` 1280 to 1306, `services/api` 2852 to 2877,
+  `packages/aisoc-benchmark` 57 to 62, `packages/aisoc-cli` 40 to 54.
+
+  **Migration 065**, not 064: `064_sandbox_upload_policy.sql` landed from
+  another phase while this one was in flight. Two tenant-scoped tables with
+  row-level-security policies and `aisoc_app` grants, verified applied
+  against a live `postgres:16`.
+
+  **Gates:** `integration.yml :: replay-e2e` (four services, a real database,
+  `AISOC_REPLAY_E2E_REQUIRED=1` so an unreachable database is a failure
+  rather than a skip), `ci.yml` cli job (`test_replay_command.py`), `ci.yml`
+  api job (`test_replay_evaluation.py`), `ci.yml` agents job
+  (`test_replay_route.py`), `ci.yml` actions job
+  (`test_replay_history_route.py`), and
+  `scripts/sync_vendored_benchmark.py --check`. Claim-to-gate matrix gains
+  three rows, all GATED.
+- **Autonomy promoted by a measured track record, not by a settings toggle**
+  (gap-closure Phase 2.3). Phase 2.2 made agreement measurable. This is what
+  the measurement is for.
+
+  **The gap.** A tenant's autonomy posture was a number somebody typed. The
+  L0 to L4 tier, the per-action thresholds and the force-auto override were
+  all settings, and nothing anywhere connected what the agent had actually
+  got right to what it was allowed to do unattended.
+
+  **How it works.** A tenant asks for a capability, either auto-closing an
+  alert class or raising a response verb's autonomy tier, and the evidence
+  decides. Granting requires a configurable minimum sample (100 decisions by
+  default, at least 30 of them closed as malicious), 95% agreement over
+  answered decisions, 90% recall on malicious, an abstention rate at or below
+  30%, and a trailing slice of recent decisions that is not already in
+  decline. Every check runs and every failure comes back together: an
+  operator told one thing at a time fixes it, re-asks, is told the next
+  thing, and overrides out of frustration rather than on the merits.
+
+  **The four refusals it exists to make.** Too few decisions. Enough
+  decisions but too few malicious ones, which a real queue produces by itself
+  because it is mostly false positives, and where agreement says only that
+  the agent recognises noise. Agreement that is high only because the agent
+  abstains, closed by three independent guards: agreement's denominator
+  excludes abstentions so declining cannot inflate it, the abstention rate is
+  capped, and malicious recall counts an abstention as a miss. And drift that
+  arrives gradually, which a 30-day average absorbs: 99% for three weeks and
+  70% this week still posts about 95%, so the trailing 50 decisions are
+  scored separately and either one falling below the floors demotes.
+
+  **Demotion is automatic and is not the mirror of promotion.** Standing
+  grants are re-checked whenever they are read. The demotion floors sit below
+  the promotion thresholds on purpose, because equal values would flip a
+  grant on every decision that crossed the line and fill the audit log with
+  churn nobody reads. Promotion refuses an unmeasured rate, since "not
+  measured" must never be read as "met the threshold"; demotion ignores one,
+  since a week with no malicious alert is not evidence the agent got worse
+  and revoking over an empty denominator would make quiet weeks dangerous.
+
+  **An override stays visibly an override.** A gate with no override is a
+  gate that gets worked around by people who then stop telling you, so an
+  operator can grant over a refusal with a stated reason. It lands as a
+  different audit action (`autonomy:overridden`), a constrained `source`
+  column on the grant row, the waived refusals inside the evidence snapshot,
+  and an amber label on the scorecard. The source is derived from the gate's
+  own verdict and `evaluate_promotion` takes no override argument, so no
+  caller can have an override recorded as earned. An override is re-checked
+  and demoted on the same floors: it means "I accept this today", not "stop
+  measuring".
+
+  **The snapshot is the point.** Every transition is written to the
+  hash-chained audit log with the numbers frozen: the counts and the rates,
+  the thresholds by value so a later retune does not rewrite past
+  justifications, the window as absolute timestamps, the first and last
+  decision id so the rows can still be found, the models that produced the
+  verdicts, and a digest of the rules that judged it. A recomputed
+  justification would describe a different world while looking authoritative
+  doing it.
+
+  **What a track record cannot unlock.** A grant raises the tier ceiling to
+  L3, which permits MINIMAL, LOW and MEDIUM blast radius, and stops there.
+  Agreement on triage verdicts is evidence about the agent's judgement and is
+  not evidence that a high-blast containment was the right call. The
+  capability contract still applies on top, so a verb declared `analyst` or
+  `mandatory_human` stays gated however good the numbers are.
+
+  **The gates.** Five new claim-to-gate rows, taking the matrix to 164 rows
+  and 156 GATED. The phase's "Done when" runs against a real Postgres in
+  `integration.yml` rather than being reasoned about: 13 tests seed recorded
+  decisions, refuse a tenant at 20, grant it at 150, inject disagreements and
+  watch the demotion land, then replay the promotion and the demotion through
+  `audit_hash.verify_chain`. The live half exists because the aggregate SQL
+  and the evaluator agree by convention, and a convention is what drifts.
+  Migration `067_autonomy_grants.sql`. Documented at
+  `apps/docs/docs/operations/shadow-mode.md`.
+
+- **Shadow mode on the live queue, and agreement measured against your own
+  analysts** (gap-closure Phase 2.1 and 2.2). Phase 1 made a customer's closed
+  history gradeable. This makes the live queue gradeable too, which is the
+  half that has to exist before autonomy can be earned rather than switched
+  on.
+
+  **The gap.** Nothing measured whether this platform's verdicts matched the
+  people using it. The published benchmark scores a synthetic corpus that is
+  balanced by construction; a real queue is mostly false positives, so an
+  agent that calls everything benign scores well on one and is worth nothing
+  on the other. An operator deciding whether to let the agent act had no
+  figure taken on their own alerts.
+
+  **How it was measured.** Shadow mode is per tenant and per alert class. For
+  an enabled class, triage runs exactly as it would in production and then
+  acts on none of it: no disposition set, no auto-closure, no writeback, no
+  approval raised, no outcome prior recorded, no escalation. It still writes
+  the ledger run, the `ai_*` columns and a decision row, and it still bills
+  the spend, because a shadow run is the product running rather than a
+  measurement the tenant asked for. When an analyst later closes the alert in
+  AiSOC, a bounded sweep matches the closure to the decision it grades and the
+  pair becomes evidence. The reader and the matcher for closures made in the
+  customer's own SIEM ship here too, reusing the Phase 1.1 readers unchanged,
+  but **nothing calls them on a schedule yet**, so that half is not automatic
+  and the documentation says so in those words rather than leaving an operator
+  to work it out from an empty scorecard.
+
+  **The property the whole thing rests on.** `alerts.disposition` is the
+  analyst's column and it is the column agreement is read back from. A shadow
+  verdict landing there would mean the agent filled in the answer it was
+  about to be graded against, and every alert nobody explicitly re-disposed
+  would score as perfect agreement. `persist_auto_triage` grew a `shadow`
+  flag, and the guard sits in the SQL (`SET disposition = CASE WHEN $10 THEN
+  disposition ELSE $3 END`) rather than in the caller, so a future code path
+  that forgets to force `auto_closed` off still cannot close an alert it was
+  only meant to observe.
+
+  **Agreement is computed over answered decisions only.** This is the part a
+  plausible implementation gets wrong. If an abstention counted as "not a
+  disagreement", an agent that answered a tenth of the queue confidently and
+  routed the rest to a human would post a near-perfect record on a population
+  it never attempted. Declining removes a decision from the numerator and the
+  denominator together, so the rate does not move; the abstention rate does,
+  and it is reported beside it. Recall on malicious runs the other way, with
+  every true positive in its denominator whether answered or not, because an
+  alert routed to a human was not caught by the agent. A rate with no
+  denominator reads "not measured", never 0, and every rate travels with the
+  count it was computed over.
+
+  **Both the window and the slice inside it.** A 30-day average is where a
+  gradual decline hides: 99% for three weeks and 70% this week still averages
+  about 95%. Every surface shows the trailing 50 decisions beside the window,
+  and the trailing slice is a count rather than a date range so it means the
+  same thing at ten alerts a day and at ten thousand.
+
+  **Reuse rather than rebuild.** The closure readers are Phase 1.1's five,
+  unchanged, including their rule that a vendor label outside the taxonomy
+  becomes `unlabeled` and is excluded from accuracy rather than guessed at.
+  The metric definitions are Phase 1.3's, and "uses the Phase 1 metrics" is
+  now enforced rather than asserted: `check_replay_contract_parity.py` was
+  extended from three trees to four and compares `GRADED_DISPOSITIONS`,
+  `ABSTENTION_VERDICTS`, `MALICIOUS` and `UNLABELED` in both directions. The
+  shared rules module is vendored into `services/api` byte-identically
+  (`sync_vendored_autonomy_evidence.py --check`), because a safety control
+  defined twice is off in whichever copy is more generous.
+
+  **The gates.** Three new claim-to-gate rows, taking the matrix to 159 rows
+  and 151 GATED. The parity gate was proven capable of failing by drifting
+  each collection in turn and watching it fire, rather than by having never
+  fired. Migration `066_shadow_autonomy.sql` adds `aisoc_shadow_mode` and
+  `aisoc_shadow_decisions` with RLS policies carrying the fail-open arm the
+  cross-tenant workers need, `FORCE`, and `aisoc_app` grants. Surfaced on the
+  SOC operations dashboard and on the autonomy scorecard; documented at
+  `apps/docs/docs/operations/shadow-mode.md`, including what the numbers are
+  not, which is a measure of agreement with your analysts rather than of
+  correctness.
+
+- **Replay evaluation: the production triage path, run over a customer's own
+  closed findings, writing nothing** (gap-closure Phase 1.2 and 1.3). Phase
+  1.1 made an operator's analyst labels readable. Nothing could grade against
+  them, and the obvious way to build that grading is the wrong one: a second
+  triage implementation would measure the evaluation harness rather than the
+  product, and would diverge from it the first time anybody changed a prompt.
+
+  **The gap, and how it was closed.** `FusedAlertTriageWorker.triage` could
+  not run without writing. It recorded the verdict to the Investigation
+  Ledger and the `alerts` row, wrote a per-signature outcome prior, queued
+  approvals, cached the verdict for deduplication and pushed the disposition
+  back to the source SIEM, all inline. Persistence is now injected through
+  `app/workers/triage_persistence.py`: `LiveTriageWriter` is the default and
+  does exactly what the worker used to do, and `ShadowTriageWriter` counts
+  each call and performs none of them. There is no `if replay` on the hot
+  path, so there is nothing to drift. `CostTracker` grew a `persist` flag for
+  the same reason: a replay must measure spend and must not bill it.
+
+  **Point-in-time context, because the test window must not answer itself.**
+  Production writes every verdict back as an outcome prior and reads that
+  prior *before* triage, so in a naive replay the verdict on one finding
+  auto-closes the next finding with the same evidence and the evaluation
+  grades an answer it supplied itself. The deduplication cache does the same
+  thing one layer earlier and leaves no trace in either store. Organisation
+  memory and outcome priors are now captured once at the 70/30 time split and
+  served from that snapshot for the whole run, and rows recorded after the
+  split are dropped from it.
+
+  **Scoring extends `packages/aisoc-benchmark` rather than standing beside
+  it.** The hallucination machinery is the existing
+  `_INDICATOR_PATTERNS`, so an indicator counted here is one the synthetic
+  corpus grader would also count. New: per-class precision and recall with
+  malicious recall first, a confusion matrix, abstention rate, reliability
+  bins with an expected calibration error, per-rule and per-source
+  breakdowns, and seeded bootstrap confidence intervals. Below 30 malicious
+  cases the report prints the count and refuses a headline accuracy, because
+  on a queue that is almost entirely false positives an agent that calls
+  everything benign scores well and the figure would describe the queue. A
+  rate with no denominator reads "not measured", never 0.
+
+  **Measured:** the `services/agents` suite goes from 1252 to 1280 passing,
+  `packages/aisoc-benchmark` from 35 to 57, and `services/connectors` from
+  880 to 886. Two runs of a 20-finding replay on the deterministic tier
+  produce identical decisions on every field but wall-clock latency, and two
+  renderings of one score are byte-identical.
+
+  **Gates:** `ci.yml` agents job (`test_replay_shadow_no_writes.py`,
+  `test_replay_leakage.py`), `ci.yml` benchmark job
+  (`test_replay_metrics.py`), and a new
+  `scripts/check_replay_contract_parity.py` wired into `ci.yml`, which
+  compares the finding shape and the disposition taxonomy across the three
+  trees that hold them and cannot import one another, in both directions. The
+  leakage tests each carry a sensitivity half that runs the unprotected
+  configuration and asserts it leaks, so the file cannot go quietly green
+  over a property it has stopped testing. Three claim-to-gate rows; the
+  matrix goes 148 rows to 151, GATED 140 to 143, NO GATE stays 0.
+
+- **File and URL analysis behind one provider contract, with uploading a
+  customer file off by default.** AiSOC could enrich an IP, a domain and a URL
+  and had nothing at all for a file hash: `services/enrichment` fans out to
+  five threat-intel providers, none of which analyses a file, and the phishing
+  triage route read an attachment's name and never its contents. The gap was
+  measured by reading the tree, not estimated: no module under `services/`
+  contained the words sandbox, detonation or CAPE in an executable sense, and
+  `AlertEnricher._IOC_FIELDS` mapped `file_hash` to the same generic lookup as
+  an IP.
+
+  `SandboxProvider` covers hash lookup, file submission, URL submission,
+  polling and a report. The interface owns the vocabulary (a verdict, a score
+  0-100, signatures, IOCs and an ATT&CK mapping) and each provider maps its
+  own payload onto it, so the first adapter wired does not become the de-facto
+  schema. Three ship: **CAPEv2** as the open-source reference, which runs on
+  the operator's own network and is therefore the one that survives air-gapped
+  mode; a **mock** that analyses nothing and knows nothing until a test seeds
+  it; and **MalwareAnalyzer** as the first commercial adapter.
+
+  **Absent is not zero, and this is the field that proved it necessary.** A
+  recorded MalwareAnalyzer report carries `attackTechniques: []` beside
+  `behavior.analyzed: false`. The list is empty because the file type could
+  not be identified and no guest was ever chosen, not because the sample
+  exhibits no techniques. An `UNAVAILABLE` sentinel keeps "the provider does
+  not compute this" distinct from "the provider computed it and found none",
+  and the report carries the stage's own reason so an analyst asking why a
+  section is blank gets an answer instead of a guess. A missing score reads
+  `unavailable`, never `0`.
+
+  **Uploading is a disclosure and is modelled as a decision.** Hash lookup runs
+  first, always, because a digest discloses nothing and a hit means the upload
+  is unnecessary rather than forbidden. Uploading is then off by default, per
+  tenant *and* per provider, since consenting to a sandbox in your own rack says
+  nothing about a hosted service. It is recorded with who agreed and which version
+  of the disclosure text they saw, and refused outright in air-gapped mode for
+  any provider that is not local. Migration `064` adds both tables with
+  row-level security, the fail-open arm the cross-tenant workers need, and
+  `aisoc_app` grants. Refusals are logged as well as uploads, because "nothing
+  was uploaded, the hash was already known" and "nothing was uploaded, this
+  tenant has not consented" are the two answers an operator actually needs.
+
+  **The consent text says `public` because the service does.** A stored
+  MalwareAnalyzer report carries `visibility: "public"` and `tlp: "clear"`, so
+  an upload there is a disclosure to the internet rather than to a vendor. The
+  operator-facing text says so in those words. The vendor's own web client
+  sends a `visibility` field and offers `private`, but pins `public` and
+  disables the control without a signed-in account, so AiSOC requests the
+  configured visibility and keeps describing the outcome as public until an
+  operator sets `MALWAREANALYZER_PRIVATE_SUBMISSIONS_CONFIRMED=1`. A key alone
+  does not flip that wording: an unverified assumption must not rewrite the
+  sentence somebody agrees to before disclosing a customer file.
+
+  **Authentication is supported and labelled unverified, because it could not
+  be determined.** The service publishes "No API key required" and every call
+  works without one. There is an authenticated surface, and the vendor's client
+  sends `Authorization: Bearer`, which is why that is the default here. But a
+  bogus `Bearer` and a bogus `x-api-key` produce byte-identical `401`s and the
+  CORS preflight reflects any header asked for, so neither confirms the scheme
+  for a minted key. The header name and prefix are configurable, no key is
+  required, and the provider reports `authentication_is_verified = False` so
+  the settings surface shows a caveat rather than a tick nobody earned.
+
+  **A failure reaches the model as "could not check".** A provider that times
+  out, refuses authentication or returns something unparseable produces
+  `outcome: could_not_check` with the reason attached and no report at all. A
+  pending analysis is equally distinct from a clean one. The agent gets one
+  tool, `lookup_file_hash`, which cannot upload: an upload is governed by a
+  consent an operator recorded deliberately, and that decision does not belong
+  behind a sentence a model chose to emit.
+
+  Wired into file-hash enrichment, into `POST /phishing/submit` via
+  `attachment_hashes` (digests only, for the same reason), and into the agent
+  tool registry.
+
+  Gated by `scripts/check_sandbox_upload_policy.py` in `ci.yml`, which drives
+  the real policy over all 24 combinations of provider class, air-gap, consent
+  and hash-known, requires air-gap and a known hash to each outrank consent,
+  and reads the AST for the three shapes that would make those runtime checks
+  vacuous: a consent-shaped flag defaulting to `True`, `evaluate_upload` called
+  before `lookup_hash`, and an `except` block constructing a report. It was
+  proven against an injected violation of each rule rather than only against
+  the tree that satisfies them, and it refuses a tree with no content.
+
+  No file was uploaded to any third party while building this. The recorded
+  fixture is a GET by hash for the published EICAR test file; every
+  submit and poll fixture is hand-written and labelled as such.
+
+- **Closed-finding history readers: the analyst labels a replay evaluation
+  grades against** (gap-closure Phase 1.1). AiSOC could already push a verdict
+  into somebody else's SIEM. It could not read back the findings a customer's
+  own analysts had already closed, so there was no way for an operator to
+  measure triage against their own decisions on their own data before being
+  asked to trust it. The published benchmark is substrate self-consistency on
+  a synthetic corpus, which answers a different question.
+
+  Five readers now list closed findings in a time window, each row carrying
+  the analyst's disposition, their reason, who closed it and when:
+  `SplunkClient.list_closed_notables`, `SentinelClient.list_closed_incidents`,
+  `ElasticClient.list_closed_signals`, `QRadarClient.list_closed_offenses` and
+  `DefenderClient.list_resolved_alerts`. They extend the clients in
+  `services/actions`, which already own the credential path and already hold
+  the writeback going the other way.
+
+  **The rule that carries the value is the refusal to guess.** Vendor labels
+  map to the canonical taxonomy in one place,
+  `app/services/alert_history.py`, rather than five places that could disagree
+  about what "benign positive" means. Anything outside that taxonomy becomes
+  `unlabeled` and is excluded from accuracy. That is not an edge case: Splunk
+  ES ships dispositions literally named "Other" and "Undetermined", and
+  Sentinel and Defender both ship an explicit `Undetermined` or `Unknown`
+  classification. An analyst who picked one of those said they did not know,
+  and folding it into `true_positive` because the finding happened to be
+  closed would manufacture agreement out of an admission of uncertainty.
+
+  Two vendor-specific decisions are worth stating rather than burying.
+  Elastic Security ships no disposition field at all: closing a signal records
+  no reason, so the honest reader returns `unlabeled` unless the deployment
+  has adopted a workflow tag, and the convention it reads is documented rather
+  than assumed. QRadar's "Non-Issue" maps to `benign` and not
+  `benign_true_positive`, because it makes no claim about whether the rule was
+  right, which is the distinction `benign` exists to carry.
+
+  **Measured:** 30 new tests drive each reader's real HTTP path against
+  vendor-shaped payloads with a mock transport, so a wrong endpoint, a wrong
+  filter or a parser that fails on the documented response shape is caught
+  here rather than on a customer's history. The `services/actions` suite goes
+  from 737 to 767 passing.
+
+  **Gate:** `ci.yml` actions job (`test_alert_history.py`), with a new
+  claim-to-gate row. The assertions that hold the claim are the negative ones:
+  every vendor's explicit "I do not know" is asserted to land on `unlabeled`,
+  two conflicting Elastic tags yield `unlabeled` rather than a coin flip, and
+  `unlabeled` is asserted not to be a member of `CANONICAL_DISPOSITIONS` so
+  nothing downstream can score it as a verdict. `ClosedFinding.__post_init__`
+  refuses a disposition that is neither canonical nor `unlabeled`, so a mapper
+  cannot introduce a third vocabulary. An unparseable close time raises rather
+  than defaulting to now, because a silently wrong close time would put a row
+  on the wrong side of the train/test split and leak the answer into its own
+  evaluation.
+
+- **`scripts/check_route_shadowing.py`**, the breadth half of the same
+  question. The runtime check needs a service's whole driver stack importable
+  and so can only speak for one service; this is one AST pass over `services/`
+  covering all thirteen, 628 routes in 138 files. It is the weaker instrument
+  and says so in its own output: it pairs routes within a module and router,
+  and a parameter carrying a convertor is counted and named as deferred to the
+  runtime check rather than being judged or silently dropped. Routes whose path
+  is not a string literal are counted too, because the first draft of the fix
+  used a shared constant and the gate went on printing OK while skipping the
+  very pair it exists for.
+
+### Changed
+
+- **npm publishing is prepared for trusted publishing (OIDC), token-free**
+  (gap-closure Phase 12.4). PyPI already used it. npm's equivalent is
+  configured on a package's settings page, and a package that has never been
+  published has no settings page, so unlike PyPI there is no pending-publisher
+  path: the first upload of each package needs a token and every upload after
+  it does not. `release.yml` and `publish-cli.yml` now take the OIDC path when
+  the `AISOC_NPM_TRUSTED_PUBLISHING` repository variable is `true`, fall back
+  to `NPM_TOKEN`, and explain honestly when neither is configured. Three
+  things make that path work and each fails with a bare `ENEEDAUTH` if missed:
+  trusted publishing needs npm 11.5.1 or later and Node 22 ships npm 10, so
+  the workflow upgrades npm on that path; npm matches the **workflow
+  filename** exactly, so `aisoc` needs a second publisher registered for
+  `publish-cli.yml`; and provenance is generated automatically on the OIDC
+  path, so `--provenance` must not be passed. The one-time registry steps are
+  recorded as maintainer-only in `GAP_CLOSURE_PROGRESS.md` and in
+  `docs/operations/publishing.md`. **No package has been uploaded and none of
+  the eight is published.**
+
+- **A skill is a fourth context store, so the replay freeze grew to cover it,
+  and the one thing that bypasses the freeze now has to say so** (gap-closure
+  Phase 6.2).
+
+  Tenant skills carry `activated_at`, so unlike organisation-memory statements
+  they can be tested against the replay split and are: a skill activated after
+  the split never reaches a replayed prompt. The exception is a skill backtest,
+  which exists to apply a candidate to a window that closed before it was
+  written. Freezing it out would measure nothing and applying it silently would
+  publish an accuracy number an author could raise by restating the labels, so
+  the candidate travels in `ContextSnapshot.skills_under_test`, and the report's
+  method note names it and carries the caveat that the figure describes that
+  window rather than forecasting new alerts.
+
+  `scripts/check_triage_context_freeze.py` is the new control and it is the one
+  that matters for what comes next: a verdict may depend on durable state only
+  through `TriageContextReader`, because that protocol is the seam the freeze
+  acts on. It requires both readers to implement every declared source and
+  every snapshot store to be filtered by `capture_context` and to publish its
+  kept and dropped counts. It was proven against seven injected regressions
+  rather than observed passing, and the seventh found a real hole: a substring
+  match over the method note passed when `skills_frozen` was deleted while
+  `skills_dropped_after_split` remained, leaving a note that said what was
+  thrown away and never what was kept.
+
+- **The injection benchmark led with the number that describes the guard least.**
+  Both the tuned and the held-out detection rates were published, but the tuned
+  98.1% came first, followed by a per-surface table reading 21/21 and 14/14, and
+  the held-out 7.1% sat below it. A reader who stopped there left with the rate
+  the guard scores against payloads it was hardened for, which is the one case an
+  attacker does not present. The generated block now opens with the held-out
+  rate and the 91-point gap, and says plainly that the gap measures how much of
+  the hardening was pattern-fitting rather than threat coverage. Both rates are
+  still published, tuned first for continuity with earlier runs. This is the same
+  rule the unmeasured fidelity floors already follow: lead with the weaker
+  measurement and let the stronger one qualify it.
+
+### Fixed
+
+- **Five surfaces kept publishing 14 CORE services after ADR-0007 moved it to
+  16, and the gate that exists for this could not see them.** Two were the
+  landing page and the FAQ, so the wrong figure was the one a reader met first.
+  `check_profile_service_counts.py` validated a hardcoded list of ten sites
+  against `docker-compose.yml` and never asked the tree whether anything else
+  published the number, so a count added to a file the list does not name was a
+  count the gate never read. It reported "10 published figures agree" while
+  five disagreed.
+
+  The exact list stays, because the reasoning behind it is right: a gate that
+  guessed which integers were claims would flag prose forever. What was missing
+  is the other direction. `unregistered_mentions()` now finds anything that
+  publishes a service count and fails unless it is registered or exempted on
+  purpose, so a new surface must join the list rather than escape it. The five
+  are registered and the gate now checks fifteen sites; the exemptions are
+  release history, ADRs that state the count they decided, and two files
+  counting something other than a compose profile.
+
+  Verified by running the repaired gate against the pre-fix tree, where it
+  names all five.
+
+- **A deactivated user's API keys kept working, so deprovisioning ended
+  sessions and not programmatic access** (found while building Phase 13.1).
+
+  **The defect.** `_resolve_api_key` looked up a key's owning user with
+  `User.is_active == True` and, when that returned nothing, fell through with
+  `role = "api_service"` instead of refusing. A key belonging to a deactivated
+  principal therefore went on authenticating indefinitely, under a generic
+  role, with nothing in the request or the logs looking wrong. Deactivating an
+  account stopped that person's sessions, which is what anyone testing it
+  would have checked, and left every credential they had minted for themselves
+  live.
+
+  **The half that was already sound, and its limit.** `get_current_user`
+  re-reads `is_active` on every request, so a session stops at the next call
+  rather than at the next token expiry. What it cannot do is survive
+  re-activation: an access token minted before the deactivation is still
+  inside its expiry window and resumes working the moment the row flips back.
+  Access and refresh tokens now carry `iat`, `users.sessions_revoked_at`
+  records the cutoff, and a token issued at or before it is refused however
+  active the principal currently is. A token carrying no `iat` predates the
+  claim and is treated as revoked whenever a revocation exists, so credentials
+  minted before this change fail closed rather than outliving the revocation
+  meant to end them. The refresh path checks it too, and matters more there: a
+  refresh token outlives an access token by days.
+- **A CISA KEV entry is now checked against the tenant's own vulnerability
+  findings** (gap-closure Phase 8.2).
+
+  A CVE takes a different path from every other indicator, and the reason is
+  the point. A hash or an address appears in event telemetry, so "have we seen
+  this" is a question for the event lake. A CVE never appears there, so
+  sweeping the lake for `CVE-2024-3400` would return zero on every tenant
+  forever while looking exactly like a sweep that worked. The router sends a
+  vulnerability to the exposure check instead, and records that as a decision
+  rather than leaving it as an omission.
+
+  Exposure means an **unremediated finding in the tenant's own vulnerability
+  data** whose CVE matches. Inferring it by matching the catalogue's vendor and
+  product strings against an asset's operating system field is deliberately not
+  done: that produces a plausible-looking answer built on string similarity,
+  and a case task an analyst has to disprove costs more than no task, because
+  the second one they disprove is the last one they read.
+
+  A tenant with no vulnerability data is told exposure **could not be checked**,
+  never that they are unaffected. `checked` and `exposed_asset_count` are
+  separate fields and `exposed` requires both, so a caller reading the result
+  cannot render an unscanned tenant as clean. The task body also says the count
+  is a floor rather than a total, because assets with no scan coverage cannot
+  appear in it.
+
+  A match additionally sets `is_exploited` on the matching findings. CISA is a
+  better source for that field than a scanner that has not caught up, and it is
+  the one write on this path that is not a case task.
+
+  Dedup shares the `retro_hunt_sightings` ledger under indicator type `cve`, so
+  the catalogue republishing its whole contents on every fetch opens one task
+  rather than one a day. It is not charged against the sweep budget: two
+  indexed Postgres queries are not a warehouse scan, and charging them against
+  a budget sized for the latter would starve the cheaper check that has the
+  clearer action attached to it.
+
+- **The `NEW_IOC` events the threat-intel pipeline has always emitted now have
+  a consumer** (gap-closure Phase 8.1).
+
+  **The gap.** `services/threatintel/app/feeds/pipeline.py` publishes a
+  `NEW_IOC` event for every newly-seen indicator. A grep for the string across
+  the repository returned the emit site, the plan, and nothing else. Every
+  indicator the CISA KEV catalog, MISP, OTX and TAXII feeds produced went into
+  three stores and onto a Kafka topic that no process subscribed to, so a
+  customer whose estate contained a published indicator was never told.
+
+  **A trap found while closing it.** The pipeline's constructor defaults
+  `kafka_topic` to `threat-intel-events`, and `services/threatintel`'s lifespan
+  overrides it with `KAFKA_TOPIC_THREAT_INTEL`, which is `aisoc.threat_intel`.
+  The constructor default is unreachable in any running deployment. A consumer
+  written against the name in the signature would have subscribed to a topic no
+  producer writes, consumed nothing, logged nothing, and kept a healthy
+  container indefinitely. `check_ioc_lake_mapping.py` compares the producer's
+  setting with the consumer's so the two cannot drift.
+
+  **What was built.** A retro-hunt sweeps each opted-in tenant's recorded
+  history for a published indicator, over the event lake and, through the
+  Phase 4 typed indicator search, any SIEMs that tenant has connected. Off by
+  default at the deployment level and again per tenant, because a sweep costs
+  warehouse time and, where it reaches a connected SIEM, possibly money.
+
+  **Why one indicator cannot open a thousand alerts.** The sweep query is an
+  aggregate: it returns a sighting count, first and last sighting times, and
+  bounded distinct sets of hosts, users and connectors, so there is no code
+  path that yields a row per match. On top of that, `retro_hunt_sightings` has
+  a UNIQUE constraint on (tenant, indicator type, indicator value), so a feed
+  republishing an indicator daily updates a counter instead of alerting daily,
+  and the alert carries an idempotency key that the `alerts` table already has
+  a per-tenant partial unique index on. One of those stops the alert being
+  attempted and the other stops it landing.
+
+  **How the mapping was proven rather than asserted.** An indicator type has to
+  be searched in a column the lake writer actually fills, and this repository
+  has twice shipped rules matching fields nothing emitted. Every mapped column
+  is annotated with the OCSF path `lake_writer.event_to_row` reads to populate
+  it; `scripts/check_ioc_lake_mapping.py` reads that writer's source, the
+  ClickHouse DDL and the three threat-intel clients and fails on any
+  disagreement; and `tests/isolation/test_retro_hunt_live.py` drives a real
+  OCSF event through the real writer into a live ClickHouse and runs the real
+  query generator against it.
+
+  **The first version of that live test was vacuous, and the fix is the
+  interesting part.** Dropping `is_ip` from both IP columns was injected and
+  all eleven tests still passed, because the `iocs` array column carries the
+  address as a plain string and matched through the OR beside the typed
+  column. The test now probes **each mapped column on its own** and compares
+  the set that matched against the set that should, which does fail when a
+  column is pointed at something the writer does not fill. Measuring that also
+  corrected a claim this changelog would otherwise have carried: ClickHouse
+  coerces a string literal when comparing against an `IPv6` column, so
+  `toIPv6()` is explicitness about the stored value being the IPv4-mapped form,
+  not the difference between matching and not.
+
+  Three deliberate refusals are recorded rather than implemented: a URL is not
+  swept in the lake because there is no URL column and a scan of the compressed
+  raw payload would return a confident zero on connectors that leave it empty;
+  a CVE is not swept against telemetry because it does not appear there; and a
+  feed type nobody has mapped is refused by name and counted rather than
+  defaulted to a plausible one.
+- **Throughput and latency are now measured end to end, against the deployment
+  rather than against one function** (gap-closure Phase 12.1 and 12.2).
+
+  **The gap.** The only performance evidence in the tree was
+  `scripts/perf/throughput_harness.py`, which times `promote_normalized_event`
+  in one process. That is the right shape for a regression floor on the
+  CPU-bound stage and it opens no socket, serialises nothing to Kafka and
+  writes no row, so it could not answer what the platform sustains. Nothing
+  published an events-per-second figure, an event-to-alert latency, a consumer
+  lag or a dead-letter rate at all.
+
+  **How it was measured.** `services/demo-producer` gained a `--load` mode
+  that pushes one deterministic event shape carrying a run id, a sequence
+  number and the send time in the title, with a distinct host per event so the
+  fusion correlation key does not collapse thousands of events into a handful
+  of alerts. `scripts/perf/load_harness.py` drives it against the real ingest
+  endpoint with a real credential, then reads the `alerts` table and times each
+  event to the row it became, correcting for the measured offset between the
+  producer's clock and the database's rather than assuming they agree.
+
+  On an Apple M5 Max with 8 CPUs and 15.6 GiB allocated to Docker, on
+  2026-09-27: a single-host Compose stack drained **176.9 alerts/s** at
+  saturation, and at a paced 80 events/s the event-to-alert latency was
+  **p50 976 ms, p95 1,091 ms, p99 1,156 ms** with consumer lag at zero. A
+  three-node kind deployment of the Helm chart drained **214.0 alerts/s** and
+  ran **p50 982 ms, p95 1,317 ms, p99 1,437 ms** paced. Every run delivered
+  every accepted event exactly once with a zero dead-letter rate. The figures
+  are published with their hardware and date at
+  `apps/docs/docs/operations/performance.md` and labelled explicitly as **not
+  a service-level objective**; the raw JSON is committed under
+  `docs/perf/results/`.
+
+  **The producer used to overstate itself.** It added `len(batch)` to one
+  counter as soon as `Do()` returned, without reading the status, so a stack
+  answering 401 or 500 to every batch still reported full throughput. It now
+  counts attempted, accepted, rejected, refused and transport-failed
+  separately, reads the `accepted`/`rejected` counters out of the ingest
+  response, and exits non-zero when nothing was accepted, because a run that
+  accepted nothing is a failed run rather than one that measured zero.
+
+  **The gates.** `scripts/check_perf_results.py` fails a committed result that
+  loses its hardware, its date or the not-an-SLO label, and fails an
+  unmeasured metric that carries a `value` key, which is how an absence gets
+  rendered as `0.00`. A measured zero is asserted to survive, because zero
+  dead letters and zero drained lag are real results. `perf.yml` runs the gate
+  and both harness self-tests on every relevant pull request, and the
+  end-to-end harness against a Compose spine nightly with floors two orders of
+  magnitude below the published figures, because a gate tuned near a
+  measurement flaps on shared runners and gets disabled.
+
+- **A reference high-availability Helm deployment, and a chaos test that
+  proves the claim it makes** (gap-closure Phase 12.2).
+
+  `infra/helm/aisoc/values-ha.yaml` runs three Kafka brokers in KRaft mode
+  with replication factor 3 and `min.insync.replicas=2`, multi-replica ingest,
+  fusion, agents, API, web and realtime, and PodDisruptionBudgets that refuse
+  to make a second broker unavailable voluntarily. PostgreSQL and ClickHouse
+  are deliberately left external, with managed options and their trade-offs
+  documented at `apps/docs/docs/operations/ha-deployment.md`: a chart that
+  shipped a single-pod database under a file called `values-ha.yaml` would be
+  claiming something it does not do.
+
+  `scripts/chaos/fusion_restart.py` pushes a paced stream, destroys a fusion
+  replica with `--grace-period=0 --force` part way through, and then asserts
+  **against PostgreSQL** that every event ingest accepted produced exactly one
+  alert row. It asserts nothing about what the replacement pod says about
+  itself, because a consumer that has silently detached reports healthy: the
+  UEBA consumer that had no `except` at all sat at `Running` with restarts 0
+  and `/health` at 200 permanently. Run against the kind deployment on
+  2026-09-27: 6,000 events, one replica destroyed 24.3 seconds in with 1,840
+  alerts already stored, 6,000 rows afterwards, no loss and no duplicates.
+
+- **A Helm install created every object and connected nothing** (gap-closure
+  Phase 12.2). Four defects that only running the chart could surface:
+
+  `KAFKA_BOOTSTRAP_SERVERS` was set on the UEBA deployment and on no other.
+  `services/ingest` and `services/fusion` both fall back to an in-code default
+  of `localhost:9092`, which inside a pod resolves to the pod itself, so a
+  Helm install produced an ingest publishing into nothing and a fusion
+  consuming nothing, with every object created and every probe green. It is
+  now set in the shared ConfigMap from one helper, alongside `KAFKA_BROKERS`.
+
+  The chart ran no brokers at all: `kafka.bootstrapServers` named a Service
+  called `kafka` that the chart never creates. It can now deploy a three-node
+  KRaft StatefulSet, off by default because a default install should not
+  silently start a stateful quorum.
+
+  The first batch after an install was lost. Auto-creation is enabled, and the
+  produce that triggers creation is the one that fails with
+  `Unknown Topic Or Partition`; a retry succeeds, so the symptom is exactly
+  one dropped batch at install time. A post-install hook now creates the four
+  spine topics and pins their partitions and replication factor rather than
+  inheriting whatever the broker defaults were at boot.
+
+  Readiness probes pointed at `/health`, which answers 200 while the process
+  is alive whatever its consumer is doing. `api`, `ingest`, `alert-fusion`,
+  `agents` and `realtime` now use `/readyz`, which evaluates a probe per
+  subscription and names any that have detached. Because Kubernetes does not
+  restart on readiness failure, and deliberately should not, consumers also
+  gained an init container that holds them back until a broker answers: on a
+  cold install the brokers are still electing a controller when fusion's
+  lifespan runs, aiokafka's bootstrap raises, the worker task ends and nothing
+  retries. Observed on kind on 2026-09-27, with every event accepted by ingest
+  and none becoming an alert.
+
+- **`ueba.enabled` was a switch wired to nothing.** `honeytokens-deployment.yaml`
+  and `purple-team-deployment.yaml` each gate on their own flag;
+  `ueba-deployment.yaml` did not, so `--set ueba.enabled=false` rendered the
+  Deployment anyway. On a cluster without that image it is two pods in
+  `CreateContainerConfigError` for a subsystem the operator switched off, and
+  the switch reads as broken rather than as absent. Gated by `helm.yml` in
+  both directions.
+
+- **`POST /kb/query` returned 503 for every request that named a `doc_kinds`
+  filter.** SQLAlchemy's `text()` skips a bound-parameter name followed by a
+  colon so the Postgres `::` cast is not mistaken for one, which means
+  `:kinds::text[]` declared no parameter at all and `.bindparams(kinds=...)`
+  raised before the statement reached the database. The handler's catch-all
+  turned that into "Database error", so the symptom pointed at the database
+  and the fault was in the statement's own text. Now `CAST(:kinds AS text[])`.
+  Found by a test for the Phase 6.3 retrieval route, which had copied the same
+  spelling.
+
+- **The prompt-injection guard now reads a constrained field as the
+  instruction it encodes, and the change was graded twice so the second
+  number could contradict the first** (gap-closure Phase 3.4).
+
+  **The measured weakness.** `PromptInjectionGuard` scored 0.852 on the prose
+  corpus it was tuned against and **66.7% (36/54)** on the field-native
+  incident corpus: 18 of 21 in ticket text and 12 of 14 in an email body,
+  against 1 of 5 in a command line, 1 of 5 in a DNS name and 0 of 3 in a file
+  name. Two properties of an identifier field, and not a shortage of
+  vocabulary, account for almost all of it. An identifier spells a sentence
+  with punctuation, and `\b` does not fire inside `snake_case` at all because
+  `_` is a word character, so a rule reading `system prompt` in an email body
+  cannot read `append-your-system-prompt-here.collect.attacker.example`. And
+  the object of a real injected containment is a proper noun: an attacker
+  writes `isolate WIN-DC-PRIMARY` because they want one named machine off the
+  network, and a noun list can hold `host` but never a customer's hostnames.
+
+  **What changed.** Every string is now matched against a second *segmented*
+  view in which identifier punctuation reads as a word separator, so a rule
+  written for prose reaches a DNS label without being rewritten, and a rule
+  added later will too. Each rule declares which views it is valid on, with
+  the reason at the declaration: `injected_containment` stays literal-only
+  because once punctuation is gone a descriptive compound name is
+  indistinguishable from an instruction. `=` and `:` stay out of the
+  separator set because they bind a key to a value that several rules read.
+  The named-target case cannot be a view at all, since segmentation is what
+  makes an identifier readable and also what destroys the target's shape, so
+  `named_containment_target` matches the argument's shape on the literal view.
+
+  **Measured on the corpus:** detection **66.7% to 98.1% (53/54)**, and the
+  prose corpus **0.852 to 0.96** with its false-positive rate still at 0.00.
+  Seventeen of the eighteen ratchet entries are closed; the last is refused
+  rather than outstanding, because it is SQL injection and the rule to catch
+  it would flag the quoted WAF payloads that sit in real tickets.
+
+  **Measured on payloads it had never seen: 7.1% (2/28), and that is the
+  number to plan against.** `injection_holdout.py` is 28 adversarial payloads
+  and 6 benign controls in the same seven surfaces, authored after the guard
+  was committed and never consulted while its patterns were written. The
+  guard *before* this change scores 3.6% on it. So the hardening moved the
+  corpus it was written against by 31 points and moved unseen payloads by a
+  single payload: it fitted the corpus far more than it closed the threat.
+  The structural half did generalise, in that a prose rule now reaches an
+  identifier field, but what it carries there is still a set of word lists
+  and an attacker has a thesaurus. That corpus carries **no floor and no
+  ratchet**, because a target on a held-out set is an instruction to tune
+  against it; CI gates only that the measurement happens, that the published
+  page matches it, and that the recorded misses describe the tree in both
+  directions. Both rates are published on `apps/docs/docs/benchmark.md` with
+  the distinction stated, and the next structural step is named in D20 of
+  `GAP_CLOSURE_PROGRESS.md` and deliberately not taken there, because
+  anything built after reading the held-out set is tuned against it.
+
+  **False positives moved the right way and are reported like for like.** On
+  the eleven benign controls that existed before, 2 flagged and 1 does now.
+  `disable_user_offboarding_batch.ps1` no longer trips a *high*-severity
+  tool-name match, which had been demoting every case carrying an ordinary
+  offboarding script to manual review: `disable_user` sat inside it as a
+  substring, and tool names now match on token boundaries. Two bare nouns
+  leave `injected_containment` because each matched its own verb and turned
+  routine administration into a high-severity hit, and `suspend`, `terminate`
+  and `block` leave the named-target verb list because in the bare
+  verb-then-name form the administrative reading is the common one. Six
+  benign controls were added, four of which flag the un-narrowed draft of the
+  rule they sit beside. `benign-edr-response-cmdline` still flags and stays
+  recorded: suppressing it needs a rule that reads a containment verb in flag
+  position as a tool invocation, and a suppression rule is the one kind whose
+  failure mode is silence.
+
+  Scan cost is **137us to 297us** per full incident, deterministic, with no
+  I/O. The eval harness re-grade is unchanged on all eleven axes, the guard
+  not being on that path.
+
+- **An operator could earn an autonomy grant and had no working way to hand it
+  back.** `DELETE /api/v1/autonomy-policy/grants` has been unreachable since it
+  shipped. `DELETE /{action}` is declared several hundred lines earlier in the
+  same router, FastAPI matches in registration order, and so the request was
+  taken by the threshold-reset handler with `action="grants"`. It answered 204,
+  so the caller was told the revocation had happened. What actually happened was
+  a `DELETE` against `aisoc_autonomy_thresholds`: the wrong table, no audit row,
+  and a capability the tenant still held. A capability outside the shared
+  vocabulary was accepted the same way, because the request never reached the
+  validator that would have refused it.
+
+  `{action}` is now constrained by a path convertor that excludes this router's
+  literal sub-resources. A convertor takes part in matching, so
+  `/autonomy-policy/grants` no longer matches `/{action}` at all and the literal
+  route is reached wherever either one is declared. Ordering the declarations
+  would have fixed the symptom while leaving the constraint written nowhere
+  except the order of the file; the two routes are deliberately left in the
+  order that failed, so the tests prove the constraint rather than the ordering.
+  FastAPI's `Path(pattern=...)` cannot do this: it is validation applied after a
+  route has already matched, so a reserved name would answer 422 rather than
+  falling through, and pydantic's regex engine rejects look-around outright. No
+  published path changed.
+
+- **The gate written for this exact bug class had never seen a route.**
+  `test_route_shadowing.py` read `app.routes` and filtered for `APIRoute`. On
+  the FastAPI version these services pin, `include_router` does not put routes
+  there: it appends a single `_IncludedRouter`, and the only `APIRoute`s in the
+  list are the handful of docs and probe routes the app was born with. Filtering
+  yielded zero routes, so the check compared zero pairs, found zero problems and
+  reported success, over an app serving 456 operations.
+
+  The corpus now comes from `app.openapi()`, and reachability is decided by
+  sending a request for every published operation and reading back which route
+  Starlette matched, which is the app as deployed rather than an internal list
+  whose meaning changed underneath. It refuses a corpus below a floor rather
+  than reporting an empty app clean, and it is proven against the defect: run
+  on the pre-fix tree it names `DELETE /api/v1/autonomy-policy/grants` as
+  answered by `reset_action_threshold`.
+
+## [11.2.0] — 2026-09-26
+
+### Added
+
+- **The detection engine runs 2,603 rules instead of 833, and every one of the
+  1,770 added rules has been watched to fire.** The library has held roughly
+  7,000 ATT&CK-mapped rules for months while 833 executed, and the question
+  that prompted this — why 800 and not 5,000 — turned out to have a single
+  concrete answer rather than a missing feature.
+
+  **Windows telemetry was unreachable, and nothing said so.** The engine
+  flattens `raw_event`'s top level into the namespace the matcher reads, and
+  the matcher does a plain `event.get(field)` with no path traversal. A Windows
+  event puts its payload one level below that: `CommandLine` lives at
+  `raw_event.EventData.CommandLine`, `EventID` under `System`. Those are the
+  two most-used fields in the public Sigma corpus — `CommandLine` in 2,173
+  rules and `Image` in 2,300 — so every Windows rule read `None` on its first
+  clause and could not fire however correctly it was written.
+  `windows_event.normalize()` now lifts both containers, which is where the
+  fix belongs: `System` and `EventData` are names from the Windows event
+  schema, and the engine is shared by every connector. Nothing in the engine or
+  the matcher changed, so the blast radius on the existing 833 is nil — proven
+  by replaying all 1,756 committed fixtures and confirming every native rule
+  keeps its verdict, now a standing test rather than a one-off check.
+
+  **`scripts/sigma_compiler.py` translates imported Sigma into `match_when`, or
+  refuses.** Refusal is the design. Sigma compares strings case-insensitively
+  and several matcher operators do not, so equality and affix tests compile to
+  anchored `pattern_match_any` rather than to `endswith_any`, which would have
+  silently stopped matching `\SvcHost.exe`. Sigma's `not filter` is true when
+  the field is missing, and only `not_in` and `not_contains_any` behave that
+  way, so the other negations are refused rather than narrowed. Of 3,132
+  imported rules, 1,770 ship and 1,362 are refused with a recorded reason — the
+  largest being 556 whose log source no connector emits and 464 whose negation
+  would flip on a missing field. The full taxonomy is in
+  `docs/detections/sigma-compilation.md`.
+
+  **A rule ships only after it is seen to fire.** `check_detection_fields.py`
+  says in its own docstring that it over-approximates and that "a false pass is
+  a rule this gate should have caught", so passing it is not evidence.
+  `scripts/compile_sigma_ruleset.py` replays a vendor-shaped event through the
+  **real** connector `normalize()` and the **real** `DetectionEngine`, and
+  keeps the rule only if it produces a hit and stays silent on an empty event
+  of the same shape. The proof is that the rule is reachable and fires on a
+  well-formed event of its log source — not that it detects an attack, which
+  no gate here claims. `--prove-gate` reverts the connector to its pre-fix
+  behaviour and requires all 1,687 Windows rules to stop firing, so the proof
+  is known to be capable of failing.
+
+- **Eight windowed aggregation rules**, covering the detection family the
+  quarantine index had been telling contributors to skip. Windows now
+  contributes here too: failed-logon volume per host, password spray counted by
+  distinct account rather than by attempt, service-install and scheduled-task
+  bursts, remote-thread fan-out, and per-process DNS fan-out for tunnelling
+  and domain-generation algorithms.
+
+- **`scripts/measure_triage_reliability.py`** — the measurement behind the
+  auto-triage reliability figures under *Fixed* below. It imports the
+  production prompt, envelope and parser rather than restating them, and uses a
+  *different* alert per attempt: production pins `temperature=0.0`, so asking
+  one alert twenty times measures one reply twenty times, not a rate. Failed
+  attempts record the model's own words, since "Expecting value: line 4 column
+  16" cannot be diagnosed without the text it indexes into. With no model
+  reachable it prints SKIPPED and says that nothing was measured, because a
+  skip is not a pass.
+
+### Changed
+
+- **Nothing an operator has to do, but the detection surface is 3.1x wider.**
+  There is no configuration change, no migration and no API change in this
+  release — the connector fix lifts the `System` and `EventData` containers
+  into the namespace the matcher already read, and a connector-normalized key
+  still wins on collision, so it only adds fields. What does change is that
+  2,603 rules evaluate where 833 did, and 1,687 of the additions are Windows
+  rules that could never fire before, so a deployment with Windows telemetry
+  should expect more alerts from the same stream. Every imported rule carries
+  its `upstream_status` onto the alert, so the 125 `experimental` ones can be
+  filtered without disabling the rest.
+
+- **Upstream lifecycle status no longer decides whether an imported rule runs.**
+  The importer quarantined on SigmaHQ status, which put 2,844 `test` and 211
+  `experimental` rules behind a flag. That conflated whether a rule *can
+  execute here* with how confident its authors are in its content; only the
+  first was ever the blocker. In SigmaHQ, `test` means reviewed and in
+  community use — the normal state for most of the corpus, not a warning.
+  Fireability now gates, status is carried onto the rule and the alert so it
+  can still be filtered, and `deprecated`/`unsupported` are refused outright.
+
+- **Published counts lead with the library and always name the executable
+  figure beside it** — "6,991 rules on disk, 2,603 executable". The two travel
+  together because a library figure on its own reads as coverage. 6,991 rather
+  than the 7,016 files under `detections/`, because 25 of those are playbooks.
+
+### Fixed
+
+- **76 rules were marked enabled and the engine had never heard of them.** They
+  counted as shipped coverage and detected nothing: 44 native rules authored as
+  YAML with no Python spec (the YAML is a generated projection, so the engine
+  never reads it), 31 imported Sigma rules, and 1 community rule. 46 of the
+  original 122 became executable through the compiler; the rest are now
+  `enabled: false` with a `quarantine_reason` naming what each would need. They
+  were deliberately not translated: their fields have no known emitter, so
+  making them load would have added rules that cannot fire, which is the defect
+  being removed rather than progress against it.
+  `detection_truth_table.py --check` now fails on any such rule.
+
+- **`readme_gates.py` misread a formatted figure.** Its pattern stopped at the
+  thousands separator, so "2,603 executable" was compared as 603 — a gate
+  measuring a number the README never claimed.
+
+- **The quarantine index told translators to skip the largest untranslated
+  family in it.** Step 3 said `| stats` aggregations belong in the windowed
+  engine, "which today has three hardcoded rules and no loader. Skip those
+  until it has one." `load_window_rules()` reads `windowed_ruleset.json` and
+  `main.py` wires it on by default, so the instruction had been stale for some
+  time while continuing to steer people away from roughly half the Splunk
+  quarantine. Corrected in `scripts/build_quarantine_index.py`, since the
+  README is generated output and editing the file would have regenerated the
+  error — the same shape as the detection-coverage generator that kept
+  restoring a dead link after the page was fixed.
+
+- **Auto-triage never asked the provider for JSON, so a third of the bundled
+  model's replies were thrown away.** `run_auto_triage` parses the reply as a
+  JSON object, but nothing in `services/agents/app/llm/` ever set
+  `response_format`, leaving the model free to emit prose shaped like JSON and
+  the parser to correct it afterwards. Measured over 50 alerts from the
+  committed synthetic corpus, through the LiteLLM gateway exactly as production
+  routes, against the bundled `llama3.2:3b-instruct-q4_K_M` at the production
+  `temperature=0.0` / `max_tokens=512`: replies triage could use went from
+  **44 of 50 to 50 of 50** once the reply was constrained to a JSON object.
+
+  The failure shape is worth recording, because it was not the one expected.
+  **Every one of the six failures carried a correct `verdict` and `confidence`
+  and a malformed `rationale`** — `"rationale": The alert is...` with the
+  opening quote simply missing, a raw newline before an unquoted value, or an
+  invalid `\'` escape. `finish_reason` was `stop` on all 50 calls, so
+  truncation was not involved and `max_tokens` is exonerated. A model that had
+  reasoned correctly was being discarded over its punctuation, which is
+  precisely what constraining the grammar prevents and no amount of parsing
+  after the fact can.
+
+  The gateway ships `drop_params: true`, so a provider that does not support
+  the parameter has it dropped rather than erroring. Requested through
+  `model_kwargs` rather than as a top-level argument, because langchain warns
+  on every construction otherwise.
+
+- **The published "7 of 19" reliability figure does not reproduce.** Re-measured
+  on the production call path at the sample sizes above, the pre-fix tree reads
+  44 of 50. The original number's conditions are not recoverable — it was taken
+  during a QA run whose host had exhausted its disk — so rather than restate it,
+  `scripts/measure_triage_reliability.py` now produces the figure repeatably and
+  records *why* each failed attempt failed. Every surface that published the old
+  ratio now carries the new one and names the method.
+
+- **A valid verdict was discarded when one field had the wrong type.**
+  `float(data.get("confidence", 0.5))` was unguarded, so `"confidence": "high"`
+  raised `ValueError`, which the caller converts into an `AutoTriageError` and a
+  deterministic fallback — losing a verdict and rationale that may have been
+  perfectly good. `_coerce_confidence` now reads numeric strings and
+  percentages and degrades to a neutral 0.5 otherwise. That is safe here and
+  only here: auto-close requires `confidence >= AUTO_CLOSE_THRESHOLD` (0.85 by
+  default), so an unread field escalates to a human instead of closing an
+  alert. The verdict itself still fails closed. Not a cause of the measured
+  failures, but reachable by any model on any alert.
+
+- **`structured_output.py` described itself as the single fail-closed parser
+  while nothing in production imported it.** Its docstring said each agent
+  "had its own ad-hoc `_parse_llm_response`", past tense; all five still did,
+  and its only callers were its own tests — a passing test on an uncalled
+  function is indistinguishable from a working feature. `auto_triage_agent` now
+  shares its extraction step, and the docstring records that `cloud_agent`,
+  `identity_agent`, `insider_threat_agent` and `phishing_agent` still carry
+  their own, rather than describing the consolidation as finished.
+
+  Extracting is also now brace-balanced and string-aware. It trimmed prose
+  before the opening `{` and nothing after the closing `}`, so a model that
+  answered correctly and added "Hope that helps!" was scored unparseable — and
+  a `}` inside a string value would have ended the scan early. An unclosed
+  object is still handed to the JSON parser to report rather than silently
+  trimmed to the last balanced point, because extraction may read what the
+  model said and must not guess at what it meant.
+
+- **Three counters still classified rules by their directory, and disagreed
+  with the engine by about 1,700 each.** `_quarantine/` stopped meaning "cannot
+  run" when the Sigma compiler began translating rules where they sat, and the
+  tools that had not been moved to the compiled ruleset kept reporting the old
+  world while printing OK. `validate_detections.py` published "Quarantined
+  (parsed-but-disabled): 5937" against a truth table saying 4,213 about the
+  same tree; it now reports `Executable (loaded by the engine): 2603; not
+  loaded: 4388`, read from the same artefact, so the two cannot diverge.
+  `curate_detections.py` skipped every `_quarantine/` file before scoring, so
+  the published coverage page selected from 1,054 candidates out of 2,603
+  executable rules and its "By category" list contained a category named
+  `_quarantine`; candidates are now the rules the engine loads, and a rule
+  that cannot fire is no longer eligible for a page that promises coverage.
+
+- **`build_marketplace.py` published 7,016 detections against a README and a
+  truth table that both say 6,991.** The 25-rule gap was `detections/playbooks/`
+  — response playbooks with `trigger:` and `steps:` and no `detection:` block —
+  walked as native detections because `playbooks` was missing from the skip set
+  that `detection_truth_table.py` has always carried. They are indexed as
+  playbooks now, so the marketplace keeps all 7,155 items, `stats.detections`
+  reads 6,991, and the landing page's pack figure is unaffected: `stats.playbooks`
+  counts every playbook and a new `stats.playbook_packs` counts the v1 pack
+  alone, because 62 of the 87 are packs and calling all 87 packs would have
+  traded one wrong number for another.
+
+- **Five refusal reasons rendered as broken table rows.** The Sigma compilation
+  report escapes the example it prints and not the reason, and five reasons
+  *name a Sigma modifier* — `|re`, `|cidr`, `|all`, `|base64`, `|fieldref` —
+  whose leading pipe is also a Markdown cell delimiter, so each opened an empty
+  first column and shifted its row. The rows that rendered wrong were exactly
+  the ones explaining the least obvious refusals.
+
+- **The DRL-1.1 attribution gap is now stated in the report rather than
+  discoverable only from the JSON.** `provenance.author` is empty on all 1,770
+  compiled rules because the Sigma importer never read the upstream `author:`
+  field. Attribution travels as repository, upstream rule id, upstream path and
+  licence — enough to find the rule, not enough to name who wrote it. The engine
+  builds its attribution sentence from what the block holds, so an alert reads
+  short rather than crediting an author called `""`, but a licence obligation
+  that is partly met is not met. Closing it needs a re-import.
+
+
+## [11.1.0] — 2026-09-25
+
+### Fixed
+
+- **The console's API and realtime addresses are now read when the container
+  starts, so a deployment that is not a laptop can be pointed at its own
+  services.** Reported by a self-hoster bringing AiSOC up with Compose on a
+  single host: setting the documented variables changed nothing. It could not
+  have — `next build` freezes *both* halves of the console's routing. Anything
+  prefixed `NEXT_PUBLIC_` is inlined into the JavaScript bundle as a string
+  literal, and the destinations returned by `rewrites()` in `next.config.js`
+  are compiled into `.next/routes-manifest.json`. `next start` loads the
+  config again and logs that it did, which makes this look configurable, but
+  production routing is served from the manifest. A pulled image could
+  therefore only ever talk to the hosts it was built against.
+
+  It worked on the bundled Compose stack by coincidence: the baked
+  `http://api:8000` happens to be that service's DNS name on that network.
+  Any other topology resolved a hostname that does not exist, and no variable
+  could re-point it.
+
+  `apps/web/docker-entrypoint.sh` now re-evaluates `rewrites()` against the
+  container's environment and writes the result into the manifest before the
+  server starts. `next.config.js` stays the single definition of the routing
+  table — the resolver duplicates no route — so `AISOC_API_URL`,
+  `AISOC_AGENTS_URL` and `AISOC_REALTIME_URL` take effect on a pulled image
+  with no rebuild. An address that is set and cannot be applied stops the
+  container and names itself rather than starting on the built-in defaults,
+  because a console silently pointed at the wrong host is worse than one that
+  refuses to boot.
+
+  The browser needs no absolute URL at all and did not need one before: the
+  bundle calls same-origin paths and this server forwards them, which is why
+  one image works on `localhost`, on a LAN address and behind a reverse proxy,
+  and why there is no CORS surface to configure. `docker-compose.yml` no
+  longer sets `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_WS_URL` on the `web`
+  service, where they were read by nothing while looking like the knob an
+  operator was meant to turn.
+
+- **A single-host deployment can be reached.** Every host port published to a
+  literal `127.0.0.1`, so the stack came up healthy and nothing outside the
+  machine could reach it — including the browser it was meant to be used from
+  — and nothing in `.env` could change that. `AISOC_CONSOLE_BIND_ADDR`
+  publishes the console, and `AISOC_BIND_ADDR` moves every binding for an
+  isolated network. Both default to loopback, so a laptop install still
+  exposes nothing by omission.
+
+  The console gets its own knob because same-origin proxying means one port is
+  enough: exposing AiSOC to a LAN no longer means handing out Postgres, Redis,
+  Kafka and Neo4j with the development passwords this repository ships.
+
+- **The Helm chart pointed the console at hostnames that do not exist in a
+  cluster.** It set no upstream addresses on the web Deployment at all, while
+  the published image dials `http://api:8000`; the chart's Services are
+  `<release>-api`, `<release>-agents` and `<release>-realtime`. Every console
+  request resolved nowhere, so the page loaded and every panel stayed empty.
+  The three addresses are now derived from the release's own Services, and
+  `services.web.env` overrides them for an API outside the release. This needs
+  a console image carrying the runtime entrypoint above; an older image
+  ignores them.
+
+- **Demo mode has one authoritative answer, and it is visible.** Two flags
+  decided it and neither could be reconciled from outside the container:
+  `AISOC_DEMO_MODE` gated the API's seed at run time while the console read
+  `NEXT_PUBLIC_DEMO_MODE`, compiled in at build time. The two could disagree,
+  and `AppShell` wrapped the banner in `ClientOnly` to hide the resulting
+  React hydration error rather than remove its cause. `AISOC_DEMO_MODE` now
+  answers for both services and outranks the compiled value, the Server
+  Component in `app/(app)/layout.tsx` resolves it once and hands it down so
+  the two paints cannot differ, and `GET /api/runtime-config` reports the
+  answer with the source that produced it (`runtime`, `build` or `default`)
+  plus the version the image was built from. Checking whether a deployment
+  thinks it is a demo no longer means inferring it from the rendered page —
+  which was actively misleading, because the banner copy is an inlined
+  constant present in the HTML either way.
+
+- **The console image a self-hoster pulls now tracks `main`, and a release
+  that publishes only some of its images now fails.** The fix above shipped to
+  nobody: `ghcr.io/beenuar/aisoc-web:latest` — what the documented
+  `docker compose up` pulls — was built from a commit two releases behind
+  `main`, and `aisoc-web:v11.0.0` was never pushed at all while
+  `aisoc-core-api`, `aisoc-fusion` and `aisoc-ingest` all carried that tag.
+  Every workflow was green throughout, which is the whole problem: a green
+  workflow says a job ran, not that the registry holds anything.
+
+  The cause was arm64 cross-building under QEMU on an amd64 runner. Measured
+  from BuildKit's own step timings in the v11.0.0 release run, emulation cost
+  roughly 7x on a good run — `pnpm install --frozen-lockfile` 15.0s on amd64
+  against 114.2s on arm64, the Next.js build 45.0s against 281.6s — and on a
+  bad run it did not converge at all: that release's arm64 `pnpm install` ran
+  **6,358 seconds without finishing**, 56x its own normal time, while the
+  amd64 leg of the identical build completed in 100s. The slow step is the
+  dependency install rather than the compile, so it was never a Next.js
+  problem, and it is intermittent rather than a steady cost — the same build
+  succeeded in five minutes on another runner while that one was still stuck.
+
+  Both `publish-images.yml` and `release.yml` now build each architecture on a
+  runner of that architecture and merge the two into a manifest list, so the
+  emulator is gone rather than budgeted for. arm64 itself stays: Apple Silicon
+  is the majority of contributor laptops, and an amd64-only manifest turns the
+  quickstart into a long silent build there. Every leg pushes by digest and
+  the tags are attached once, after both exist, so `:latest` can no longer
+  resolve to half a manifest.
+
+  `publish-images.yml` also no longer cancels itself. `cancel-in-progress` is
+  thrift on a test run and a correctness bug on a run that pushes artefacts —
+  it is what left twelve images at the new commit and the thirteenth two
+  behind, reported as `cancelled` rather than `failed`. Runs now queue. And
+  `release.yml` gained a `workflow_dispatch` that republishes the images for
+  an existing tag, because the only way to finish a half-published release was
+  previously to invent a new tag for a commit that had already shipped.
+
+- **A republish moved `latest` to the older release it was repairing, and
+  stamped the wrong commit on every image it built.** Both come from the same
+  place: on a dispatched run the GitHub context describes the ref the workflow
+  was launched from while the source checked out is the tag being
+  republished. So `metadata-action` wrote `main`'s commit into
+  `org.opencontainers.image.revision` on images built from v11.0.0 — the field
+  `check_published_images.py` trusts to decide what an image contains — and
+  the tag list still carried `latest`, which handed eight images older content
+  than `main` on the tag a self-hoster pulls by default. A republish now
+  publishes only the tag it was asked to repair, and labels the commit it
+  actually built. Its verification step also checks out the workflow's own ref
+  rather than the tag, because the gate it runs exists on the default branch
+  and not in a tree from two releases ago.
+
+- **A dispatched release reported success having published nothing.** The
+  recovery path's `release` job is push-only, and a skip propagates the whole
+  length of a `needs` chain rather than one link: `docker-build` declared
+  `always()` and ran, `docker-manifest` declared nothing and was skipped
+  anyway. The first dispatched run built both architectures of sixteen images,
+  tagged none of them, and went green — the same silent green the workflow was
+  being changed to fix. Every job below the conditional one now says
+  `always()` and states what it requires, and
+  `test_no_job_below_a_conditional_one_is_silently_skipped` walks the `needs`
+  graph of both workflows so the shape cannot return.
+
+- **The console's manifest job collected the demo build's digests as well as
+  its own.** `web` and `web-demo` push to the same repository and the digest
+  artefacts were keyed `digest-<service>-<platform>`, downloaded with a
+  `digest-<service>-*` pattern — so `digest-web-*` also matched
+  `digest-web-demo-amd64`, and the console's merge job pulled four digests,
+  two of them the demo bundle. It failed on the merge step's own check that it
+  had exactly one digest per architecture, which is the only reason a mixed
+  manifest did not go out under the tag `make up` pulls. The separator is now
+  a dot, which cannot collide, and `test_one_image_cannot_collect_another_images_digests`
+  replays each service's download pattern against every service's upload name
+  so the ambiguity is caught at review rather than at publish.
+
+- **`aisoc-honeytokens`, `aisoc-purple-team` and `aisoc-osquery-tls` are
+  published.** All three were named by `docker-compose.yml` since it was
+  written and built by nothing, so `--profile extras` silently compiled them
+  from source every time. The Helm chart has no such fallback and named two of
+  them, so those pods could only ever have reached `ImagePullBackOff`.
+
+- **The Helm chart could not install at all.** Every image tag defaults to
+  `Chart.AppVersion`, which read `5.2.0` — a tag that exists for no image in
+  the registry — so a default `helm install` would have failed to pull on
+  every pod. It now pins a tag that exists. The chart also named
+  `ghcr.io/beenuar/aisoc-alert-fusion`, which has never existed under any tag;
+  the image the publish matrix builds is `aisoc-fusion`.
+
+- **Deployment docs named four images that have never been published.**
+  `deployment/kubernetes.md` listed seven images at `v5.2.0` — including
+  `aisoc-api` and `aisoc-mcp`, neither of which exists under any tag — and its
+  `helm install` passed `--set api.image.tag=…`, a path no template reads,
+  since every service lives under `services.<name>`. The overrides therefore
+  changed nothing and the tag they set existed for nothing. `deployment/
+  docker.md`, the Vault connector page, and the Azure and GCP Terraform
+  defaults — the `api_image` variable a `terraform apply` uses, which pointed
+  at `aisoc-api` — named the same non-existent images. The gate now
+  resolves fully-written first-party references in tracked prose too —
+  existence only, since a release note naming an older image is describing
+  history rather than instructing anybody.
+
+- **`make up` printed an address the operator could not use.** README tells
+  anyone deploying to something other than a laptop to set `AISOC_CONSOLE_URL`
+  "so the printed address is the one people browse to", and `up` printed a
+  hardcoded `http://localhost:3000` regardless. Two lines below it
+  `bootstrap` printed the configured address, because it reads the variable —
+  so the operator got both, contradicting each other, wrong one first, on the
+  one screen where they are being handed a credential and told where to use
+  it. On a host reached by its LAN address `localhost` resolves on the
+  reader's own machine to something that is not that console. Both `up` and
+  `up-full` now derive the line from `.env`, falling back to
+  `http://localhost:3000` when it is unset, so a laptop install is unchanged.
+  The `API:` line beside it stays on loopback deliberately: that is accurate
+  for this host, and a console URL behind a reverse proxy says nothing about
+  where the API port ended up, so deriving one from the other would trade a
+  wrong address for a guess.
+
+- **`make doctor` reported another deployment's health as yours.** Its port
+  section derives each host port from `docker compose port`, so it correctly
+  says "aisoc api is published on 18000 (not the default 8000)". Its service
+  probes then dialled the canonical port anyway. On a host running a second
+  AiSOC project that means probing the other project's containers: observed
+  here as `ingest-worker is alive but NOT ready — it cannot reach Kafka`
+  while this deployment's own `/readyz` answered 200 with Kafka reachable,
+  alongside four services reported healthy that the probe never touched. A
+  diagnostic that names the wrong deployment is worse than a vague one,
+  because it sends the operator to debug something that is not theirs. The
+  probes now default to the port this project actually published, falling
+  back to the canonical one when compose cannot answer — so a single-stack
+  install is unchanged — and an explicit `AISOC_*_URL` still wins over both.
+  `web`, `realtime` and `agents` had no override at all and were purely
+  hardcoded; they also read the *host* port where `docker compose port` is
+  keyed on the container port, which differs for two of the three.
+
+- **The onboarding hero's screencast card was a dead link wearing a stale
+  promise.** It pointed at `/demo.mp4`, a text placeholder, labelled
+  "Coming v8.0" — three majors after v8.0 shipped — and described a
+  four-case product tour nobody had recorded. It now links the walkthrough
+  below, is thumbnailed with a real frame from it rather than a hand-drawn
+  SVG that could drift from the content, and describes what the recording
+  actually contains. The four-case tour is still unrecorded and its brief
+  stays in `apps/web/public/.demo-mp4-placeholder`, now saying so plainly.
+
+### Added
+
+- **A recorded deployment walkthrough, and the written form of it.**
+  `apps/web/public/demo/demo.mp4` (2 min 57 s) takes one host from nothing to
+  an AI triage verdict: `make up` against the images published on GHCR, the
+  console signed into at a LAN address rather than `localhost`, the CISA
+  Known Exploited Vulnerabilities feed already populated with no API key, one
+  event pushed through the documented ingest path, `make smoke` reporting ten
+  stages, and the resulting alert with its measured token counts. README
+  embeds `hero.gif`, a 17-second loop cut from the same file — an animated
+  image renders inline on GitHub, on mirrors and on package pages, where a
+  `<video>` pointing at a repository path does not.
+
+  Everything in it is real: real images, real feed, real alert, real tokens.
+  Demo mode was off and nothing was seeded. The event was authored to be
+  representative and the recording says so. Terminal waits are shortened,
+  disclosed by a badge on screen for the whole of every segment it applies
+  to; the browser sections run at real speed. Both triage runs in the
+  recording fell back to the deterministic path because the bundled
+  3B model's output failed schema validation, and the closing card states
+  that rather than hiding it — the token counts are real because the model
+  really was called; what failed was the shape of its reply.
+
+  `apps/docs/docs/deployment/walkthrough.md` is the same path in prose, with
+  the detail three minutes has no room for: why `AISOC_CONSOLE_BIND_ADDR` and
+  `AISOC_CONSOLE_URL` are separate decisions, that the CISA feed's primary URL
+  answers `403` to non-browser clients and the service falls back to a mirror
+  (a warning line followed by `CISA KEV IOCs ingested` is the healthy path),
+  and how to run a second stack beside an existing one — every service pins a
+  `container_name`, so a distinct project name alone is not enough, and
+  `make up`'s port pre-flight reads `docker compose port`, which cannot see a
+  remap on a host where no container has started yet.
+
+- `scripts/check_published_images.py` — the gate none of the above had. It
+  resolves every image reference in `docker-compose.yml` and the Helm chart
+  the way the tooling that reads them does (`${AISOC_VERSION:-latest}` to its
+  default, an empty chart `tag:` to `Chart.AppVersion`) and asks GHCR whether
+  each one is there, optionally checking that the version inside matches the
+  tree. Against `main` before this change it reported 14 findings across both
+  files. Third-party images are counted and named but not resolved: this
+  checks the images *this project publishes*, and upstream availability is not
+  a claim this repository makes. Offline it prints `SKIPPED` and never `OK`,
+  because a skip is not a pass; `--require-network` makes unreachable a
+  failure, which is what the scheduled job uses. `--self-test` covers 28
+  assertions including every shape the registry was actually in.
+
+- `.github/workflows/image-availability.yml` — runs that gate daily against
+  `main`, and `publish-images.yml` and `release.yml` each run it over their own
+  output, so a half-published release fails the run that half-published it.
+
+- `apps/docs/docs/deployment/single-host.md` — the path for a server you reach
+  over the network: publishing the console, pointing it at your services,
+  confirming what the deployment thinks it is, and what changes on the way to
+  Kubernetes.
+- `tests/test_console_runtime_config_gate.py` — runs the real resolver against
+  the real `next.config.js` and asserts an operator's chosen API address is
+  the one the console proxies to, plus the deployment contract that carries
+  it. All five fail against `v11.0.0`.
+
+## [11.0.0] — 2026-09-25
+
+### BREAKING
+
+- **`POST /v1/ingest` and `POST /v1/ingest/batch` now require a credential,
+  and the tenant comes from the credential rather than from the
+  `X-Tenant-ID` header.** The endpoint the README tells users to push
+  telemetry to, and the one `make smoke` exercises, authenticated nothing:
+  it read `X-Tenant-ID`, believed it, and wrote events for whatever tenant
+  the caller named. Anyone who could reach the port could write alerts into
+  any tenant by typing that tenant's UUID. Compose binds the port to
+  `127.0.0.1`, which contains it locally, but ingesting real telemetry means
+  exposing it and nothing said so at the moment the operator did. The
+  comment at `services/ingest/internal/server/server.go` asserting that
+  "`/v1/ingest` is token-authenticated per request" had been false since it
+  was written; it is true now.
+
+  Rather than invent a second mechanism this extends the one the service
+  already had. `/v1/inbox/*` resolves a minted token from
+  `tenant_inbox_tokens` to a tenant, with optional HMAC-SHA256 over
+  `X-Signature`; `/v1/ingest` now resolves the same kind of token, pinned to
+  a new `connector-push` template exactly as `/v1/inbox/cef` is pinned to
+  `cef-syslog` — an inbox token is pasted into a third party's webhook
+  config, so minting one for PagerDuty must not also hand PagerDuty a
+  general ingest credential. A second shape covers AiSOC's own services:
+  `services/connectors` polls on behalf of many tenants and cannot hold a
+  per-tenant token, so it presents `AISOC_SERVICE_TOKEN` and declares the
+  tenant on `X-Tenant-ID`, which is then checked against the tenants table
+  before it becomes a scope.
+
+  `X-Tenant-ID` is still read and is never authority. It is **intersected**
+  with what the credential authorises, so naming an outside tenant narrows
+  to nothing and is refused rather than reaching out — the same
+  intersection-only rule `app/security/tenant_scope.py` already implements
+  for the Python services, ported to Go in
+  `services/ingest/internal/ingestauth`. There is no dev-mode bypass:
+  `AISOC_DEV_MODE` does not reach this path, and an ingest service that
+  cannot verify a credential answers 503 rather than accepting the write.
+
+  **Every deployment must act.** Mint a push token per external pusher with
+  `make ingest-token`, and set `AISOC_SERVICE_TOKEN` on both `ingest` and
+  `connectors` if you use pull connectors — without it, connector polling is
+  refused, loudly, at startup on one side and per request on the other. Full
+  procedure: `apps/docs/docs/operations/ingest-authentication.md`.
+
+- **CORE now needs 8 GB of memory and 20 GB of free disk, up from `~6.5 GB`.**
+  A machine that ran the previous CORE profile may not start this one, and the
+  failure arrives as containers being killed rather than as a message naming
+  the requirement — so this is a prerequisite change to read before upgrading,
+  not a footnote. The cause is that CORE stopped being a profile with nothing
+  to show: `threatintel` and `qdrant` moved in so a fresh `make up` holds real
+  CISA KEV data with no credentials, and `ollama` moved in with its pinned
+  `llama3.2:3b-instruct-q4_K_M` so triage runs against a real model with real
+  token counts. Measured before and after on the same machine: 11 long-running
+  services become 14 plus a one-shot model pull, unique image layers 8.11 GB →
+  16.46 GB, model weights a new 2.02 GB volume, and resident memory for the
+  whole stack 1.72 GiB → 4.84 GiB. Ollama is 9.6 MiB resident when idle and
+  2.96 GiB while serving a request; the requirement is sized against the
+  second. The full table is under **Fixed → Measured, not estimated**.
+
+### The landing page now shows the product, and points at the repository
+
+- **The only place the marketing site claimed to show the console was an
+  invented one.** `DemoEmbed` drew a hand-authored Investigation Ledger: an
+  incident id, a named ransomware family, `confidence 0.93`, `$0.084` spent
+  against a named hosted model, "4 hosts · 2 users", "step 14 of 32". None of
+  it was labelled as a mock and none of it had ever happened. It is replaced
+  by `ProductTour`, four captures of a running CORE stack taken from
+  `apps/web/public/screenshots/`: the local model's triage verdict, 1,725
+  live CISA KEV entries, the degraded graph view naming its own `API 503`,
+  and an operations dashboard on a tenant with nothing connected. Two of the
+  four are deliberately empty or degraded states. The section lede carries
+  the distinction the manifest records — the security events were authored
+  and pushed through the documented ingest API; normalization, detection,
+  promotion, correlation and triage were performed by the running services,
+  no row was seeded, and none of it is a real intrusion.
+
+- **The fold had no picture of the product and its primary button pointed at
+  the maintainers' hosted host.** The hero is rebuilt left-aligned around a
+  real capture of the dashboard — chosen because its mean-time-to-resolve
+  reads *not measured · no cases closed* — with the repository as the primary
+  call to action and the two commands that reproduce the screenshot below it.
+  The same substitution lands in the site-wide nav and the closing band, so
+  the destination on every marketing page is now the source. Four entries
+  were **dropped** from `scripts/check_hosted_hostname.py` rather than
+  renumbered, because the occurrences are gone rather than reduced.
+
+- **`Testimonials` was an empty state that asserted a programme.** It
+  headlined "What teams say after their first month" over an offer to onboard
+  reference partners "through Q2 2026" — a window that had closed. Replaced
+  by `HonestLimits`, which states six limitations against the artefacts that
+  measure them, including the one the page most wanted to skip: the bundled
+  3B model returned schema-valid triage output **7 times in a measured run of
+  19**, and the other 12 fell back to the deterministic path.
+
+- **Four landing-page claims were stale or unsupported against the tree.**
+  The FAQ answered "what runs in production today?" with beta deployments
+  through reference partners, which nothing supports; quoted a `cryptography`
+  floor three majors behind what the services declare; described the
+  retracted alert-reduction suite as "a real measurement"; and named managed
+  data-residency regions. The benchmark band published *Sub-minute p50* as a
+  metric when `mtc_p50_seconds` is null on every scoreboard row — it now
+  reads **not measured**, with the reason. The open-source band told visitors
+  to run `pnpm aisoc:demo`, which loads the synthetic dataset, so the three
+  commands a reader was given produced the one thing this project asks them
+  not to mistake for the product working; it is `make up && make smoke`. The
+  footer had shipped `v7.3.1` hard-coded through seven major releases and now
+  reads the version the release flow bumps. The visible FAQ and the
+  `FAQPage` JSON-LD were corrected together, and the structured data's
+  hand-typed "69 ship in the box" now reads the generated connector count.
+
+- **Capabilities the site had never mentioned** are on it: verified response
+  (the executor probes the vendor rather than trusting an HTTP 200),
+  authenticated ingest with the tenant resolved from the credential,
+  row-level security on 83 tables behind a DML-only runtime role, two-way
+  SIEM writeback of agent dispositions, and the cost and token telemetry in
+  the ledger.
+
+### Discoverability: the machine-readable surface, and an installer that wrote a config nothing could start
+
+A project an AI agent cannot read accurately is a project it will describe
+inaccurately, and the one-command install that was supposed to be the easy
+path did not work at all.
+
+- **`aisoc-mcp install` wrote `npx -y @aisoc/mcp serve` unconditionally, from
+  every source build.** `@aisoc/mcp` is not on npm — the release workflow packs
+  it on every tag and the upload is blocked on registry credentials — so the
+  installer's output was a config file that parsed, wrote cleanly, reported
+  success, and could never launch. The host surfaced "server failed to start"
+  with no reason, at the point the user had already decided to adopt it. The
+  existing test asserted the broken behaviour verbatim ("always uses `npx -y`
+  so users don't need a global install"), so a full suite proved it.
+
+  `install` now resolves a launcher: from a monorepo build it writes
+  `node <absolute path to dist/index.js> serve`, from an installed package it
+  writes the `npx` form, and `--launcher node|npx|auto` forces either. Forcing
+  `npx` today prints why it will not start. Verified end to end by launching
+  the generated config and completing an MCP handshake against it.
+
+- **`install --verbose` wrote `AISOC_VERBOSE` while the server reads
+  `AISOC_MCP_VERBOSE`,** so the one setting whose entire purpose is diagnosing
+  a misbehaving server was dead in every installed config. Its test asserted
+  the producer's own spelling rather than checking the consumer reads it; the
+  replacement runs the written environment back through `resolveConfig`.
+
+- **`llms.txt` and `llms-full.txt`** now publish at the documentation root, the
+  convention LLM-backed tools fetch instead of scraping a rendered navigation
+  tree. Both are **generated** by `scripts/generate_llms_txt.py` from the
+  artefacts that already own each figure — the connector registry and the
+  detection truth table — because a summary written *for* machine readers is
+  the worst place for a hand-typed count to rot, and this repository has
+  published 47 connectors against a real 84 before. `--check` is a CI gate and
+  the generator carries a self-test proving it refuses an empty tree.
+
+- **The documentation site's Open Graph card was undecodable.**
+  `img/aisoc-social-card.png` held 277 bytes of SVG, so every crawler was
+  served `image/png` with SVG bytes and rendered no image at all; `favicon.ico`
+  had the same defect. Both are now real PNGs rendered from committed SVG
+  sources by `apps/web/scripts/render-og-images.mjs`.
+
+- **The marketing Open Graph card named the commercial parent.** It read
+  "Built by Cyble" and "Free forever" beneath a stale "v3 milestone" pill —
+  on the open-source project's card, which a self-hoster shares when linking
+  their own deployment. Rewritten without any of the three, and the metadata
+  now points at a PNG: Slack, LinkedIn, Facebook and X all decline to render
+  an SVG `og:image`, so the previous `og-image.svg` produced no card anywhere.
+  The landing page's OG description also sent readers to a commercial hostname;
+  removed.
+
+- **schema.org `SoftwareApplication` and `WebSite` markup** on the docs site,
+  carrying only independently checkable assertions — MIT licence, genuinely
+  zero price, canonical repository. No `aggregateRating` or `review`, because
+  no such data exists. The marketing site's existing markup hard-coded
+  "26 security sources" and now reads the generated `CONNECTOR_COUNT`.
+
+- **`services/mcp/server.json`**, an MCP registry manifest validated against
+  the published `2025-12-11` schema. It deliberately declares **no `packages`
+  entry** — optional in the schema — so a directory listing sends a reader to
+  the source rather than to an install command that would 404.
+  `tests/registry.test.ts` asserts the manifest and the README's
+  "ready, unpublished" line can only change together.
+
+- The MCP README and `docs/integrations/mcp.md` promised npm publication "in
+  v8.0" three major versions after v8.0 shipped, claimed 50 tests against a
+  real 124, and asserted an audit trail that `services/mcp/src/telemetry.ts`
+  already documents as untrue — `audit_middleware` records no row for any of
+  the ten read tools. Corrected, along with the competitor-framed "moat" line.
+
+
+### `make up` reported the stack broken on every machine, and four published numbers were wrong
+
+Found by bringing the stack up from the documented path and photographing the
+result. Each of these was visible within minutes of a real first run and
+invisible to the test suite.
+
+- **`make up` could not succeed, ever.** Its `_wait` loop scored any container
+  in state `exited` as broken, and `ollama-pull` is a one-shot: it fetches the
+  model, exits 0, and `litellm` waits on `service_completed_successfully`, so
+  by the time `docker compose up -d` returns the puller has *always* exited.
+  The documented command therefore ended in `These services are not running:
+  ollama-pull` against a completely healthy stack — the step whose job is to
+  say whether the stack is healthy, reporting the opposite. Fixed by reading
+  `{{.ExitCode}}` and treating `exited 0` as a one-shot that did its job.
+  The first attempt at that fix did not work either, for a reason worth
+  recording: a service with no healthcheck prints an *empty* `Health`, and
+  awk's default whitespace splitting collapses the run, so `ollama-pull
+  exited  0` parsed as three fields with the exit code in `$3` — the new test
+  read an empty `$4` on exactly the row it was written for. The fields are
+  `|`-separated now.
+
+- **Four of the ten shipped ingest profiles rendered their vendor twice.**
+  `product_label()` deduplicated the vendor/product join on exact equality, so
+  `crowdstrike` + `crowdstrike` collapsed but `Okta` + `Okta System Log` did
+  not. The alert queue, the Investigation Rail and every entity chip read
+  "Okta Okta System Log", "Splunk Splunk Enterprise", "Kubernetes Kubernetes
+  Audit" and "Email Forwarded Email". A part another part already contains is
+  dropped now, on word boundaries so "AWS" is not swallowed by a product
+  called "Lawsuit Monitor", and the new test reads the pairs *out of the Go
+  normalizer* rather than restating them — the previous tests passed every
+  hand-written case while four shipped profiles were wrong, because none of
+  them asked the normalizer what it actually declares.
+
+- **The Threat Intelligence page published its own page length as the size of
+  the catalogue.** With 1,725 CISA KEV entries collected, Qdrant held 1,725,
+  the API answered `total: 400` (the size of its bounded scan window) and the
+  console's headline card read **100** (its page). Three answers to one
+  question, the two published ones both wrong, and the page presenting the
+  smallest as the corpus. `total` is now the store's own count, `shown` is the
+  page, and a narrowed query is marked `bounded` so a caller knows the match
+  was made inside a window.
+
+- **`Added Today` on that same page was the literal `3`, hard-coded**, on
+  every deployment including ones that had never ingested an indicator. The
+  comment four lines above it describes removing an invented IOC list for
+  exactly this reason and names this counter while doing so; the counter
+  survived. Replaced with figures the page can support — the store's count,
+  the page's count, and two counts explicitly labelled *of shown*. The
+  sample-data gate did not catch it and could not: it scans module-scope
+  fabricated-record literals, and this was a scalar inside JSX.
+
+- **Nothing in the console rendered the AI verdict.** `services/agents`
+  triages every fused alert and writes `ai_score`, `ai_summary`,
+  `triage_groundedness` and `triage_ungrounded` back onto the row; the API
+  returns all four; `normalizeAlert` dropped all four on the floor. The
+  product's headline capability was producing tokens, cost and a ledger entry
+  that no surface showed. The Investigation Rail's Details view now carries an
+  **Automated triage** section rendering the verdict, the confidence, the
+  rationale *verbatim* — so a reader can tell the model's own text from the
+  deterministic fallback — and groundedness as **not assessed** when the
+  column is null, never as 0.
+
+### Real screenshots, and an architecture doc that follows one event
+
+- **Every committed screenshot is now a capture of a running stack.** The
+  24 MB `screenshots/` tree was a marketing redesign from an older product and
+  no longer resembled it; the four tiles under
+  `apps/web/public/screenshots/` were SVG placeholders. Both are replaced by
+  16 PNGs (844 KB total) taken from a CORE stack brought up with `make up`,
+  fed through the documented ingest API, holding 1,725 real CISA KEV entries
+  and a real local-model verdict. `apps/web/public/screenshots/README.md`
+  states what is real in each one and what was authored — the security events
+  were written by hand; everything downstream of them is the product working.
+  **None was taken in demo mode.**
+
+- **`apps/docs/docs/architecture.md` is organised around what happens when
+  AiSOC receives one security event** — eleven numbered steps from the two
+  ingest doors through normalization, the spine, detection, enrichment,
+  promotion, correlation, alerting, AI triage, the ledger, approval and
+  verified response — instead of the component inventory it was. Every box in
+  every diagram links to the directory that implements it, and all 31 source
+  links were checked to resolve. It also records what the previous version got
+  wrong: ports (the page listed host ports as though services addressed each
+  other on them), `50 vendors` against 84, `200+` detection rules against 833
+  executable, and five packages still promised "in v8.0" two releases later.
+
+- **Measured figures, re-read rather than carried forward.** CORE is 14
+  long-running services plus a one-shot model pull; `full` is 22. The playbook
+  palette offers **21** of the engine's 22 step types — `approval` is withheld
+  because the engine is a single-threaded index walk with no pause or resume.
+  Row-level security is live on 83 tables under 84 policies, and the runtime
+  role holds `SELECT / INSERT / UPDATE / DELETE` and no DDL.
+
+- **The local model's triage output is now described honestly.** In a measured
+  run of 19 auto-triages on a CORE stack the bundled
+  `llama3.2:3b-instruct-q4_K_M` returned schema-valid JSON 7 times; the other
+  12 fell back to the deterministic path and logged that they had. The README
+  and the architecture page both publish that ratio rather than implying the
+  model answers every time. No hosted provider has been exercised — there is
+  still no funded key, and that remains a different claim.
+
+### Added
+
+- **`RENDER_FALLBACK_EXEMPT` is now checked in both directions.**
+  `ALLOWED_ILLUSTRATIVE` had a staleness check from the start and this list
+  had none, so an exemption could outlive the code it excused and go on
+  covering whatever was written next under that name.
+- **A corpus floor.** The gate refuses a root holding no `.ts`/`.tsx` rather
+  than certifying it: a renamed directory or a changed suffix produces zero
+  findings over zero files, and found-nothing and scanned-nothing print the
+  same word. It also names what it scanned, rooted at `git rev-parse`.
+- **A real `--self-test`.** Twenty-six cases, each asserting the *rule* that
+  must account for it rather than that something fired — the conditional rules
+  overlap by construction, so a boolean check would pass with half the fixes
+  reverted. Each case builds its own source and its own tree.
+- **`KNOWN_UNGATED`**, a shrink-only ledger of sites the detector reports and
+  the tree has not fixed, each with a reason, so a stricter rule can land
+  without weakening it. Not an exemption: while an entry stands the gate
+  prints the outstanding count instead of the unqualified "all gated"
+  sentence. Recorded by count, so an entry cannot survive its own fix and a
+  second violation cannot hide behind a recorded one. It shipped holding the
+  seven sites this revision first detected and is **empty** — they were fixed
+  in a parallel change, the counts stopped matching, and the entries had to be
+  deleted before the build would pass. The console is now genuinely clean:
+  21 module-scope fabricated-record literals, 21 of them gated.
+
+- **`scripts/generate_corpus_stats.py`** — generates
+  `apps/web/src/data/corpus-stats.json` + `corpusStats.ts` from the compiled
+  engine ruleset, the generated detection truth table, and the marketplace
+  index, reconciling all three against each other and refusing to publish if
+  they disagree. Every landing surface imports the constants, so none can
+  carry its own literal. `--check` is wired into `ci.yml :: python-lint`;
+  `--self-test` hand-edits the artefact and requires the drift to be caught.
+  The artefact keeps `executable` and `onDisk`/`quarantined` as separate
+  fields, and the UI leads with the executable count.
+- **`scripts/check_alert_reduction_claims.py`** — prose cannot be generated
+  the way a count can, so the retraction is gated instead. No published
+  surface may assert the legacy harness runs the production grouping; any
+  surface quoting 75.3 % must carry the retraction; the `alert_reduction`
+  suite card may not be declared `kind: 'measurement'`; and every surface
+  publishing the real figure must quote `PUBLISHED_REDUCTION_PCT`, a new
+  constant in `services/fusion/tests/test_alert_reduction_real.py` that the
+  test asserts against its own measurement — so the chain from measurement
+  to published prose has no hand-copied link. A paragraph that dates or
+  negates the claim is exempt, so the retraction can quote the wording it
+  retracts.
+- **The prerequisites that were required but undocumented.** Beyond Docker and
+  its memory, a first run needs `python3` **on the host** (`make smoke` runs
+  the golden-pipeline script there, so without it you can start AiSOC but
+  cannot prove it works), `bash` (`make up` gates on `scripts/doctor.sh
+  --ports-only` before it calls compose), and roughly 18 GB of free Docker
+  disk — previously implied only by a troubleshooting row noting that Kafka
+  corrupts its log directory and *still passes its healthcheck* when the
+  daemon runs out of space. Node 22 and pnpm 8, which the installers require,
+  were also unlisted. All are now in the quick-start prerequisites table with
+  the command each one gates.
+- **`scripts/check_demo_state_gated.py`** — a CI gate that asks the two
+  questions which do not depend on guessing the next syntax. *Is the
+  fabricated value reachable?* — every read of a fabricated symbol must have a
+  gate in scope, so `cond ? x : MOCK` fails and so does whatever replaces it.
+  *Does the component decide for itself that it is a demo?* — no component may
+  hold demo/sample **mode** in local state, because state derived from a fetch
+  failure fabricates exactly when the backend is unhealthy.
+  It treats three things as fabricated: a `MOCK_*`/`DEMO_*`-style constant; a
+  factory that builds one (the constant convention could not see
+  `buildDemoCase`); and any constant assembled out of either (`EASMView`
+  declared `const SUMMARY = { totalAssets: MOCK_ASSETS.length, … }`, carrying
+  the fabrication under a name the convention does not cover). It accepts the
+  four ways this tree legitimately gates — the read's own bracket-balanced
+  statement, an enclosing `if`, an early return, and a local derived from the
+  gate — but **not** a bare mention of the gate elsewhere in the file, which
+  is the hole `SLADashboard` fell through. Its `KNOWN_UNGATED` ratchet is
+  empty and checked in both directions; a gate seeded with its own exceptions
+  has never been true.
+
+- **The playbook parity gate now reads every declaration of the step
+  vocabulary, wherever it is.** `scripts/check_playbook_schema_parity.py`
+  compared the engine against `packages/types/src/playbook.ts` and never
+  opened `apps/web`; naming the editor's file here would have fixed that file
+  and left the next one free. The TypeScript half is a scan: every `.ts` and
+  `.tsx` file in the tree is parsed for literal collections of step-type
+  names, and any collection overlapping the engine's vocabulary must either
+  match it exactly or be a recorded subset with a reason, checked in both
+  directions so an exemption that stops being needed fails the build. The
+  editor's execution annotations are compared against the schema's
+  `x-aisoc-execution` in both directions as well, so a surface cannot tell an
+  author a step will run when the contract says it will not. `--list` prints
+  what the scan credited, not only what it flagged, and the gate refuses to
+  report agreement when it finds no declaration at all.
+
+  Against `origin/main` it reports 56 disagreements across all five
+  vocabularies; against this tree it credits five declarations, each complete.
+
+  Two limits are stated rather than left implicit: a collection overlapping
+  the vocabulary by fewer than two members is not treated as one, and a list
+  derived at runtime is not a literal and is not seen — which is the shape the
+  gate wants, because a derived list cannot drift. A file the reader cannot
+  parse to the end is never silently skipped: it is checked for step-type
+  names in its raw bytes first, and the gate refuses the tree if it finds any.
+
+- **A WCAG AA sweep over all twenty-two inspector forms.** The labels in
+  `SchemaForm` and `StepInspector` sat beside their controls with no
+  association, requiredness was an `aria-hidden` asterisk, help text was
+  unreferenced, and the error summary named fields it could not be reached
+  from. Controls now carry ids, labels `htmlFor`, `aria-required`,
+  `aria-invalid` and `aria-describedby`; errors are reported per field as well
+  as in the summary; the condition and params groups are fieldsets. The sweep
+  also caught `<ul role="alert">`, which is not an allowed role for a list and
+  left its items without a list parent.
+
+### Changed
+
+- **`readme_gates.py` covers the governance documents.** Its `FIGURE_DOCS`
+  list named one compliance page, which is why `ROADMAP.md` drifted with CI
+  green. `ROADMAP.md` and `RELEASES.md` are now on the list, the matrix
+  **row total** is compared as well as the GATED/PARTIAL split, and a figure
+  the prose explicitly dates ("the count at that time") is exempt so history
+  need not be rewritten.
+- **`check_scoreboard.py --check` verifies `agent_version` against
+  `VERSION`.** `--refresh` already stamped it; nothing compared it, and the
+  freshness gate reads only the date — which a refresh keeps current — so a
+  row could be two days old and still labelled two majors behind.
+### Fixed
+
+- **`/customers/example` published a fabricated case study on the public
+  site.** `generateStaticParams` pre-rendered every file in
+  `apps/web/content/customers/`, and `getCustomerBySlug` never consulted the
+  `draft` flag, so the template shipped as scaffolding was built into the
+  static output and served: a company that does not exist, invented
+  before/after numbers, a quote attributed to a role at it, and a claim that a
+  SOC 2 Type II auditor closed three named controls. The index page was
+  correct — it filters drafts — which is what made this invisible: the
+  fabrication was reachable only by its own URL, and by search engines.
+
+  Drafts are now excluded from pre-rendering, and resolve by slug only outside
+  production so an author can still preview their own work. Verified against
+  the build output rather than the source: the study appears in no file under
+  `.next/`, only the index route is generated, and the sitemap lists
+  `/customers` alone.
+
+  The index itself asserted customers exist when none do. Its metadata read
+  "Reference customers running AiSOC in production", its Open Graph
+  description promised "the before/after metrics each team reports", and its
+  heading read "Teams running AiSOC in production." — all published while the
+  published-study count was zero. The page now says so plainly and points at
+  the real screenshots and the repository instead.
+
+- **A duplicate "Investigation Chat" entry in the console sidebar.** It pointed
+  at `/investigate`, which permanently redirects to `/hunt` — a route the
+  sidebar already lists — so the entry advertised a surface that was collapsed
+  into Hunt, and whose component was removed as fabricated. Clicking it landed
+  on Hunt with the highlight on a different item than the one clicked.
+
+
+- **The `Public papers (regenerate PDFs)` workflow could never succeed on
+  `main`, and its design hid that from everyone opening a PR.** Its final step
+  pushed refreshed PDFs directly to `main`, which stopped being possible when
+  `main` became branch-protected — the push is rejected with
+  `GH006: Protected branch update failed`. Because that step is skipped on pull
+  requests, the workflow passed on every branch and failed only on `main`, so
+  contributors saw green while `main` carried a permanently red workflow.
+  Redirecting it to open a pull request instead is not available either: this
+  repository has Actions set to read-only permissions with pull-request
+  creation disabled.
+
+  It now reports staleness rather than repairing it, and `make papers` plus a
+  commit is the documented refresh path. The check compares each markdown
+  source's SHA-256 against the digest recorded when its PDF was last rendered
+  (`apps/web/public/papers/render-manifest.json`, written by `make papers`).
+  It deliberately does **not** compare PDF bytes — the workflow's own comment
+  asserted the render was deterministic, and it is not: WeasyPrint stamps a
+  creation timestamp into its output and glyph metrics depend on the host's
+  installed fonts, so two correct renders of one source differ and a byte
+  comparison would fail for reasons unrelated to staleness. Each of the five
+  conditions it claims to catch — edited source, missing PDF, unrecorded
+  render, orphaned manifest entry, and no sources at all — is now asserted by
+  a `--self-test` that runs as its own CI step ahead of the gate, so a check
+  that has stopped detecting anything cannot report the tree clean. Each rule
+  was then removed in turn to confirm the self-test fails without it. The run
+  also fails if any source renders no PDF, which nothing previously checked.
+
+  Adding a verdict mode made this script a gate, which `check_gate_contract.py`
+  then judged by the same contract as the other 85: it reported that the script
+  derived its repository root from `__file__` rather than asking git, and that
+  it declared no self-test. Both are fixed. The control case in that self-test
+  earned its place immediately — a nested helper assigned to the module paths
+  without a `global` declaration, so all five cases silently graded the real
+  tree, and only the case that *expects* a pass revealed it.
+
+  Two things fell out of the change. `apps/web/public/papers/README.md` told
+  readers "you no longer have to run the renderer locally before opening a PR"
+  and described the commit-back step as current behaviour; both were false and
+  are corrected. And the removed step set a commercial email domain as the
+  commit author inside the open-source repository, so its `check_hosted_hostname.py`
+  allow-list entry went with it — caught by that gate's own staleness check,
+  which reported an exemption recording two occurrences in a file that now has
+  none.
+
+- **`check_mock_data_gated.py` reported "All sample-data fallbacks are gated
+  behind demo mode." on a tree carrying nine of them.** Each gap was confirmed
+  by running the gate's own patterns against the live lines rather than by
+  reading them, and every fix is falsifiable on its own: reverting any one of
+  them turns exactly one self-test case red.
+
+  The dominant one was the fabrication test. It required an identity **and**
+  at least two numeric keys, so four datasets with zero numbers between them
+  were invisible — including fifteen invented ATT&CK coverage verdicts from
+  which `CoverageAdvisorView.tsx` derives and prints a coverage percentage.
+  The harm was never numeric, and the headline figure never existed as a
+  literal the gate could match. The numeric requirement is gone, replaced by
+  two unequal arms: an **estate identifier** — a hostname, an address, a
+  ticket reference — stands alone, because no filter list or route table in
+  this console contains one; a **proper noun** counts only alongside an
+  assertion of state, because most of this console's configuration is made of
+  proper nouns. That distinction is what separates fifteen coverage verdicts
+  from the fourteen-entry MITRE tactic vocabulary two directories away.
+
+  Eight more: a ternary (`cond ? real : MOCK_X`) is the same bypass as `??`
+  and matched nothing; a demo factory reached by `return` rather than through
+  a setter; an inline object literal handed to a setter in a `catch`, which
+  the docstring had always claimed to catch and never did; `= {` object
+  literals, scanned now like `= [` arrays; `useState(MOCK_X)`; a one-record
+  array, under a `< 3` floor; a single `(` defeating `\s*` in the nullish
+  rule; and `.ts` modules, which the record glob never opened.
+
+  Gating is now decided **per constant** from its use sites, not once per
+  file: one `demoFallback` anywhere used to credit every dataset in the
+  module, and `HuntView.tsx` has exactly that pair. `_is_exempt_name` was a
+  substring test over the whole line, so a line mentioning an editor
+  placeholder was skipped even when it also carried a real bypass.
+
+  Two things the relaxed detector got wrong, both found by enumerating what it
+  *credits* rather than what it flags: a comment explaining why a mock is
+  **not** reached at render was counted as a use of it, so three components
+  were reported for documenting their own fix; and the marketing pages'
+  published disclosure address matched the mailbox arm, so a mailbox now
+  counts as estate data only when it is not sitting beside the link you are
+  meant to click.
+
+- **A retracted benchmark figure was still badged "Real measurement".**
+  `apps/docs/docs/benchmark.md` withdrew the 75.3 % alert-reduction claim —
+  the harness that produced it groups on four tiers of `(rule_id, host,
+  user)` while the shipping `RawAlert.correlation_key()` groups on
+  `{tenant}:{entity}:{tactic}`, so it does not merely re-implement fusion's
+  grouping, it implements *different* grouping. The retraction reached one
+  surface of five. `BenchmarkResults.tsx` rendered a green **"Real
+  measurement"** badge on `0.753` with a blurb claiming the harness used the
+  production rules, "same logic"; `benchmarks/alert-reduction.md`
+  (`sidebar_position: 1`) called it a "faithful in-harness re-implementation"
+  and headlined 75.3 %; `ComparisonTable.tsx` qualified it as "measured on
+  fixed noisy stream". Two more were found while gating the invariant:
+  `benchmark-methodology.md`, and `benchmark.md` itself, which re-asserted
+  the claim in its own intro blockquote. All five now carry the wording
+  `benchmark.md` already uses. The comparison table quotes **33.3 %**, the
+  figure measured against the key the product actually runs.
+- **The landing page published three different wrong corpus counts.**
+  "6,998 detections" in four places (the tree indexes 7,016, of which 5,937
+  are quarantined and the engine loads **833**), "57 plugins" (77), "7,117
+  community items" (7,155), and `218 rules across 5 categories` on the
+  contributor leaderboard (833 across 6). The 6,998 figure also quoted the
+  imported corpus as the detection capability, presenting quarantined rules
+  as executable.
+- **Governance figures had gone stale.** `ROADMAP.md` published "136 rows —
+  128 GATED / 8 PARTIAL" against a matrix holding 139 / 131, in the same
+  sentence that tells the reader to recount with the script "rather than
+  trusting a figure quoted in prose — this line has gone stale before".
+  `CLAIM_TO_GATE_MATRIX.md` carried a stale executable-rule figure (939) in
+  a row note. The scoreboard's newest substrate row was labelled `v8.1.1`
+  while `VERSION` read `10.0.0`; it is refreshed from a fresh deterministic
+  run (0.97, unchanged) and now carries the tree's version. The scoreboard
+  keeps its three rows, all `substrate: true`, and no live-LLM row was
+  invented.
+- **The "Design partners" block on the landing page was removed** rather
+  than updated. Four dashed "Partner A–D" chips under the caption
+  "Reference partners onboarding through Q2 2026": placeholders rather than
+  fabricated logos, but four of them assert a partner count nothing in the
+  repository supports, and the window closed in June 2026 while still being
+  advertised as upcoming.
+- **The Windows installer routed evaluators to a stack that cannot answer the
+  question they came to ask.** `install.sh` was changed to bring up the real
+  deployment, create an administrator and verify the pipeline; `install.ps1`
+  was not, and nothing noticed. It handed off to `pnpm aisoc:demo` — a compose
+  file that opens by saying it does not run the AiSOC pipeline, has no ingest
+  service and no fusion service, sets `AISOC_DISABLE_KAFKA=true`, and whose
+  console content comes entirely from a seed script writing rows straight into
+  Postgres — and then printed `AiSOC is up and running.` A Windows user saw a
+  populated console and concluded the platform worked, having never run the
+  platform. `install.ps1` now performs the stages `make up` and `make smoke`
+  perform: a port pre-check that names the process holding a port rather than
+  letting compose fail with `Bind for 0.0.0.0:5432 failed`, `docker compose
+  up -d`, a wait that reads `docker compose ps -a` so an exited or
+  crash-looping container fails rather than passing, `docker compose run --rm
+  -T api python -m app.scripts.bootstrap_admin`, and the golden-pipeline
+  runner. Windows has no `make` and the Makefile's recipes are POSIX shell, so
+  these are native re-implementations of the same commands rather than a
+  `make` call; `tests/test_installer_parity_gate.py` fails the build if the
+  two installers diverge again.
+- **No administrator was created on Windows, and the closing banner said
+  nothing about credentials.** A Windows user either could not sign in at all
+  or signed in to a seeded database and evaluated that as the product. The
+  banner now surfaces the generated password the same way `install.sh` does:
+  printed once, stored nowhere, with the reset command alongside it. It also
+  no longer claims the pipeline was verified when the check was skipped for
+  want of a Python interpreter.
+- **`install.ps1` pointed at an uninstaller that does not exist.** The closing
+  banner named `.\scripts\install\uninstall.ps1`; the file is `uninstall.ps1`
+  at the repository root and has never been anywhere else, so the last
+  instruction the installer gave a Windows user could not work. The parity
+  gate now asserts every `.ps1` path either script tells a user to run is a
+  file in the repository.
+- **`uninstall.ps1` left the whole stack running while reporting success.** It
+  tore down only `infra/compose/docker-compose.demo.yml`, so every CORE
+  container — Postgres still holding 5432 — survived an uninstall that said it
+  was complete. It now brings down the root `docker-compose.yml` project
+  across every optional profile, then the demo project for anyone who ran the
+  older installer.
+- **`install.ps1` installed dependencies nobody tested.** It used
+  `pnpm install --no-frozen-lockfile` where `install.sh` uses
+  `--frozen-lockfile` for the stated reason that a self-hoster's install must
+  not quietly resolve a dependency set CI never saw. It also accepted Node 20
+  where `install.sh` requires 22, the version every workflow tests on and both
+  Node images ship. Both now match, and the gate compares them.
+- **The docs portal contradicted the README on whether the pipeline works.**
+  `quickstart.md` was a pre-v8.2 page built around `pnpm aisoc:demo`; because
+  the scripts it named still exist, nothing errored and it simply took readers
+  to the wrong stack. Three statements were false. It claimed `.env.example`
+  ships "a pre-generated dev `AISOC_CREDENTIAL_KEY`" — it ships a placeholder
+  that is worse than an empty value, because an empty one makes the API
+  generate an ephemeral key and warn while a malformed one makes the
+  credential vault raise, so the first request touching a connector secret
+  returns HTTP 500. It claimed events posted to `/v1/ingest/batch` "accept
+  cleanly but never become `Alert` rows", which is the exact path `make smoke`
+  asserts and the README publishes as its headline proof. And its cheat sheet
+  offered `aisoc keygen` as the way to generate that vault key, when `aisoc
+  keygen` writes an Ed25519 plugin-signing pair to `~/.aisoc/signing.key` and
+  has nothing to do with Fernet. The page is now written around `make up`,
+  `make bootstrap` and `make smoke`, and its compose-profile table was rebuilt
+  from `docker-compose.yml` rather than corrected from the old text — six port
+  numbers and profile memberships were wrong, and two whole profiles were
+  missing.
+- **`installation.md` documented flags that do not exist.** `-SkipDemo`,
+  `AISOC_SKIP_DEMO` and `-AisocDir` are not accepted by either installer; the
+  real spellings are `--no-launch` / `-NoLaunch` and `--clone-dir` /
+  `-CloneDir`. The page also still promised a browser opening on a seeded
+  ransomware case with pre-filled credentials, which no longer happens and for
+  which there are no default credentials.
+- **Five banners that misdiagnosed their own failure.** Four of them claimed
+  to be showing data they were not showing, which is worse than no banner: the
+  operator now has a confident diagnosis, it is wrong, and they spend the next
+  hour on the service it named. `ConnectorsView` printed "Connectors API
+  unreachable — showing demo instances so you can explore the interface" above
+  a list that is `data?.connectors ?? []` and therefore empty outside the
+  hosted demo, with four stat tiles reading a confident `0` beside it.
+  `RBACView` printed "showing demo roles" while `roles` was `undefined`, which
+  suppressed both the skeleton and the empty state — the banner was the only
+  thing on the page. `PlaybooksView` printed "showing demo playbooks", and a
+  truthy `error` suppressed its empty state too. `EffectivePermissionsView`
+  said "falling back to demo data" when `demoFallback(DEMO_RESULT)` is
+  `undefined` and there is no fallback, over a blank Cytoscape canvas with no
+  explanation at all. And the copilot pill labelled **any** error "Demo mode"
+  on deployments that are not the demo, beside a green "Connected" that
+  asserted connectivity before a single request had been made.
+  `lib/failure.ts` generalises the fix already made for the entity-risk queue.
+  Two rules: **name the upstream service only when that service is genuinely
+  at fault** (a 422 is a malformed request from the console and the backend is
+  healthy and saying so; a 401 is an expired session; neither is an outage),
+  and **say the data is unknown, never empty** — an empty list and an
+  unreadable list look identical and mean opposite things. `FailureBanner`
+  carries a retry that re-issues the request, which none of the five had; the
+  copilot surfaces a failed question in the thread with a retry that re-sends
+  it rather than leaving it unanswered under a pill. Two fetchers that threw
+  `new Error('HTTP 404')` and `new Error('Failed to fetch')` now throw
+  `ApiError`, because a status discarded in prose is a status no banner can
+  reason about. Every test asserts on **first paint** as well as the error
+  branch: `data` is `undefined` in both states, so a suite that only drives
+  the error branch never exercises the one a self-hoster sees on every load.
+- **Three surfaces that asked for the wrong tenant's data.** `/purple-team`
+  had `const TENANT_ID = '00000000-0000-0000-0000-000000000001'` at module
+  scope and used it for all nine of its requests, so on any deployment with
+  more than one tenant it read another tenant's ATT&CK coverage, drift
+  history, executions and tabletop sessions — and *wrote* into that tenant,
+  since "Capture snapshot" and "Create session" used the same literal.
+  `/honeytokens` had the same literal behind `NEXT_PUBLIC_TENANT_ID`, which is
+  inlined at build time and is therefore one constant for every operator of
+  every tenant. Both now read the active tenant from `TenantProvider`, and
+  every request is `null`-gated on it so nothing is issued against a guess.
+- **`/fim` was not tenant-scoped, and its own comment had gone stale.** The
+  component pinned `TENANT_ID = 'default'` and explained that
+  `services/osquery-tls` used a different tenancy model. That service had in
+  fact already been reconciled: its read path resolves a tenant UUID from the
+  caller's credential and lists `'default'` as a *placeholder* meaning "the
+  caller did not name a tenant", precisely because migration `001` seeds that
+  slug and the demo seed renames it to `demo`. What was actually broken: the
+  console sent no credential at all, so there was no scope to resolve; and
+  `/fim/summary` resolved the scope correctly for its total and then filtered
+  its by-action and top-paths breakdowns on the **raw** query parameter, so
+  one card showed three numbers computed against two different tenants. Not a
+  leak — anything out of scope was already refused — but wrong. The client
+  sends the session bearer and no tenant; the endpoint filters every query on
+  the resolved scope. Still unreconciled and now stated rather than implied:
+  node *enrolment* keys `Node.tenant_id` as a `String(64)` defaulting to
+  `"default"`, so a node enrolled with no tenant header writes events under a
+  string no console read can resolve. That is an enrolment-side migration.
+  Three contract breaks found while proving the tenancy fix was observable,
+  all of which made the page unusable regardless of tenancy: the summary
+  response never carried `active_nodes` while the card called
+  `.toLocaleString()` on it; the events response is `{items, offset, limit}`
+  and the client read `{events, page, page_size}`; and the client sent
+  `page`/`page_size`/`since` to an endpoint declaring `offset`/`limit` and no
+  `since`, so FastAPI dropped all three — every page showed the same first 100
+  rows and every time window showed the same events.
+- **A non-promoted event now leaves a thread to pull.**
+  `promote_normalized_event` returned `None` and the consumer incremented
+  `not_promoted`. The aggregate reached `/metrics`, so an operator could see
+  that events were being dropped and nothing else — not which connector, not
+  what shape, not why. "I connected my SIEM and no alerts appeared" is the
+  first question a new user asks and a counter cannot answer it. The log now
+  names the connector, the OCSF class and category, the severity, which
+  promotion condition was not met, and that the event is in the lake.
+  **Volume:** this is the hot path and most ingested telemetry is correctly
+  not promoted, so a line per event would be the platform's highest-volume log
+  and would cost more than the pipeline it describes. A pure time-sampled
+  rollup is wrong the other way — somebody who has just connected a source
+  needs the answer in seconds. So both, split by novelty: the **first** event
+  of each distinct `(connector, class, severity, reason)` shape is explained
+  in full immediately, everything after it is counted into a rollup emitted at
+  most once per 60s (`AISOC_NOT_PROMOTED_ROLLUP_SECONDS`). Steady-state cost
+  is one line per minute regardless of throughput. Tracked shapes are capped
+  so a connector emitting a garbage `class_uid` per event cannot make the
+  sampler a memory leak.
+- **`splunk_enterprise` stays non-promoting, and now says so on the event.**
+  The profile maps raw Splunk *search result rows* (`_time`, `src`, `dst`,
+  `user`), not notables, and it stays at `classUID: 4001`: promoting each row
+  of an arbitrary saved search would turn a result set into an alert queue,
+  which is what the `splunk` profile at 2001 already does properly for
+  findings that have passed Splunk's own correlation. Its `severityMap` was
+  literally empty, which was read as the cause of the silence; it was not —
+  severity mapping already falls through to the shared five-tier ladder, so a
+  row carrying `severity: "critical"` scores 5 and promotes. Naming that
+  ladder on the profile changes nothing at runtime and stops the next reader
+  making the same diagnosis. What remains true is that a row with **no**
+  severity field scores 0, and category 4 with severity 0 satisfies neither
+  branch — such an event now carries a `normalization_warnings` entry saying
+  exactly that, which lands in the lake beside it rather than scrolling past
+  in a log. A test pins the two constants against the fusion policy they
+  mirror.
+- **Organisation memory reaches the triage prompt.** `active_statements`
+  compiles repeated, tagged analyst disagreement into durable statements; a
+  repo-wide grep returned exactly one match, its own definition. Its write
+  counterpart `record_disagreement` had no caller either, so the memory was
+  neither written nor read and the platform triaged the next identical alert
+  knowing nothing about the last one being overturned. Both ends are wired,
+  because wiring only the read would have been a query against a table nothing
+  populates: `POST /feedback/alert-override` takes an optional `reason_code`
+  from the closed vocabulary, and the agents triage worker reads
+  `GET /feedback/context-statements` into the prompt over HTTP — the API owns
+  the session and the expiry semantics, and a second copy of that SQL would be
+  a second definition of "active". Statements are presented to the model as
+  advisory evidence rather than instructions, because a statement needs two
+  analysts and phrasing it as fact hands anyone who can produce two benign
+  votes a suppression the model obeys. Fails soft, caches for 120s, and
+  `test_organisation_memory_in_prompt.py` proves the claim by capturing the
+  messages handed to the model with and without a recorded disagreement and
+  diffing them.
+- `EmptyState` accepts a `headingLevel`. `ConnectorsView` renders it directly
+  under the page `h1`, so the default `h3` skipped a level and failed
+  axe-core's `heading-order` rule.
+- **Six console surfaces rendered fabricated security data outside demo mode,
+  on a tree where the existing gate reported clean.** The gate recognises
+  *shapes* — a bare mock in SWR's `fallbackData`, a mock through a state
+  setter, a mock behind `??`. Each was added after a specific escape, so each
+  knows only the syntax that got past it last time.
+  `SLADashboard.tsx` wrote the same defect as a ternary. Line 446 passed
+  `fallbackData: demoFallback(MOCK_SLA_METRICS)`, which is correct and which
+  the gate accepted; line 457 then read `isValidMetrics ? rawMetrics :
+  MOCK_SLA_METRICS`. Outside the hosted demo `demoFallback` returns
+  `undefined`, so the test is falsy on **first paint as much as on error**,
+  and 847 alerts, 23 breaches, a 2.7% breach rate and a 42.5-minute MTTR
+  rendered in both states, identically, on every deployment. The disclosure
+  banner fired only on `metricsError`, so during loading the invented figures
+  appeared with nothing saying so.
+  The worst of the six was `CaseWorkspace.tsx`. A failed case load rendered
+  `buildDemoCase(caseId)`, which copies the route param, so the invention did
+  not present as sample data — it presented *as the case the analyst had
+  opened*, with an invented title, assignee, four linked alert ids, three
+  ATT&CK techniques and a five-event timeline including "Auto-investigation
+  completed". Separately, a failed `casesApi.investigate` was caught and
+  turned into `status: 'completed'` carrying recon IOCs (`192.168.1.105`,
+  `c2.evil-corp.io`), a forensic root cause at 0.88 confidence drawn as a
+  progress bar, three containment actions and a four-entry agent audit log.
+  The structured panels carried no caveat of their own; only a transient
+  toast did, and it is gone by the time anyone reads the verdict. This is the
+  `AlertDetailView` catch-block defect from v10.0.0, surviving in a second
+  file. And `updateStatus` mutated the SWR cache optimistically and, on
+  failure, toasted "writes disabled" without rolling back, so the workspace
+  showed a status the database did not have.
+  `HuntView.tsx` had no demo gate at all: its `demoMode` was a local
+  `useState(false)` flipped by **fetch failure**, so it substituted three
+  detections on named hosts with encoded-PowerShell command lines precisely
+  when the backend was unhealthy — when a reader is least equipped to notice.
+  It also published `took: 42`, a query latency for a query that never ran,
+  in the same line as a real measurement.
+  `CoverageAdvisorView.tsx` was fabricated end to end, with no API call
+  anywhere in the file: fifteen invented ATT&CK verdicts whose recommendation
+  column asserted deployment state it could not know ("Existing PowerShell &
+  Bash rules active"), four headline cards computed from them so "Coverage
+  50%" and "Critical Gaps 5" were byte-identical everywhere, and one button
+  that raised `toast.success('Detection rule draft created')` and created
+  nothing. It now reads `GET /api/v1/detection/coverage`.
+- **`/coverage-advisor` reports what that endpoint can actually support.**
+  The endpoint returns one cell per technique *at least one rule references*,
+  so a technique nobody has written a rule for never appears and a percentage
+  over those cells is not coverage of ATT&CK — on a tenant with three rules it
+  would read 100%. The page therefore reports the fraction, names its own
+  blind spot in the body copy, and publishes no coverage score. "Covered"
+  means *enabled*: a technique whose only rules are switched off gets its own
+  status and a link to those rules, because a disabled rule detects exactly as
+  much as no rule. The `ROADMAP.md` and `apps/docs/docs/architecture.md`
+  claims that it "ranks technique gaps by adversary prevalence" were corrected
+  — no prevalence data exists anywhere in the tree.
+- **The server fetch on `/cases` was discarded on every non-demo
+  deployment.** `initialCases` is documented as server-rendered data that
+  avoids a flash of mock content. It was folded into the same object as
+  `MOCK_CASES` and the whole thing passed through `demoFallback(fallback)`,
+  which returns `undefined` outside the hosted demo *regardless of whether
+  real SSR data was supplied* — so the round-trip in `cases/page.tsx` was
+  made, awaited and thrown away. Real SSR data is not sample data, and the
+  gate that withholds one must not withhold the other.
+- **`CopilotDock` answered a failed request with an assistant turn.** Same
+  class as the above: a local `demoMode` flipped by fetch failure. Outside the
+  hosted demo the dock now reports that the copilot could not be reached, with
+  the error, instead of emitting a reply.
+
+**The documented quick start broke the product, and then the product had
+nothing to show.** Every item below passed the existing test suite and
+failed on a real deployment. They are grouped by what a new user actually
+hit, in the order they hit it.
+
+#### Following the README broke the credential vault
+
+- **`.env.example` shipped `AISOC_CREDENTIAL_KEY=replace-me-with-a-freshly-generated-fernet-key`,
+  and `cp .env.example .env` is step two of the quick start.** The vault takes
+  its friendly ephemeral-development-key path only when the key is *empty*; a
+  non-empty invalid key reaches `Fernet()` and raises, which the connector
+  endpoints turn into HTTP 500 `credential vault unavailable`. Nothing failed
+  at boot. So **not** copying the template produced a working vault and
+  following the documented instructions produced a broken one, discovered
+  minutes later at the connector wizard with nothing linking the two.
+
+  Fixed at setup rather than in the vault: `make up` now runs
+  `scripts/ensure_env.py`, which creates `.env` and writes a real random value
+  for `AISOC_CREDENTIAL_KEY`, `SECRET_KEY` and `AISOC_SERVICE_TOKEN`. It is
+  idempotent and never rotates a value an operator already set, and it uses
+  the standard library so it does not put a `pip install` in front of
+  `make up`. Teaching the vault to tolerate a placeholder was the alternative
+  and would have been worse: a deployment whose saved connector credentials
+  silently do not survive a restart. The three secrets now ship **empty** in
+  the template as well, so a hand-copied `.env` degrades to the documented
+  development path instead of a hard 500.
+
+- **`make doctor`'s placeholder check matched neither placeholder the
+  repository shipped.** It grepped
+  `^[A-Z_]*(SECRET|PASSWORD|KEY)=(change_me|changeme|)$` while the template
+  carried `replace-me-…` and `change-this-…` — a gate built to catch shipped
+  placeholders that was blind to every shipped placeholder, and that reported
+  clean on the one `.env` that broke the vault. The check now delegates to
+  `scripts/check_env_placeholders.py`, and `tests/test_env_placeholder_gate.py`
+  compares the detector against the template in both directions: every
+  non-empty value in `.env.example` must be either recognised as a placeholder
+  or declared in the test as a deliberate working default. A new placeholder
+  cannot be added without one of the two failing.
+
+#### The connector wizard could not complete
+
+Three independent causes, all silent, all fixed:
+
+- **The API was never given the credential it presents to the connectors
+  service.** `_service_token()` reads `AISOC_CONNECTORS_SERVICE_TOKEN` then
+  `AISOC_SERVICE_TOKEN`; compose interpolated the shared token into
+  `connectors`, `ueba`, `honeytokens` and `purple-team` and **not into the one
+  service that has to send it**, and with no `env_file` anywhere a value in
+  `.env` could not reach it by any route. Every catalog call was answered 401
+  and fell back to the bundled copy with `degraded=True`. Measured after the
+  fix: the catalog is `live` with **84** connectors instead of the bundled 26.
+
+- **"Test connection" sent no `Authorization` header at all.** The catalog call
+  beside it had been given one and this one had not, so it was answered 401 on
+  every invocation — and 401 was the one status the ladder did not branch on,
+  so it fell through and returned a body with no `success` key. The wizard
+  reads `result.success`, found it absent, and rendered the bare string
+  **"Connection test failed"** for an internal service-auth misconfiguration,
+  while its own help text promised "Credentials are tested against the
+  upstream API". The upstream API was never reached. It now sends the same
+  headers as the catalog call, branches on 401/403 explicitly, refuses any
+  unhandled 4xx rather than returning it as a verdict, and guarantees a
+  `success` key. An operator now sees: *"connectors service returned HTTP 401
+  to this API's service credential. AiSOC's API could not authenticate to its
+  own connectors service, so your credentials were never sent upstream. Set
+  `AISOC_SERVICE_TOKEN` …"*. The wizard also reads FastAPI's `detail` out of
+  the response body instead of showing only the status line.
+
+- **The connectors service answered 503 to everything on a default stack.**
+  Its `SECRET_KEY` compose default is one of `INSECURE_SECRET_DEFAULTS`, so
+  `resolve_console_secret()` returns `""`; with `AISOC_SERVICE_TOKEN` also
+  blank it has no credential material and fails closed, correctly. The
+  dev-mode escape that exists for exactly that case was set on `actions`,
+  `ueba`, `honeytokens`, `purple-team` and `slack-bot`, and not on
+  `connectors`. Now set — and once `make env` generates a real token, dev mode
+  stops applying at all.
+
+#### CORE had no real data and no AI
+
+- **`services/threatintel` and `qdrant` moved from the `full` profile into
+  CORE.** The CISA Known Exploited Vulnerabilities catalog is authoritative,
+  public and needs no API key, and has been wired as a scheduled handler the
+  whole time in a profile nobody starting out runs. Meanwhile the console
+  shipped a `/threat-intel` page whose endpoint existed in no profile, and that
+  page was recently caught rendering five invented IOCs. The missing feed and
+  the fabrication were one hole. A fresh `make up` now populates the console
+  with **1,723 real KEV entries** within a minute of boot, with no credentials.
+  New: `GET /api/v1/threat-intel/indicators` on the API, proxying a new
+  indicators route on `services/threatintel` backed by Qdrant.
+
+- **A daily feed would not have polled for a day.** `FeedScheduler.register`
+  handed APScheduler an `IntervalTrigger` and nothing else, and an interval
+  trigger schedules its *first* run one whole interval after start — 86400
+  seconds for KEV. A fresh install had a healthy container, a registered feed,
+  a created collection, and an empty page for twenty-four hours, with nothing
+  anywhere reporting a fault. First poll is now jittered into the first twenty
+  seconds.
+
+- **CISA's edge returns 403 to whole networks regardless of user agent.**
+  Observed with curl, httpx and a browser UA. Without a fallback every
+  deployment on such a network gets permanently zero indicators and no error a
+  user would see. The canonical `cisa.gov` URL stays primary; CISA's own
+  `cisagov/kev-data` GitHub repository — same publisher, identical schema — is
+  the fallback, and the log line names which source answered.
+
+- **OpenSearch and Neo4j are no longer required by `threatintel`.** Its
+  lifespan called `os_store.initialize()` with no `try`, which made a
+  `full`-profile store a hard dependency of a CORE service. Both that call and
+  the pipeline's bulk index are best-effort now: with OpenSearch you
+  additionally get full-text IOC search; without it the feeds still write to
+  Qdrant, which is what the console reads.
+
+- **Ollama moved from the air-gapped overlay into CORE**, with its pinned
+  `llama3.2:3b-instruct-q4_K_M` (~2 GB, CPU-only). The gateway had already
+  moved into CORE and the models it pointed at had not, so a default install
+  could route a key nobody had. `make up` now produces real triage verdicts
+  from a real model with real token counts. `litellm` waits on the model pull
+  completing rather than on Ollama being healthy, because a gateway that is up
+  before the weights exist answers the first request — the one a new user
+  makes — with "model not found". The aliases in `infra/litellm/config.yaml`
+  now read their backend from the environment, so moving to a hosted provider
+  is three variables in `.env` rather than an edit to a mounted config file.
+
+- **Every auto-triage run on a default install was dead-lettered.**
+  `record_auto_triage` bound the two cost columns directly while
+  `complete_run` beside it used `COALESCE`; both are `NOT NULL`, and
+  `estimated_cost_usd` is `None` for every run against a local model because
+  there is no list price for `ollama_chat/…`. The UPDATE violated the
+  constraint, the transaction rolled back, the worker retried three times and
+  dead-lettered the alert — a real LLM call, real tokens, and no verdict in
+  the console. Found only because a model shipped in CORE made it the normal
+  case rather than an edge case.
+
+- **A small model that stops mid-JSON no longer loses its verdict.** Measured
+  against the bundled model, triage responses arrive with the closing quote
+  and brace absent and `finish_reason: "stop"` — every field the caller reads
+  present and correct, and the whole response discarded. The parser now closes
+  what the model opened, and nothing more: a fragment too damaged to read
+  still raises, so the deterministic fallback stays reachable rather than a
+  verdict being invented from an empty object. A failed parse now logs a
+  bounded excerpt of what the model actually said, which previously could only
+  be discovered by reproducing the prompt by hand.
+
+#### Other first-run friction
+
+- **`ENVIRONMENT` was a bare literal in `docker-compose.yml`**, so the value
+  `.env.example` documents was ignored and setting `production` changed
+  nothing — including the dev auth bypass in `dev_auth.py`, which could not be
+  switched off from `.env` at all. Now interpolated, along with `LOG_LEVEL`.
+- **`AISOC_CONSOLE_URL` appeared in no `.env.example` entry, no compose
+  service and no doc**, so every deployment that is not a laptop printed the
+  wrong sign-in address beside a password shown exactly once. Now wired and
+  documented.
+- **`python3`, `bash` and the Docker disk requirement were undocumented** while
+  `make smoke` — the README's headline proof — runs a Python script on the
+  host. `make doctor` now checks for both interpreters, and the measured
+  requirements are published.
+- **`handler.go` rendered its over-size error with `string(rune(…))`**, so a
+  limit of 1000 told the caller their batch exceeded a maximum of `Ϩ`.
+- **`apps/docs/docs/operations/security.md` named an init script that does not
+  exist** (`zz_runtime_role_password.sh`; the file is
+  `20_runtime_role_password.sh`).
+
+#### Measured, not estimated
+
+CORE's published figures moved because the footprint was measured before and
+after on the same machine:
+
+| | Before | After |
+|---|---|---|
+| Services | 11 | 14 (plus a one-shot model pull) |
+| Images, unique layers | 8.11 GB | 16.46 GB |
+| Model weights (named volume) | — | 2.02 GB |
+| Resident memory, whole stack | 1.72 GiB | 4.84 GiB |
+
+The README's `~6.5 GB` becomes **8 GB of memory and 20 GB of disk**. Ollama is
+9.6 MiB resident when idle and 2.96 GiB while serving a request; the second
+number is the one the requirement is sized against.
+
+### Removed
+
+- **`apps/web/src/components/copilot/InvestigationChat.tsx`** — canned
+  threat-intel replies ("VirusTotal: 14/87 engines flagged malicious",
+  "Associated campaigns: APT-42"), a fixed context sidebar, no API call for
+  the chat, and imported by no file. One import from being live, which is the
+  `MitreStrip.tsx` precedent exactly. It also embedded a personal email
+  address in OSS source; the same string in `FunnelKpiBar.tsx` was removed
+  too. `/investigate` already permanently redirects to `/hunt`, and the
+  multi-turn copilot is `CopilotDock` and `/copilot`, so the docs line naming
+  this component was corrected rather than the component wired.
+
+- **The playbook editor could author nine of the engine's twenty-two step
+  types, and the build was green.** `apps/web/src/components/playbooks/types.ts`
+  declared its own nine-member `StepType` union under a header comment
+  claiming it mirrored `services/agents/app/playbook/models.py`, which
+  declares twenty-two. The registry behind every form is keyed
+  `Record<StepType, StepSchema>`, so exhaustiveness was satisfied against the
+  *local* union and thirteen missing forms compiled cleanly; had it imported
+  the union from `packages/types`, `Record` would have failed with thirteen
+  missing keys. None of the fourteen files in the directory imported the
+  published package. It now re-exports `StepType` from `@aisoc/types`, and the
+  compiler named the gap.
+
+  The thirteen forms are built: `block_ioc`, `osquery_live_query`,
+  `disable_user`, `reset_password`, `revoke_session`, `force_mfa`,
+  `kill_process`, `quarantine_file`, `run_av_scan`, `run_script`,
+  `search_siem`, `create_notable_event`, and `approval`. Each collects what
+  its executor in `services/actions` reads, and each governed verb's target
+  field is keyed on the name `engine._resolve_target` actually looks for, so a
+  saved step carries its own target rather than depending on the alert context
+  happening to hold one. Nothing collects a credential — those are resolved
+  per tenant from the connector vault at dispatch — and nothing offers a
+  `dry_run` control, because the bridge does not read one.
+
+  `approval` is presented, never offered. The engine records it in
+  `_UNBRIDGEABLE` with a full reason, so the palette and the type dropdown
+  filter on `execution !== 'unimplemented'` rather than on its name, an
+  existing `approval` step still renders so an imported playbook can be read
+  and fixed, and the inspector states that the engine fails the step closed
+  and the run stops there.
+
+- **`osquery_live_query` reported SUCCESS while running nothing.** Its handler
+  returned an error dict when the osquery backend clients could not be
+  imported — which is always, in the shipped agents image, because those
+  clients live in `services/actions` — and a returned dict leaves the step
+  status at SUCCESS. Reachable from the console the moment the editor could
+  author the type, so it now raises `PermanentStepFailure` and fails closed.
+
+- **Three more partial vocabularies in the same directory.** `stepColors.ts`
+  held a second nine-entry `Record<StepType, …>`; `StepInspector` and
+  `PlaybookEditor` each hard-coded a nine-member array. All three are derived
+  from the registry now. `packHelpers.ts` mapped step types to integration
+  badges as a `Record<string, …>` covering eighteen of twenty-two, so a
+  playbook built from the other four claimed to use no integrations at all.
+## [10.0.0] — 2026-09-25
+
+**Two ways for a control to be absent: not written, or written and not
+reachable.** This release is mostly the second. Row-level security covered 92
+tables and filtered nothing, because every service connected to Postgres as a
+superuser. Fifty-eight routes across four services carried no authentication
+at all. UEBA consumed events, reported healthy, and could not write a baseline
+or an anomaly. AI triage was wired to a gateway that both of its resolvers had
+been deliberately written to ignore. In each case the mechanism was present
+and the path to it was not.
+
+Read the BREAKING section before upgrading. **Every deployment must act on one
+item**: services now connect as a DML-only `aisoc_app` role rather than as the
+schema owner, which is what makes those 92 policies filter. The bundled
+Postgres provisions it on a fresh volume; an existing volume or a managed
+database does not.
+
+Two published figures moved because they were measured rather than restated:
+CORE is **11 services** — the LLM gateway is in it now, so a provider key
+works with no profile change — and `full` is **21**, not the 30 previously
+published. The quick start also ends differently: `make up` creates an
+administrator and prints a generated password once, because the credential
+pair the documentation used to publish was wrong in three independent ways and
+nobody following the README could sign in.
+
+### BREAKING
+
+- **The services no longer connect to Postgres as a superuser, so the 92
+  row-level-security policies added below now actually filter.** The previous
+  entry closed the coverage gap and measured, in the same breath, that none of
+  it did anything: `docker-compose.yml`, the CI service containers, the Helm
+  chart and the Terraform environment all ran every service as
+  `POSTGRES_USER=aisoc`, which the postgres image creates as a **superuser**,
+  and a superuser ignores policies *even under* `FORCE ROW LEVEL SECURITY` —
+  FORCE binds the table owner, not a superuser. Sixty-one new policies bought
+  nothing operationally.
+
+  `061_runtime_app_role.sql` splits the credential in two. `aisoc` owns the
+  schema and applies migrations; `aisoc_app` is what every service connects
+  as, holding `USAGE` on `public`, `SELECT / INSERT / UPDATE / DELETE` on
+  tables and views, `USAGE, SELECT` on sequences and `EXECUTE` on functions —
+  no `CREATE`, no `TRUNCATE` (`002_rls.sql` had granted `ALL`, which let one
+  statement delete every tenant's rows without a policy seeing a `WHERE`
+  clause), and ownership of nothing. Measured on `postgres:16` with two alerts
+  seeded one per tenant and the session bound to tenant A, reading `alerts`
+  with **no tenant predicate at all**: the old role saw 2, the new role sees
+  1, and an insert for tenant B is refused by the policy.
+
+  Things this turned up along the way, each of which would have survived the
+  role switch and quietly undone it:
+
+  - **Two views read around every policy underneath them.** A view executes as
+    its *owner* unless declared `security_invoker`, and both views here are
+    owned by the role that ran the chain. Bound to tenant A,
+    `mssp_tenant_latest_metrics` returned 2 rows before and 1 after.
+  - **`SET LOCAL row_security = off` stops being a no-op and becomes a
+    crash.** For a role the policies apply to, Postgres refuses the query
+    rather than ignoring the policy. The retention purge, the hunt scheduler's
+    sweep and tenant deletion all used it; all three now rely on the
+    `OR current_tenant_id() IS NULL` arm and call `assert_cross_tenant_session()`
+    first, which raises if a tenant *is* bound — a sweep that sees one tenant
+    and reports success is worse than one that fails.
+  - **`CREATE TABLE IF NOT EXISTS` still needs `CREATE` on the schema when the
+    table already exists**, because Postgres checks the ACL before the
+    existence test. Two stores in `services/agents` opened their pool that way
+    and swallowed the failure into `logger.debug`, so the agents service would
+    have silently recorded no cost telemetry and no institutional memory at
+    all. Both tables are already in the migration chain; the bootstrap now
+    probes first and reports at `error` if it genuinely has to create one.
+
+  Deployment surfaces updated: `docker-compose.yml`, the demo compose stack,
+  `integration.yml`, the Helm chart's `values.yaml`, the Terraform environment
+  (which now generates the runtime role's password rather than reusing the RDS
+  master user) and `.env.example`. `infra/postgres/initdb/zz_runtime_role_password.sh`
+  sets the credential on a fresh volume before the container reports healthy;
+  `app.scripts.run_migrations` applies it on every run, which covers an
+  upgrade in place. **Operators on a managed Postgres must act**: apply the
+  chain as the owner with `AISOC_APP_DB_PASSWORD` set, then point
+  `DATABASE_URL` at `aisoc_app` and `DATABASE_MIGRATION_URL` at the owner.
+  `002_rls.sql` created `aisoc_app` with the literal password `changeme`; 061
+  does not clear it (that would break an operator who had already set a real
+  one), so rotate it if none of the automatic paths applies to you.
+
+  Two new gates, both with a self-test that runs before the scan and both
+  failing over an empty or absent tree. `scripts/check_runtime_db_role.py`
+  fails if a runtime DSN connects as the role that surface provisions as the
+  database superuser — structurally, by reading `POSTGRES_USER` /
+  `db_username` out of the tree rather than matching a name — and in
+  `--dsn` mode reads `pg_roles` and `pg_class` directly, catching
+  `rolsuper`, `rolbypassrls`, ownership, a view without `security_invoker`,
+  and a role still accepting `changeme`. `scripts/check_rls_policy_shape.py`
+  fails if a policy is written without the fail-open arm, replaying the chain
+  in order so a definition a later migration repaired is not reported. Both
+  run in `isolation.yml`; the live half runs in `integration.yml`.
+
+  `tests/isolation/test_postgres_rls.py` now reads as `DATABASE_URL` — the
+  role the deployment ships — instead of a `NOSUPERUSER NOBYPASSRLS` role it
+  constructed for itself, so its 80-table two-tenant replay covers what ships.
+  `test_superuser_bypasses_rls_which_is_why_the_probe_role_exists` is replaced
+  by its inverse.
+
+- **The four services that run their own alembic chain now migrate as the
+  owner and serve as the runtime role, and three of them were not reached by
+  the role switch at all.** `honeytokens`, `osquery-tls`, `purple-team` and
+  `ueba` manage their own schema, and each applied it as whatever DSN the
+  operator supplied — so their migration and runtime credentials were the same
+  one, and pointing such a service at the owner turned off row-level security
+  for the twelve tables those chains own with nothing objecting. Each
+  `env.py` now reads `<SERVICE>_DATABASE_MIGRATION_URL`, then
+  `DATABASE_MIGRATION_URL`, and only then falls back to the runtime DSN with a
+  warning on stderr naming what will break.
+
+  Three things were found while wiring it, each measured rather than inferred:
+
+  - **`DATABASE_URL` was inert on three of the four.** `docker-compose.yml`
+    sets it on every service, but `honeytokens`, `purple-team` and
+    `osquery-tls` declare `env_prefix` in their settings, so the name they
+    read is `HONEYTOKEN_DATABASE_URL` and the compose entry did nothing: each
+    fell back to a default naming the **owner**. Both spellings now resolve,
+    unprefixed first, the convention `services/ueba` and `services/fusion`
+    already used. Operator note: on a deployment that sets both to *different*
+    databases, the unprefixed one now wins.
+  - **The four chains shared one `alembic_version` table** — they share one
+    database in the default deployment and number their revisions identically.
+    Following `apps/docs/docs/quickstart.md` against `postgres:16`: after
+    `ueba` reached `0002`, `honeytokens alembic upgrade head` ran **zero**
+    migrations and `purple-team` failed applying its RLS revision to tables
+    that had never been created, so two services had no tables and no policies
+    and every command reported success. Each chain now keeps its own version
+    table and adopts an existing deployment's recorded version on the next
+    upgrade — only when that chain's own tables are already present, so it
+    cannot claim a sibling's row.
+  - **The runtime role had no grant on those tables.**
+    `061_runtime_app_role.sql` grants over `ALL TABLES` as they stood and sets
+    `ALTER DEFAULT PRIVILEGES` for the role that issued it; nothing orders the
+    chains against it, and a deployment applying them under different owners
+    gets neither. Each chain now grants `SELECT, INSERT, UPDATE, DELETE` on its
+    own tables, guarded so it is a notice rather than a failure where the role
+    does not exist.
+
+  Verified live on `postgres:16` with all four chains applied and two tenants
+  seeded: bound to one tenant the runtime role sees one row of two in
+  `ueba_entity_baselines`, `honeytokens` and `osquery_node`; unbound it sees
+  both, which is the fail-open arm the cross-tenant sweeps depend on; a
+  cross-tenant insert is refused by the policy; `CREATE TABLE` is refused with
+  `permission denied for schema public`; `ALTER TABLE … NO FORCE ROW LEVEL
+  SECURITY` with `must be owner of table`; and `SET LOCAL row_security = off`
+  raises rather than doing nothing. None of the four chains creates a view, so
+  the `security_invoker` hazard does not arise there, and none of the four
+  services issues DDL outside its chain.
+
+- **The published `aisoc-web:latest` image shipped demo mode baked on**, and
+  it is the image `docker-compose.yml` pulls for `make up`. Next inlines
+  `NEXT_PUBLIC_*` at build time, so there was no runtime escape: a
+  self-hoster's console announced "Demo data resets daily at 00:00 UTC. All
+  write actions are disabled." over their own real alerts, disabled every
+  write control, and offered a "Self-host AiSOC" link inside an already
+  self-hosted install. The only remedy was to rebuild the image.
+
+  The demo is now its own build under its own tag. `latest`, `main` and
+  `vX.Y.Z` are the product with demo mode off; `demo` and `vX.Y.Z-demo` carry
+  the demo bundle, and `infra/compose/docker-compose.demo.yml` pulls those.
+  Nothing has to choose between a working demo and a usable self-host image.
+
+  Demo credentials are also no longer compiled into a non-demo bundle at all.
+  `apps/web/Dockerfile` defaulted the autologin address and password to real
+  values, and `login/page.tsx` and `DemoAutoLogin.tsx` each declared them as
+  module-level literals — gating the *render* on `isDemoMode()` hid the panel
+  but left the strings in every chunk the project ships. All three now read
+  them from the build environment, and only the demo build supplies them.
+
+- **Three MSSP response schemas describing fabricated data are removed:
+  `MSSPKpiOverview`, `ManagedTenantRow`, `CrossTenantIncident`.** They were
+  the shape of five hardcoded companies with invented alert counts, not the
+  shape of anything the platform measured. `/mssp/overview`,
+  `/mssp/tenants` and `/mssp/incidents` keep their paths and now return
+  `PortfolioSummaryOut`, `PortfolioTenantOut` and `PortfolioAlertOut`,
+  computed from real rows.
+
+  What moved, and why it could not be preserved:
+
+  - `health_score` / `avg_health_score` are **gone**, not nulled. It was an
+    undefined composite with no formula anywhere in the tree; keeping the
+    field would promise a measurement that does not exist. (`MetricsOut` on
+    the separate `/mssp/metrics` route still carries a `health_score` and is
+    unchanged by this release.)
+  - `avg_mttr_minutes` → `mttr_minutes`, measured from cases a tenant
+    actually closed in the trailing 30 days, and **null** when it closed
+    none. The old value was the literal `23.4`. Present on both the per-tenant
+    row and the portfolio summary, where it averages only over tenants that
+    closed something rather than counting a null as a zero.
+  - `sla_breach_count` and `sla_breaches` → `sla_breached_cases`, counted
+    from `cases.sla_breached`.
+  - `connectors_online` / `connectors_degraded` / `connector_status` →
+    `total` / `healthy` / `stale` / `error`, derived from each connector's
+    `health_status` and `last_sync`. Nested under a `connectors` object on
+    the per-tenant row; flat `connectors_*` fields on the summary.
+  - `tenant_id` is now a real tenant UUID rather than a string like
+    `"t-acme"`.
+  - `assignee` is gone from the incident rows. It named invented analysts;
+    an alert's real owner is `case_id`, which is now returned instead.
+  - New: `synthetic_alerts`, so seeded demo rows are counted apart from a
+    tenant's real posture instead of inflating it.
+
+  The routes also return `403` to a caller who belongs to no operator
+  organisation, where they previously returned an empty list to anyone
+  authenticated.
+
+  Nothing in `apps/web` consumes these three routes; it calls
+  `/mssp/children`, which is unchanged.
+
+- **Two `ActionType` members are removed: `add_ioc_to_blocklist` and
+  `run_playbook`.** Neither had an executor. `POST /actions` accepted both and
+  answered `No executor found for action type`, which reads as a broken
+  deployment rather than a verb nobody built; it now rejects them at
+  validation. A verb with no implementation path should leave the surface
+  rather than sit on it dead.
+
+  Why neither could be preserved by implementing it:
+
+  - `add_ioc_to_blocklist` was a second name for `block_ioc`, which has a
+    Defender arm, a capability contract, a registered adapter and a place in
+    the vocabulary. Two names for one verb means half the callers reach the
+    dead one. Use `block_ioc`.
+  - `run_playbook` is the wrong shape for this registry rather than a missing
+    feature. Playbook execution lives in `services/agents` and always has, and
+    the contract in this service belongs to the *verb* — "run an arbitrary
+    bundle of verbs" has no verb-level impact, reversal or verification probe
+    to declare. Approving it once would execute whatever steps it contained
+    without each step meeting its own contract, which is precisely what the
+    per-capability contract exists to prevent. Playbooks already dispatch step
+    by step through this service, so every step is graded on the way past.
+
+  The actions service's `ActionType` is not part of `docs/openapi.yaml`, so
+  the breaking-change gate does not see this; it is recorded here because a
+  dropped enum value is a break whether or not a workflow notices.
+
+- **`CostTracker` no longer reports an estimated dollar figure as a measured
+  one, and `CostTracker.total_cost_usd` is gone.** It priced a call by looking
+  its **model name** up in a table of hosted list prices, and the name it
+  looked up was an `aisoc-<role>` alias — a label the LiteLLM gateway resolves
+  to a model, not a model. No alias is in the table, so every call fell
+  through a `(0.001, 0.002)` default and was booked at a price nobody charges
+  for a model nobody named. Measured live: a 903-token completion on an
+  operator's own hardware, through a local Ollama model, reported
+  `total_cost_usd=0.000999`. The same call now reports `$0.00`, measured.
+
+  The figure was not confined to a dashboard. It fed the funnel insights, the
+  per-run Investigation Ledger, the investigation summary export, and the
+  **budget circuit breaker** — which trips at `AISOC_BUDGET_HARD_USD` and
+  would eventually have degraded a working local install to
+  deterministic-only over money nobody spent.
+
+  Every cost is now one of three things, and says which:
+
+  - **measured** — the gateway reported it. The real figure comes off the
+    response headers (`x-litellm-response-cost`, and `x-litellm-model-name`
+    for what the alias resolved to), so `make_chat_model` now builds clients
+    with `include_response_headers=True`. A measured `0.0` — what a local
+    model genuinely costs — is a value, not a gap.
+  - **estimated** — re-priced from a public list price for a *concrete* model
+    id, and labelled an estimate on every surface: `~$` in the console, an
+    `estimated_cost_usd` field of its own on every response, and
+    "list-price estimate … not billed" in the export. Never merged into a
+    measured figure, because one number cannot be labelled two ways.
+  - **not measured** — neither. Rendered as an em dash with the reason, never
+    as `$0.00`. Following the MTTR precedent: the count of calls a sum was
+    computed over travels with the sum, so a zero can be told from an absence.
+
+  There is deliberately no default price any more. An unknown model imputes
+  nothing and is counted as unpriced; the BYOK savings panel reports
+  "not estimable" rather than a saving computed from an invented rate.
+
+  **The wire is fully additive — no generated SDK client breaks.** The obvious
+  shape for "not knowable" is a nullable number, and four fields were written
+  that way first (`ByokSavings.imputed_public_cost_usd` / `savings_usd`,
+  `ModelBreakdown.imputed_public_cost_usd`, `CostAggregateRow.avg_cost_per_run`).
+  That is the wrong shape here for the same reason the MTTR pass rejected it:
+  it breaks every client for a fact a companion field already carries. Each
+  keeps its type and gains a qualifier — `imputed_is_estimable`, or the
+  existing `measured_call_count` — and the console reads the qualifier before
+  the number. `scripts/openapi_diff.py` reports no breaking change.
+
+  What callers must change: `CostTracker.total_cost_usd` is replaced by
+  `measured_cost_usd` (`float | None`) plus `measured_call_count`, mirrored by
+  `estimated_cost_usd` / `estimated_call_count` / `unpriced_call_count`;
+  `CallRecord.cost_usd` is now `float | None` and carries `cost_source`;
+  `summary()` no longer emits a `total_cost_usd` key. On the wire the fields
+  are additive — `total_cost_usd` keeps its name and now carries measured
+  cost only, with `measured_call_count` beside it. Migration
+  `063_cost_provenance.sql` adds the columns; **every pre-063 row reads as
+  "not measured"**, which is the truth about it, and the historical values are
+  left in place rather than deleted. Gated by
+  `scripts/check_cost_provenance.py`.
+
+### Added
+
+- **Two-way SIEM integration: an AiSOC verdict is written back onto the
+  finding that produced the alert.** The integration only ever ran inbound. A
+  Splunk notable became an alert, the agent triaged it, and the notable sat in
+  the Splunk queue untouched — so an analyst re-read a finding AiSOC had
+  already dismissed, and a finding AiSOC had confirmed waited its turn behind
+  them. Nothing on `main` wrote a disposition back to any SIEM in any form.
+
+  New capability `update_alert_disposition` with five vendor arms (Splunk ES,
+  Elastic Security, Microsoft Sentinel, IBM QRadar, Microsoft Defender), two
+  new clients (`sentinel_client.py`, `qradar_client.py`), migration
+  `057_alert_source_links.sql`, and `POST /api/v1/alerts/{id}/source-writeback`.
+  The agents triage worker posts to that route after the verdict is durable and
+  fails soft — the verdict outranks its writeback, and an unreachable Splunk
+  must not dead-letter an alert that was triaged correctly. Docs:
+  [Integrations → SIEM writeback](apps/docs/docs/integrations/siem-writeback.md).
+
+  **The disposition mapping is the safety argument, not the approval tier.** A
+  confirmed true positive is *escalated and never closed*: it is the finding a
+  human most needs to see, and closing it because the platform is confident is
+  how an agent turns a real intrusion into a resolved ticket nobody read. An
+  unknown verdict is *refused, never guessed* — which matters because
+  `normalize_disposition` defaults an unrecognised string to `true_positive`,
+  so a mapper that normalised first would convert "I do not recognise this"
+  into a confident claim. Only benign and false-positive verdicts may close a
+  finding, and `benign_true_positive` is classified as a correct detection of
+  authorised activity rather than as a false positive, so it never inflates a
+  rule's own FP rate.
+
+  **Governance ships dry-run by default.** `AISOC_SIEM_WRITEBACK_ENABLED`
+  defaults on and `AISOC_SIEM_WRITEBACK_EXECUTE` defaults **off**, so an
+  operator opts in to writing into their own SIEM. Anything that is not an
+  explicit yes — including a typo — is read as a dry run. `executed` is the
+  single field that means a vendor was touched; it is carried on the API
+  response, on the worker's return value, and as a no-default column on
+  `alert_source_links`, so a dry run, a refusal and a credential-less
+  simulation can never be read as a write that happened. Projecting a closing
+  verdict onto a linked Jira / ServiceNow ticket needs a third flag
+  (`AISOC_SIEM_WRITEBACK_CLOSE_CASE`, off) because the ITSM connectors project
+  a status transition rather than a note, so the only truthful way to reach the
+  ticket is to resolve the case for real.
+
+- **The join key survives ingest.** `finding.uid` — the vendor's own id for a
+  finding — reached the OCSF envelope and was then discarded, so by the time a
+  row hit `alerts` the notable's rule UID, the Elastic signal id and the QRadar
+  offense id were gone and no verdict could be aimed at anything. Fusion now
+  carries it onto `alerts.external_id` and writes an `alert_source_links` row,
+  but only for a vendor with a writeback arm: a link to a system AiSOC cannot
+  write to would read as a two-way integration that is not one.
+
+- **`GET /api/v1/graph` exists.** The console's Attack Graph view has always
+  called it and always got a 404, while `/graph/neighbors/…` and
+  `/graph/mitre-coverage` returned 200 from the same Neo4j instance holding
+  real graph-at-ingest data — the data and the scoping were sound and only
+  the overview endpoint was missing.
+
+  It returns the caller's own entity graph in the shape the Cytoscape canvas
+  consumes, bounded to 400 nodes and 900 edges per render with `truncated`
+  set when the cut was applied. `depth` (1–6) bounds the walk; `entity`
+  narrows the seed set to one named host, user or indicator.
+
+  Scoping follows the rule the other graph reads had to learn the hard way:
+  **every node of every traversed path** must satisfy the tenant predicate,
+  not only the node the walk starts from, and `tenant_id IS NULL` is never
+  readable — an untagged node that were readable would bridge two tenants
+  through any entity they share. Edges are returned only between nodes that
+  first pass that filter, so an edge cannot reintroduce a node the node query
+  refused. Global MITRE labels stay exempt, but cannot seed a traversal.
+
+  Two failure modes are kept distinguishable. An empty graph is `200` with no
+  nodes; an unreachable graph is `503`. It deliberately does not degrade to an
+  empty graph the way `/graph/mitre-coverage` does, because "no attack
+  relationships exist in your estate" is a security claim, and making it on
+  evidence nobody retrieved is the shape of defect this codebase keeps
+  rediscovering. The console's error state — which names the endpoint and the
+  status rather than inventing topology — is unchanged, and a test now asserts
+  the view holds no graph at **first paint**, so a future `fallbackData` (which
+  disables revalidation, making a mock permanent rather than provisional)
+  fails the build.
+
+- **The Attack Graph says when it is showing a truncated graph.**
+  `GET /api/v1/graph` bounds itself to 400 nodes and 900 edges and reports
+  `truncated`; the console rendered the flag nowhere, so a graph cut at the
+  ceiling and a graph that is genuinely that size looked identical. On an
+  attack graph that difference changes a conclusion — a missing edge reads
+  as a lateral path that does not exist. The view now shows a
+  `role="status"` notice naming the counts, the depth and the ceiling that
+  produced them, with a depth control that issues a new query rather than
+  re-rendering the cached one. The three existing states are unchanged: an
+  empty tenant still reads as empty, an unreachable backend still names the
+  endpoint and the status, and neither is reported as a truncation.
+
+- `GraphOverviewResponse` gains `nodeLimit` and `edgeLimit`, read from
+  `graph_service` rather than restated, so the ceiling a client reports is
+  the ceiling the service applied. Additive and defaulted; no existing
+  consumer changes.
+
+- **`/graph` honours `?entity=` and selects the node it names.** Three callers
+  already built that URL — the Investigation Rail's entity chips, `HuntView`'s
+  "Pivot to graph" button, and now federated search — and nothing read it, so
+  every pivot navigated to the graph and dropped the entity, leaving the
+  analyst to find the node by eye. Both the typed form (`host:WIN-DC01`) and
+  the bare form `HuntView` emits are accepted, matching on node id then label.
+
+- **Federated SIEM search has a console surface.** `/api/v1/federated/backends`
+  and `/api/v1/federated/search` have fanned one query out to Splunk, Microsoft
+  Sentinel, Elastic and QRadar — in parallel, against each tenant's own
+  vault-encrypted credentials — for some time. `apps/web` had no client for
+  either, so the capability was reachable only from the SDK. `/federated-search`
+  now exposes it: pick which connected SIEMs to query, describe the search once
+  in free text plus optional `field operator value` filters, and read the merged
+  rows.
+
+  The design constraint the page is built around is the endpoint's per-source
+  isolation. It deliberately never fails the whole call because one backend is
+  slow, 401s or 5xxs; it returns a verdict per backend instead. A UI that
+  renders only the merged rows discards that, and the analyst cannot tell
+  "Sentinel has nothing" from "Sentinel did not answer" — opposite conclusions
+  mid-incident. So the per-backend strip renders above the rows, always, with
+  each backend's own row count, latency and error message. A backend that
+  failed shows no row count, because "0 rows" beside a timeout reads as
+  "nothing matched". An empty result set is labelled "No matching events" when
+  a backend answered and matched nothing, and "No backend returned results"
+  when every backend failed.
+
+  Recognised entities in a row deep-link to `/graph?entity=<type>:<value>`.
+  Recognition is a fixed per-vendor field-name list rather than a heuristic:
+  `src_ip`, `source.ip` and `SourceIP` all resolve to the same IP pivot, while
+  `zip`, `recipient` and `description` resolve to none.
+
+- **A SOC operations dashboard at `/dashboards/operations`.** `/dashboard`
+  answers what is happening in the estate; this answers whether the machine
+  that reports it is working. The distinction matters because every failure
+  mode of a detection pipeline makes it *quieter* — a connector stops polling,
+  a schema changes and events bounce, a token expires — and an alert-centric
+  view reports all three as good news.
+
+  Six panels, each backed by one endpoint and owning its own fetch, loading,
+  empty and error state: connector fleet staleness (`/health/fleet`), rejected
+  events by reason (`/health/dead-letters`), alert severity and disposition
+  (`/alerts/stats`), detection coverage counting only *enabled* rules
+  (`/detection/coverage`), agent runs/tokens/spend (`/costs/dashboard`), and
+  response actions paused for approval (`/approvals`). The first three had no
+  web client at all.
+
+  Fleet staleness is reported against each connector's own cadence — "3.2
+  intervals behind" rather than an absolute age, because a daily connector and
+  a five-minute connector are not late at the same wall-clock time. One dead
+  endpoint blanks one panel and names the failure; it does not take the page
+  down and does not substitute plausible figures.
+
+- **A real operator organisation above tenants, so the MSSP console can be
+  backed by data instead of gated behind demo mode.** `/mssp/overview`,
+  `/mssp/tenants` and `/mssp/incidents` returned five hardcoded companies —
+  "Acme Corp, health 92.4, 12 open alerts", "Wayne Enterprises", invented
+  incidents with invented assignees — because the cross-tenant aggregation
+  query behind them was never written. Gating the sample behind demo mode
+  removed the lie but left the feature unbuilt: outside demo mode the
+  console showed zeros forever. Making it real was a schema change, not an
+  ungating.
+
+  Migration `058` adds `organizations`, `organization_members`,
+  `organization_tenants` and `organization_member_tenants`, and backfills
+  from `tenants.parent_tenant_id`, which keeps working. Three constraints
+  hold the boundary in the database rather than in whichever code path
+  writes a row: `organization_tenants` is unique on `tenant_id` so two
+  providers cannot claim one customer; `organization_member_tenants` has
+  composite foreign keys onto both the membership and the portfolio, so a
+  grant cannot name an unmanaged tenant and releasing a tenant revokes every
+  grant over it; and `organizations.home_tenant_id` cascades, so erasing a
+  provider's own tenant removes the organisation while leaving its customers
+  standing as unclaimed tenants.
+
+  Roles carry two separate axes. `owner`/`admin` reach the whole portfolio;
+  `operator`/`viewer` reach only tenants granted to them, and **nothing**
+  when they have no grants — "no scope" degrading into "all scopes" is the
+  shape every cross-tenant leak in this codebase has had.
+
+  Every cross-tenant read resolves its tenant list through
+  `resolve_portfolio_scope` and nowhere else, then passes it to
+  `require_scope`, which raises rather than letting an aggregate run
+  unfiltered; the list is bound as a query parameter. A `?tenant_id=` filter
+  is intersected with the portfolio, so naming an outside tenant narrows to
+  nothing instead of reaching out. An AST gate fails the build if a new
+  cross-tenant function is added that never calls `require_scope`, and
+  `test_mssp_portfolio_isolation.py` replays two organisations plus an
+  unmanaged tenant against live Postgres in `integration.yml`.
+
+  The sample rows are deleted rather than gated. `health_score` is gone
+  because it was an undefined composite; `mttr_minutes` is measured from
+  cases a tenant actually closed and is null when it closed none; seeded
+  rows are counted separately as `synthetic_alerts` and excluded from the
+  headline figures.
+
+- **Per-tenant limit headroom, so a cap cannot throttle a customer
+  silently.** A tenant that hits a ceiling raises no error anyone sees —
+  alerts keep arriving and stop being triaged, which reads to an evaluator
+  as "the AI doesn't work". `app/services/entitlements.py` measures
+  `connectors`, `seats`, `alerts_per_day` and `triages_per_month` from real
+  rows, reports `ok` / `warning` / `exhausted` per tenant across a
+  portfolio, and logs exhaustion at `warning`. AiSOC ships uncapped: a key
+  with no configured ceiling reports `unlimited` rather than a default
+  nobody set. Ceilings come from `tenants.limits` (per tenant, wins in
+  either direction) or the new `AISOC_DEFAULT_TENANT_LIMITS` setting —
+  declared as a real field, because an undeclared setting is dropped by
+  `extra="ignore"` and the operator who exports it gets no explanation.
+
+- **The Splunk warehouse driver executes.** It previously raised
+  `HuntNotConfigured("provider scaffolded but live SPL execution not yet
+  shipped")` on every call, so the SPL every hunt was translated into was
+  discarded. `app/services/spl_runner.py` carries the same three guards as the
+  ES|QL runner — per-tenant SSRF allow-list, air-gap policy, row cap — and
+  prefixes the translator's bare `index=…` expression with `search`, without
+  which Splunk's REST API answers 400 on every hunt.
+
+- **A playbook step that names a response verb now reaches governed
+  dispatch, and says honestly what happened to it.** Fifteen of the engine's
+  twenty-two step types name an action against somebody's estate. Three of
+  them — `block_ip`, `isolate_host`, `create_ticket` — returned
+  `{"simulated": true}` from inside the engine, reached no executor, and were
+  recorded `SUCCESS`; the other twelve had no handler at all. Meanwhile
+  `services/actions` held working executors for fourteen of the fifteen,
+  behind a contract declaring each verb's impact, reversibility, approval
+  requirement and whether a probe exists to confirm the effect landed. The
+  missing piece was never an executor. The comment in `action.py` asserting
+  that "playbooks dispatch step by step through this service, so every step
+  is graded on the way past" described something that did not happen.
+
+  The bridge is `services/agents/app/playbook/action_bridge.py` ->
+  `POST /api/v1/playbook-steps/dispatch` -> `live_actions.dispatch()`. It
+  lands in the API rather than going direct because that service holds the
+  credential vault and the tenant session, and `services/actions` is the only
+  place that may change a customer's estate — the same shape, and the same
+  reasoning, as `siem_writeback`. **One step, one request, one grading**: a
+  playbook is not approved as a unit, so authorising it cannot authorise
+  whatever its steps happen to contain.
+
+  `executed` is the single field that means a vendor was touched. A preview,
+  an approval queue, a blocked action, a tenant with no integration, a
+  credential-less simulation and a vendor failure are each named and each
+  `executed: false`, and a step that did not execute is recorded FAILED so
+  the run halts under the default `on_failure: abort`. `AWAITING_COMPLETION`
+  counts as executed and `PENDING_APPROVAL` does not: collapsing that pair
+  either loses an action in flight or invents one that never ran. Execution
+  is off by default (`AISOC_PLAYBOOK_ACTIONS_EXECUTE`), so out of the box a
+  response step previews and reports a preview.
+
+  **`approval` is the one step type deliberately not bridged.** It is a
+  pause, and the engine is a single-threaded index walk with nothing to
+  suspend and nothing to wake. It is also no longer the mechanism: every
+  response step is now graded individually at dispatch and returns
+  `pending_approval` on its own when a human is required, so a gate in front
+  of one would gate a decision that is already gated. It fails closed with
+  that reason recorded rather than shipping a handler that pretends.
+
+  **`run_playbook` as a nested step stays unimplemented, and the calculus was
+  re-examined rather than inherited.** Per-step grading was the missing piece
+  the previous decision named, and it now exists — but the objection it was
+  the answer to does not move: a nested playbook's steps are still not
+  visible where the parent declares its policy. What changed is that the
+  parent no longer *needs* to bound them, because each step is graded on
+  arrival wherever it came from. What has not changed is that the engine
+  cannot see a nested playbook's content before running it, so an author
+  cannot review what a run will do, and a cycle across two playbooks that
+  reference each other is unbounded by the per-step `visited` set. Recursion
+  depth and an ancestor set would answer the second; the first is a product
+  question about reviewability, not a governance gap, and it is the reason to
+  keep waiting.
+
+  The schema's `x-aisoc-execution` map gains a `governed` class rather than
+  reusing `executed`, because "a handler ran and made an outbound call" and
+  "a vendor was touched" are different claims and the second is answered per
+  run. `simulated` stays in the vocabulary: it is the class for a handler
+  that answers from inside the engine, which is what these three did, and
+  deleting the word would make that state unspellable rather than absent.
+  `check_playbook_schema_parity.py` compares `governed` against
+  `engine.RESPONSE_STEP_TYPES` in both directions, so a verb wearing the
+  label while being answered locally fails the build.
+
+- **The published playbook schema now describes the engine that runs
+  playbooks, and a gate keeps it that way in both directions.**
+  `schemas/playbook.schema.json` is the contract authors are told to trust,
+  and it had drifted from `services/agents/app/playbook/` in every available
+  direction at once. Two schema files existed with different step
+  vocabularies — 15 types at the repo root, 9 under `schemas/` — against a
+  `StepType` enum of 22, and the NL drafter silently fell back from one to
+  the other if the primary was missing. Eleven step types were declared by a
+  schema and implemented nowhere (`trigger`, `action`, `loop`, `parallel`,
+  `human_approval`, `wait`, `isolate`, `block`, `create_case`,
+  `run_playbook`, `script`); thirteen were accepted by the engine and
+  declared by neither schema. Six step fields (`blast_radius`, `depends_on`,
+  `output_key`, `retry.max_attempts`, `retry.backoff_seconds`,
+  `retry.backoff_multiplier`) were declared and never read — `blast_radius`
+  carried the description "engine enforces analyst approval for destructive
+  steps", and the engine could not see the field at all.
+
+  Resolved by making `schemas/playbook.schema.json` the only schema, widened
+  to the full `StepType` range with the condition-as-string form the engine
+  already accepted, bounds matched to `bounds.py` (3600s / 25 retries, not
+  600s / 5), and the two authored-but-inert playbook keys (`inputs`,
+  `dry_run_support`) declared as the documentation they are. The root
+  duplicate is deleted. The schema also carries `x-aisoc-execution`, a
+  machine-checked map recording whether each step type is `executed`,
+  `simulated`, or vocabulary with no handler — so an author can tell what
+  will happen before writing the playbook rather than after running it.
+
+  `run_playbook` is deliberately **not** implemented as a step, on its own
+  merits rather than by inheriting the argument that removed it as an action.
+  A nested playbook's steps are not visible where the parent declares its
+  step-level policy, so the parent cannot bound them; the engine reads no
+  step-level approval or blast-radius field today, so nesting would let one
+  ungated parent pull in an arbitrary tree; and twelve of the engine's own
+  step types have no handler, so a verb whose purpose is to execute more
+  steps would multiply that. It can return when playbook steps are graded
+  individually — recursion depth and an ancestor set are the easy part.
+
+  `scripts/check_playbook_schema_parity.py` compares the schema enum, the
+  `StepType` enum, the engine's handler table, the execution map, the bounds
+  module and the pack validator's trigger list — every pair in both
+  directions, because the characteristic failure here is a check that asks
+  only whether the schema declares something the engine lacks and never the
+  reverse, which is the direction things actually drift. It carries a
+  `--self-test` that injects drift each way and fails if any goes undetected,
+  refuses to run at all on a tree missing its marker files rather than
+  printing OK about files it never opened, and names the root, schema, step
+  counts and playbook count it inspected.
+
+- **Every `ActionType` now resolves a capability contract.** `notify_slack`
+  was the last one without, and it was a naming gap rather than a missing
+  capability: the verb is `notify`, it has had a contract throughout, and the
+  `SlackNotify` adapter already bridged the two names. Nothing connected a
+  lookup *by `ActionType` value* to that bridge, so `approval_gate` found no
+  contract and skipped the confidence matrix — a 10%-confidence
+  `notify_slack` was approved for auto-execution, and the verb most likely to
+  auto-execute was the one graded without reference to confidence. It now
+  requires an analyst under the default L1 tier.
+
+  Closed with a one-entry alias (`ACTION_TYPE_CAPABILITY_ALIASES`) rather
+  than a rename, because `action_type` is persisted operator intent:
+  `remediation_whitelist` (migration 015) stores per-tenant pre-approvals
+  keyed `UNIQUE (tenant_id, action_type)`, so renaming the member silently
+  orphans every row an operator created for `notify_slack`. It is also a
+  documented request field and a member of the `ActionType` union in
+  `packages/types`. The retirement condition is recorded rather than left
+  open-ended: the map goes when `ActionType` does. `check_action_contract.py`
+  gains two directions — every `ActionType` must resolve a contract, and
+  every alias must name a real `ActionType`, point at a real contract, not
+  shadow a capability of the same name, and describe a bridge some adapter
+  actually implements.
+
+- **`scripts/upgrade_playbooks.py`, which `docs/upgrade/MIGRATION.md` has told
+  operators to run since v4.** It did not exist, so the one command in the
+  upgrade path that touches a customer's own content failed at exactly the
+  moment it was needed. The field table beside it was worse: four of the five
+  spellings in its "v4" column are rejected by the schema
+  (`on_failure: {policy}`, `retry: {max_attempts, backoff}`,
+  `condition: {expr, language}`, and `type: "action"`, which is not a step
+  type at all), so following the doc by hand produced playbooks that would
+  not validate either. Both are corrected.
+
+  The script reports before it writes, validates its own output against the
+  real `schemas/playbook.schema.json` before touching anything, and leaves
+  alone any file whose upgrade would not validate. `loop`, `parallel`,
+  `wait`, `run_playbook`, `action` and `trigger` are reported and refused
+  rather than mapped onto a nearest neighbour — that rewrite is precisely the
+  defect removed from the NL drafter, where a `disable_user` step shipped as
+  `investigate`. An empty scan is a failure, not a clean bill of health.
+
+- **Competitor product names removed from the docs portal, the benchmark page
+  and the archived plan subtree, and a CI gate added to keep them out.** AiSOC
+  names no competitor product, but two published comparison tables and the
+  competitive-landscape section of the archived plan named eleven vendors
+  outright. The analytical content is preserved everywhere: every matrix cell
+  survives unchanged and every gap keeps its capability, direction and
+  magnitude — only the vendor's identity is gone. The comparison columns on
+  `apps/docs/src/pages/index.tsx` and `apps/docs/docs/benchmark.md` now read
+  "Open-source SIEM/HIDS" and "Commercial SIEM platform"; the plan's competitor
+  profiles and its five-column capability matrix now carry category labels
+  ("Autonomous triage", "Hyperautomation SOAR", "Hyperscaler bundle",
+  "Vendor-stack XDR", "First-line responder", "No-code automation").
+
+  - `scripts/check_competitor_names.py` + `scripts/competitor_names.toml` drive
+    the gate from an **explicit list of competitor product names**, never a
+    heuristic, and allow-list the integration surfaces **by path** — connector
+    modules, plugin manifests, connector docs, the connector registry, fixtures
+    and tests. This matters because a vendor name is usually correct here:
+    `Torq` is simultaneously a first-party SOAR connector and a name that
+    appeared in a comparison matrix, so a global replace would have broken
+    working connector code. Its connector, manifest, docs page and tests are
+    untouched; only the competitive framing changed.
+  - Both lists are checked **in both directions**. A pattern that matches
+    nothing is dead and fails; an allow entry whose files no longer contain any
+    of the names it excuses is stale and fails, so an exemption cannot outlive
+    the code it excused; a mistyped name in an allow entry is rejected at load
+    rather than silently excusing nothing.
+  - A published comparison table is the one place where *any* vendor name is a
+    violation, including one AiSOC integrates with, because the table's job is
+    to position AiSOC against it. Those two regions are pinned by literal
+    start/end markers and checked against a wider vendor list; a marker that
+    drifts fails rather than scanning an empty slice and reporting clean.
+  - The scan root comes from the working directory or `--root`, never from the
+    script's own location, and the run prints the absolute path it walked plus
+    the file count — a gate that resolves its own repository can print a
+    confident OK about a tree it never inspected.
+  - `scripts/check_competitor_names.py --self-test` proves the gate detects a
+    known-bad sample and passes a known-good one in both directions, and fails
+    if a declared competitor has no fixture. `tests/test_competitor_names_gate.py`
+    adds 42 cases covering the stale-allow-list, marker-drift and dual-role-name
+    properties. Wired into `.github/workflows/competitor-names.yml`, which runs
+    on pull requests *and* pushes to `main` with no paths filter.
+
+- **Tool attribution is now prevented at commit time and blocked in CI.** AiSOC
+  does not attribute work to a development tool or AI assistant. An audit found
+  the rule was being broken automatically: a `Co-authored-by:` trailer naming an
+  editor appeared in 214 commits on `main`, and 280 of 732 pull request bodies
+  carried a "Made with" or "Generated with" footer. Nothing in the repository
+  caused it — no `commit.template`, no `core.hooksPath`, nothing in
+  `.git/hooks/` — the editor appended it at commit time, and it survived
+  `git commit --amend`.
+
+  - `.githooks/commit-msg` strips the line before it reaches a commit. It is
+    wired through `core.hooksPath`, so it is version-controlled and shared with
+    every clone rather than living in an untracked `.git/hooks/`;
+    `scripts/setup_hooks.sh` installs it and runs automatically as the `prepare`
+    script on `pnpm install`. The hook rewrites and never rejects — a hook that
+    can block is a hook that can halt someone's work on a bad pattern, so the
+    blocking job belongs in CI where it is visible.
+  - This is load-bearing rather than cosmetic because the repository
+    squash-merges with `squash_merge_commit_message=COMMIT_MESSAGES`: GitHub
+    composes the squash commit body from the branch commits, so a trailer on any
+    branch commit is copied onto `main` at merge time.
+  - `scripts/check_attribution.py` fails CI when attribution appears in a
+    commit message, a changed file or the PR body. A human `Co-authored-by:`
+    line is never flagged — a pattern only fires when the trailer names a known
+    tool — and `dependabot[bot]` is allowlisted.
+  - The gate runs on `push` to `main` as well as on `pull_request`. A PR-only
+    check is one-directional: it inspects what contributors propose but never
+    what actually lands, so anything introduced by the merge itself would pass
+    it while the gate stayed green.
+  - `--self-test` runs on every CI invocation and checks four directions against
+    a shared fixture corpus: the gate detects every known-bad sample (so it
+    cannot pass vacuously), flags no known-good sample (so it cannot pass
+    direction one by flagging everything), and the hook strips exactly what the
+    gate flags in both directions (so the two implementations cannot drift).
+    Both read their patterns from the same `.githooks/attribution-patterns.txt`.
+    The self-test earned its place immediately by catching a real hole in the
+    patterns — `Built with GitHub Copilot` slipped through, because a vendor
+    word sat between the verb and the tool name.
+
+- **A model name must resolve, and the variable that routes it must be read —
+  gated in both directions.** `scripts/check_llm_model_routing.py` reconciles
+  `infra/litellm/config.yaml`, the role pins, the API-side mirror,
+  `.env.example` and `docker-compose.yml`: every pin's alias must be defined by
+  the gateway and every alias claimed by a pin; every model named in an env or
+  compose file that wires the bundled gateway must be one the gateway defines;
+  every variable compose points at the gateway must be read by *both* resolvers
+  and every gateway variable the resolvers read must be set by compose; and a
+  service handed the gateway URL must be handed the gateway key. Wired into
+  `ci.yml :: python-lint`, with the self-test running first.
+
+  Every parser is AST- or comment-aware, and the self-test proves each refusal
+  rather than asserting it, because all three corpora contain text shaped
+  exactly like what the gate looks for: the gateway config's commented
+  Ollama/vLLM examples repeat `model_name: aisoc-triage` verbatim,
+  `.env.example` documents the escape hatch as a commented
+  `AISOC_MODEL_PIN_TRIAGE=gpt-4o-mini`, and `docker-compose.yml` explains the
+  gateway in prose containing `OPENAI_BASE_URL=http://litellm:4000/v1` two lines
+  above the key it describes. A line regex credits all three. 13 injected
+  defects and 7 parser blind spots, each caught by its own code, plus the shared
+  empty-tree refusal.
+
+- **`scripts/check_orm_migration_parity.py` — a column a model declares and
+  no migration creates now fails the build.** Structural on both sides
+  (Python `ast` over the models and the alembic revisions, plus the raw SQL
+  those revisions and `services/api/migrations/*.sql` execute) and in both
+  directions: `missing-in-migration`, `missing-in-model`,
+  `type-narrower-in-migration`, `type-family-mismatch`, and
+  `no-migration-source` for a mapped table no migration mentions at all —
+  which is the finding that exists because pairing nothing produces zero
+  findings, and zero findings over zero comparisons prints the same word as
+  a clean result. `--credits` enumerates what each verdict was *based on*
+  for the same reason.
+
+  Scoped structurally rather than by a list: a service that calls
+  `metadata.create_all` builds its tables from the models, so a column no
+  migration creates is created anyway. `services/api` is the one such
+  service and is reported as advisory with its count printed, not hidden.
+  The four alembic-managed services have no such fallback, which is exactly
+  why UEBA's missing column was fatal.
+
+  Verified non-vacuous against the tree as it was: it reports all three of
+  the real UEBA defects. The `type-family-mismatch` kind exists *because*
+  an earlier version reported only two of them — a length comparison could
+  not see `UUID` against `String(64)`, since neither side declared a length
+  the other contradicted.
+
+- **`scripts/check_service_migration_bootstrap.py` — a migration chain
+  nothing invokes is not a migration chain.** Asserts every service with an
+  `alembic.ini` ships `app/_migrate.py`, keeps it byte-identical to the
+  others, runs it from its `CMD`/`ENTRYPOINT` (matched on the command lines,
+  so a mention in a comment does not count), and carries both an owner DSN
+  and a compose healthcheck. The other direction too: a service shipping
+  the module with no chain to apply would exit 1 on every start.
+
+- **`scripts/check_connector_profiles.py` — a connector-type drift gate that
+  reads in both directions.** Nothing compared the profile keys in
+  `services/ingest/internal/normalizer/normalizer.go` against the identifiers
+  the connectors service declares, and they had drifted apart in both
+  directions at once. The gate enumerates four name spaces — the Go profiles
+  and type aliases, the 84 declared `connector_id`s, the `ConnectorType`
+  union, and every `connector_type` appearing in a documented example — and
+  fails when a name in any of them resolves to nothing.
+
+  It also checks that a documented example reaches a *profile*, not merely a
+  declared connector: a reader pastes a flat payload, which never carries the
+  canonical envelope, so only a profile or alias can give the event a vendor
+  identity. That is the specific check that catches the README defect.
+
+  `--self-test` injects twelve defects, one per direction and per failure
+  code, and requires the gate to catch each; it runs in CI on the same tree
+  immediately before the gate itself. The resolved repo root, every file read
+  and every count are printed before the verdict, and an input that is missing
+  or parses empty is a hard error rather than a quiet pass — a gate that
+  reports OK about a tree it never opened is worse than no gate.
+
+- **The console's `ConnectorType` union is generated from the connector
+  registry.** Its members were corrected in the previous release; the
+  mechanism that let them drift was not. Hand-maintenance is how ten of them
+  came to name nothing the platform could ingest, and `ibm_qradar` is what
+  that costs: no connector declared it and no profile was keyed on it, so
+  strict mode rejected those events while lenient mode minted a vendor called
+  "ibm_qradar" — a second alert source for the QRadar deployment `qradar`
+  already fed.
+
+  `scripts/generate_connector_types.py` derives the union from the three
+  places that decide what the normalizer resolves: the `_CONNECTOR_CLASSES`
+  tuple in `services/connectors/app/connectors/__init__.py` (84 ids), the
+  `connectorProfiles` keys in the ingest normalizer (5 more that no connector
+  declares under that spelling, including the legacy `splunk_enterprise`), and
+  the `connectorTypeCanonical` fold sources (5 alternate spellings the console
+  still emits). 94 members, written to
+  `packages/types/src/generated/connector-types.ts` as a `CONNECTOR_TYPES`
+  tuple the union is taken from, alongside a machine-readable
+  `connector-types.json` recording each member's origin. `connector.ts`
+  re-exports rather than redeclares, and `--check` fails if it goes back to
+  declaring its own — a generated file can be perfectly current and completely
+  ignored while a hand-written union three directories away is what TypeScript
+  resolves.
+
+  That set is, by construction, the `resolvable` set
+  `scripts/check_connector_profiles.py` already computed, so the two gates now
+  share one definition instead of holding two. The fold map is emitted with
+  the union as `CONNECTOR_TYPE_CANONICAL`, so the console can resolve a stored
+  spelling to one product name the same way the normalizer does.
+
+  Nothing is positional, so no lock file is needed and the
+  `generate_detections.py` renumbering trap does not apply: a member *is* its
+  `connector_id` and the output is a sorted set. A test reverses the registry
+  and asserts the output does not move a byte. Identity is read off the class,
+  the way `_build_registry()` resolves it — `jira_connector.py` declares
+  `jira` and `tenable.py` declares `tenable_io`, so a filename slug would
+  misname both, which is the defect `generate_connector_docs.py` shipped when
+  it generated duplicate pages for six connectors while reporting 100%
+  coverage.
+
+  The `palo_alto_cortex` fold was the one entry naming a vendor rather than a
+  product, and Palo Alto ships two the platform ingests. It stays on
+  `cortex_xdr`: the spelling entered the union in the initial-release commit
+  before either connector existed, it appears nowhere else in the tree and
+  never has (no console code, no saved instance, no seed, no catalog entry, no
+  fixture), the console's own catalog names "Cortex XDR" under EDR and lists
+  no XSIAM, and XSIAM is reachable under `cortex_xsiam` for any deployment
+  that means it. The evidence is recorded beside the map in `normalizer.go`.
+
+- **A gate that fails when a route lets its caller name the tenant.**
+  `scripts/check_route_tenant_scope.py` is an AST pass over every route
+  decorator and signature under `services/` — a structural property needs a
+  structural check, and the thing being looked for (a parameter's name, a
+  decorator's `dependencies` list, the router object the decorator hangs off)
+  survives renames a regex would miss. It fails in **both** directions: a
+  route that takes a tenant identifier with no auth dependency, and a route
+  that accepts one without intersecting it with the caller's scope. It reads
+  request-body models too, because `POST {"tenant_id": "<someone else's>"}` is
+  the same hole as `?tenant_id=` and the mutating routes carry it on the body.
+
+  `--self-test` injects a violation of each kind and asserts both are caught
+  while two clean controls pass, so the gate cannot quietly stop detecting
+  things. Exemptions each carry a written reason and are as narrow as the
+  facts allow: `services/mesh` is public by design (Ed25519 + k-anonymity, a
+  bearer token would break federation rather than secure it); three MSSP
+  routes *define* a scope rather than read within one, so intersecting would
+  make them impossible; and `osquery-tls` `/enroll` authenticates with a
+  per-tenant enroll secret because osqueryd has no session yet. That last
+  exemption is **conditional** — the self-test strips the verifier it names
+  and asserts the route is then reported, so deleting the check and keeping
+  the entry fails the build. The gate resolves its repository root from `git
+  rev-parse` rather than its own file location, and prints how many routes
+  across how many files it opened, so an OK can be distinguished from a scan
+  that never happened. `--inventory` prints the per-service table.
+
+- **`scripts/check_gate_coverage.py` — the gate on the gates.** The most
+  expensive recurring defect in this repository is a mechanism that exists, is
+  tested, and has no caller on the path that needs it. A gate is the worst case
+  of that shape, because a gate *is* its caller: a conformance script no
+  workflow runs cannot fail, which is indistinguishable from no gate at all,
+  while its presence in `scripts/` advertises coverage to everyone who reads
+  the tree. Finding them had meant tracing the call graph by hand.
+
+  This resolves the graph mechanically instead of reading workflow names,
+  because a check can be reached four different ways and only one of them is
+  obvious: a workflow can run it directly, through a `make` recipe, through
+  another script it already runs, or through a pytest suite it collects.
+  `connector_conformance.py` is reached *only* by that last route — the
+  connectors matrix in `ci.yml` collects `test_conformance.py`, which imports
+  the script and asserts the published matrix is current — so calling it
+  orphaned, as an earlier pass did, would have been wrong. The inverse
+  direction is checked too: a workflow step naming a `scripts/` path that does
+  not exist cannot do what its name says.
+
+  Wired into `ci.yml` with its `--self-test` running first, which injects an
+  unreachable check, a check that loses its only workflow, a dangling workflow
+  path and both ratchet-drift directions, and additionally asserts the
+  resolver *discriminates* rather than returning "reached" for everything —
+  the failure mode that would make every other case pass vacuously. Current
+  state: **42 checks, 42 reachable, 0 on the deliberately-unwired ratchet.**
+
+  Three checks were genuinely orphaned and are now wired. Each passed on first
+  real run, which is the quiet part: they had been correct and unheard.
+
+  - `check_store_migrations.py` → `ci.yml`. Neo4j, ClickHouse and Qdrant all
+    create-if-absent, so a schema change lands on a fresh deployment and
+    silently does not land on an existing one. The gate asserts each store has
+    a runner, that something on the startup path calls it, and that migration
+    ids stay ordered and unique.
+  - `check_published_packages.py` → `readme-gates.yml`, on the daily cron
+    alongside `published-onramp`, with `--require-network` so a runner that
+    cannot reach a registry says so instead of reporting a clean result.
+    `RELEASES.md` cited this script as the reason the README's "Ready,
+    unpublished" claim cannot go stale; nothing ran it.
+  - `sync_vendored_redactor.py --check` → `ci.yml`. The only one of five
+    vendored mirrors with no drift gate. A redactor copy that drifts strips a
+    different set on one side of the wire than the other.
+
+- **No gate may report OK over a repository with no content, and it is a CI
+  gate now rather than a probe somebody happened to run once.** Copying
+  `scripts/` into an empty git repository and running every wired check there
+  found five reporting OK over a tree holding nothing — the detection
+  validator behind the rule count on the front page certifying zero rules as
+  valid, a dashboard check that failed on an *empty* directory and passed on a
+  *missing* one, `OK: 0 published Go module path(s)`, every self-link healthy
+  over zero files, and a health-probe audit printing a table header and
+  exiting 0. Those five were fixed; the probe that found them was a one-off,
+  so the next gate written could reintroduce the defect freely.
+
+  `scripts/check_gate_contract.py` is that probe made permanent. It runs all
+  69 inventoried checks the way a workflow runs each one, inside a git
+  repository holding only `scripts/`, and requires each to exit non-zero.
+  Three things make the result mean something:
+
+  - **The inventory is not written here.** It comes from
+    `check_gate_coverage.py`, which already resolves the workflow-to-check
+    graph structurally. A second scanner would drift the first time either
+    one learned something the other had not.
+  - **A failure the empty tree did not cause is INCONCLUSIVE, not a pass.**
+    An argparse usage error, or an import of a module the repository does not
+    supply, means the gate was never exercised — crediting that as a refusal
+    would be the same defect one level up. Whether a missing module is the
+    repository's own is read from `git ls-files`, so `No module named 'app'`
+    counts as the empty tree working and `No module named 'structlog'` does
+    not.
+  - **Every way CI runs a script is probed, and the worst result decides.**
+    Four subcommands under one name are four gates; excusing the set because
+    the first refused is how the others stay hidden. Only invocations
+    carrying a declared verdict flag are probed, so the generator half of a
+    script that is both generator and gate is not mistaken for one.
+
+  Exceptions are recorded with the disposition they are excused for and
+  checked in both directions, so an entry naming a check that no longer
+  exists fails, and so does one whose gate has started behaving differently.
+  Four are recorded: `wet_eval_check.py` (reads two environment variables and
+  no repository content), `security_audit.py`'s `validate-ignores` arm (its
+  entire subject is a file inside `scripts/`, the one directory the scratch
+  tree must keep), and `openapi_diff.py` / `wet_eval_update_benchmark.py`
+  (both inputs named on the command line, one of them built outside the
+  checkout).
+
+- **Every check resolves its repository root from git, and every check
+  carries a `--self-test`.** Sixty of the sixty-nine derived a root from
+  `Path(__file__).resolve().parent.parent` — whatever happens to sit two
+  levels above the script — which is how a gate prints a confident OK about a
+  tree it never opened, and only a deliberate run from another directory
+  catches it. Fifty-four had no self-test at all. Both are now properties the
+  contract gate enforces, with empty exception lists.
+
+  `scripts/gate_toolkit.py` holds the single implementation of both. Five
+  near-identical copies of the git resolution had already accumulated across
+  `scripts/`, which is how the sixth gets written subtly differently.
+
+  Two things this turned up. `check_gate_coverage.py` decided whether a script
+  inspects the repository partly by looking for `Path(__file__)` — the very
+  idiom being migrated away from — so moving six gates onto the shared
+  resolver silently dropped them out of the inventory, and deleting their
+  workflow steps would then have gone unnoticed. And the first spelling of the
+  root-resolution property matched `repo_root` anywhere in the file, which
+  `check_gate_coverage.py` emits as a JSON key: a gate rooted at `__file__`
+  read as compliant on the strength of a dictionary key in its own output.
+  Both are read from the syntax tree now.
+
+- **Every test file in the tree is now executed by a workflow, and a gate
+  holds it that way in both directions.** 63 were executed by nothing at all:
+  56 of the 82 under `services/agents`, because that invocation was a
+  hand-maintained list of 26 file paths; five under the repository's own
+  `tests/`, which was reached only as nineteen single-file invocations spread
+  across eleven workflows; and both files under `scripts/tests/`, which no
+  workflow named. A file nothing runs reports nothing, which is
+  indistinguishable from a file that passed.
+
+  `scripts/check_test_discovery.py` derives the corpus from `git ls-files` and
+  models reach the way pytest collects — directory arguments, `--ignore`,
+  `conftest` `collect_ignore`, and `-m` marker deselection, since a file whose
+  every test is deselected runs nothing however plainly it is named. An
+  invocation naming a path that is not in the tree fails too. Quarantine is a
+  shrink-only list where every entry carries a reason and an entry that has
+  become reachable fails as stale, so "not run" can never again be silent.
+
+  Two blind spots in the gate's own parser were found by enumerating what it
+  **credited** rather than what it flagged. A step that `cd`s into a service
+  and then names `tests/` had its paths resolved against the repository root,
+  which simultaneously reported all 82 agents files unreached and credited the
+  root `tests/` tree with a package's invocation — the same defect in both
+  directions at once. And `-m` was first treated as "a filter, not a
+  collection rule", which would have credited a module in full under
+  `-m "not integration"` while nothing in it ran.
+
+  The invocations are directories now. `services/agents` runs `tests/`;
+  `tests/` and `scripts/tests/` run as directories in `python-test`, with
+  `tests/isolation/` left to `isolation.yml`, which owns its live stores.
+
+- **`--suite <name>` in `scripts/run_evals.py` ran every suite.** Its `--help`
+  said "runs that suite in isolation", the module docstring said "run a single
+  suite by name", and `args.suite` reached nothing but the wording of the
+  banner: the report dict called all eleven `_run_*` helpers inline. So
+  `--suite mitre_accuracy` took the full runtime, graded eleven gates, and
+  printed `PASS — mitre_accuracy green` — a verdict naming one suite and
+  decided by eleven, with `--ci` able to fail an operator's single-suite
+  bisection on an unrelated regression. The report now carries `suite_filter`
+  and only the requested suites are called; the registry is asserted against
+  `_SUITE_NAMES` so a name argparse accepts cannot be one no runner answers
+  to. A substrate-import failure also exits **3**, which is what this file's
+  own "Exit codes" block has always documented — it exited **2**, and 2 means
+  "MITRE accuracy regressed against the baseline", so a fresh clone missing a
+  dependency reported an accuracy regression, and the one actionable
+  instruction (`pip install -e services/agents`) was not in the message.
+  All three defects were pinned by tests in `scripts/tests/` that had been
+  failing for as long as they existed, in the tree no workflow ran.
+
+- **`scripts/check_dependency_pins.py` — fails when any two install paths for
+  one package disagree.** A package is installed from more than one place: a
+  manifest, a lock, a Dockerfile, and whichever workflows pip-install a
+  service's dependencies to run a test. Nothing compared them, so CI could
+  test one version while the image shipped another. It scans 99 install paths
+  and names every one of them, and it runs in six directions rather than one,
+  because the recurring failure here is a gate that compares A to B and never
+  B to A:
+
+  - a package the manifest declares, installed at a different version by the
+    image;
+  - a package the image installs that no manifest declares;
+  - two ranges written for the same package anywhere in the tree;
+  - a lock resolving something outside the range everyone agreed on;
+  - a critical package installed with no version bound at all;
+  - a file that declares one and was never scanned — **and, separately, a
+    file that was scanned but whose declaration the parser could not read.**
+
+  That last direction found a real bug in the gate on its first run: the
+  manifest parser read only runtime dependencies, so `ruff` — which lives
+  only in dev groups — was reported as agreeing across seven files, none of
+  which had actually been read for it. It also caught `integration.yml`,
+  which installs the whole API dependency set through a folded `run: >-`
+  scalar that a line-by-line reader skips while still counting the file as
+  scanned.
+
+  `--self-test` builds throwaway trees, injects drift in each of those
+  directions separately, and fails if any injection goes undetected. It also
+  asserts the gate refuses a directory that is not the repository, rather
+  than printing a confident OK about a tree it never opened.
+
+- **`scripts/check_toolchain_pins.py` — the Go, Node and toolchain half of
+  reproducible builds.** `check_dependency_pins.py` made every *package*
+  install path agree and stopped at the Python services. Go has `go.sum` and
+  pnpm has a frozen lockfile, so the raw material was already there — but
+  nothing compared the paths that use it, and nothing audited the *runtime*
+  those paths run on. Measured across 111 install paths, and every
+  disagreement found:
+
+  | What | Before |
+  |---|---|
+  | `apps/web/Dockerfile` | `pnpm install --no-frozen-lockfile` — the production web bundle was the one install path in the repository free to resolve its own dependency set, while all 13 workflows installing the same workspace used `--frozen-lockfile` |
+  | `services/realtime/Dockerfile` | `npm install` twice, and `package-lock.json` never copied into the build context, so the committed lockfile was inert and every image build re-resolved |
+  | `install.sh` | `pnpm install --no-frozen-lockfile`, so a self-hoster's install could differ from everything CI tested |
+  | `.devcontainer/devcontainer.json` | `pnpm install --frozen-lockfile=false` — an opt-out a substring test for the flag reads as *enabling* it |
+  | `deploy-docs.yml` | `pnpm --filter @aisoc/docs install`, unlocked; the published docs site could build from a tree no other job resolved |
+  | `apps/web/Dockerfile` | `npm install -g pnpm@8` against `packageManager: pnpm@8.15.1` — two resolvers, the `poetry 1.7.1 vs 1.8.2` finding again |
+  | Node | 20 in both images, the devcontainer, `deploy-docs.yml` and both installers; 22 in twelve workflows. Node 20 left security support in April 2026 |
+  | `services/enrichment/Dockerfile` | `COPY go.mod go.sum*` — the glob makes the checksum file optional, so deleting it downgrades the build to an unverified resolve without failing |
+  | `ci.yml` | `cache-dependency-path: packages/plugin-sdk-go/go.sum`, a file that does not exist. `setup-go` reports that as a **warning**, so the cache had been silently off while the job stayed green |
+  | `packages/sdk-go` | compiled by no workflow at all |
+
+  Everything above is now one version and one lockfile discipline, proved
+  rather than asserted: two `--no-cache` builds of each Node image resolve
+  byte-identically (web 1,172 packages, realtime 187, matching sha256 both
+  times).
+
+  Six directions, each with a `--self-test` injection that fails if it goes
+  undetected — 22 cases. Beyond agreement: *ship → test* (a version an image
+  ships that no workflow exercises) and *test → ship* (a version CI uses that
+  no image ships, which is the direction versions actually travel); *module →
+  sum* and *sum → module*; *module → CI* and *CI → module*; unlocked install
+  and its reverse, a lockfile nothing can consume; and both coverage
+  directions — a file declaring a toolchain that the gate never opened, and a
+  file it *did* open whose declaration the parser could not read.
+
+  That last direction earned its place immediately. Hunting for this parser's
+  equivalent of the blind spot `check_dependency_pins` found in itself, five
+  turned up: `cd services/${{ matrix.service }}` resolved to nothing, so five
+  of six Go modules looked ungated; `working-directory:` was not read at all,
+  so `services/osquery-extensions` looked uncompiled while the workflow that
+  compiles it sat two directories away; the npm pattern had no left word
+  boundary and matched inside every `pnpm install`; quoted shell text was read
+  as commands, so `die "pnpm install failed."` counted as an install path; and
+  the `node_modules` skip was a prefix rather than a path segment, so on a
+  checkout with dependencies installed the gate scanned 223 vendored manifests
+  and reported Node floors of `0.10` from other people's packages — an answer
+  that depended on whether someone had run `pnpm install`.
+
+  `EXPECTED_ESBUILD` pins the **resolved** esbuild set (0.25.12 bundled by
+  Next, 0.28.1 from the scoped overrides). The overrides are deliberately
+  per-parent because forcing esbuild workspace-wide broke Turbopack's font
+  import map, and that scoping means a `vite` bump can pull a different
+  esbuild with no esbuild line in the diff.
+
+- **`scripts/check_sqlglot_pin.py` now checks the lock, not just the ranges.**
+  `services/api/Dockerfile` left the list of files declaring sqlglot when its
+  pip fallback was removed. The lock took its place — but a lock states a
+  resolved version rather than a range, so it is checked differently: the
+  version it resolved must fall inside the agreed range. Comparing the ranges
+  only to each other would have left the gate agreeing about a bound that
+  nothing installs.
+
+- **`.github/workflows/reproducible-builds.yml`.** Four jobs: the pin gate
+  and its self-test; `poetry check --lock` across all thirteen Python
+  services; the API imported on both ends of the declared FastAPI range; and
+  two `--no-cache` builds of the same commit compared package by package.
+
+- **`Reproducible builds` now proves the property for all thirteen Python
+  services, not one.** The `twice` job asserted byte-identical resolution for
+  `api` alone; the other twelve used the same mechanism and nothing checked
+  it. A nightly matrix (03:17 UTC) double-builds all twelve services that have
+  a Dockerfile and double-installs the thirteenth, `teams-bot`, which has a
+  lock but no image. The matrix is derived from the tree rather than
+  hand-listed, and a `coverage` job fails when the number of services proved
+  is not the number that exist — a scheduled run that silently covers less
+  than it claims is the `wet-eval` failure, eight green weekly runs with every
+  real step skipped.
+
+- **`scripts/check_mypy_baseline.py` — the type check the CI job is named
+  after.** `ci.yml`'s **Python — Lint & Type-check** installed mypy and never
+  invoked it. Six manifests declare `[tool.mypy]` and three set
+  `strict = true`, so three authors had asked for a check that had never once
+  run. It runs now. The 690 findings are recorded in
+  `scripts/mypy_baseline.json` exactly as mypy reports them, keyed on
+  `(tree, file, error-code)` so an error cannot be introduced under cover of
+  fixing an unrelated one — no `ignore_errors`, no widened config, no excluded
+  tree. Both directions: a finding above baseline fails, and a *fixed* finding
+  still in the baseline fails too, so freed headroom must be banked rather
+  than left to absorb the next regression.
+
+  Its first run against a rebased tree earned the gate: 22 findings — 14
+  `union-attr`, 8 `arg-type` — in `services/api/app/services/playbook_step_dispatch.py`,
+  a file merged hours earlier that nothing had ever type-checked. They are
+  recorded rather than fixed because that file belongs to concurrent work;
+  what matters is that they are now visible and cannot grow. Five other
+  findings were real null-safety bugs in `services/fusion` — an
+  `IsolationForest` and an `LGBMRanker` used before training, and the Kafka
+  consumer and producer used before `start()` assigns them — and those are
+  fixed, taking fusion from 7 to 2.
+
+- **All twenty Python trees are type-checked, and the coverage is gated in both
+  directions.** `#818` ran mypy for the first time, over the six trees that
+  declared a `[tool.mypy]` table. Fourteen declared none, so the job named
+  "Lint & Type-check" reported green over 787 Python files it never opened — a
+  tool that appears to cover the repository while covering a third of it is
+  indistinguishable from no tool at all, only more reassuring.
+
+  Every tree now declares one, matching the two strictness shapes that already
+  existed rather than inventing a third: the ten services take
+  `python_version = "3.11"` / `strict = false` / `ignore_missing_imports = true`
+  like `services/api` and `services/osquery-tls`; the four packages take
+  `strict = true` / `python_version = "3.11"` like `packages/sdk-py`,
+  `plugin-sdk-py` and `aisoc-cli`. No `ignore_errors`, no widened config, no
+  `# type: ignore` added to reach a number.
+
+  `scripts/check_mypy_baseline.py` gains the coverage check itself, rather than
+  a second gate with its own idea of what a tree is. A Python tree on disk that
+  declares no `[tool.mypy]` fails (`tree -> config`), and a configured or
+  recorded tree that is no longer on disk fails (`config -> tree`) — the
+  direction that rots quietly, because nothing ever fails when a stale entry is
+  simply never consulted. Discovery is now structural, every directory holding a
+  `pyproject.toml`, instead of `services/*` plus `packages/*`: the glob was a
+  naming convention, and a Python tree added anywhere else would have satisfied
+  a coverage gate written against that same glob while being checked by nothing.
+  The gate resolves its root from `git rev-parse` rather than from its own file
+  location, prints how many trees and files were in scope, and its `--self-test`
+  injects coverage drift each way against a throwaway repository.
+
+- **The 153 Python files that belong to no manifest tree are type-checked, and
+  five gates that reported OK over nothing now fail.** Giving all twenty trees
+  a `[tool.mypy]` table still left `scripts/`, `tests/`, `tools/` and
+  `plugins/` outside every config — which is to say the CI gates themselves
+  were the only Python in the repository nothing type-checked, while every
+  other claim here rests on them.
+
+  They are covered by a scoped invocation under a new root
+  `mypy-unmanaged.toml`, not by a root `pyproject.toml`. Three things were
+  measured rather than assumed: a root manifest carrying only `[tool.mypy]`
+  makes `poetry check` answer *"The Poetry configuration is invalid"* from
+  every directory without a manifest of its own, because poetry searches
+  upward; pytest gains a `configfile` where it had none; and
+  `check_dependency_pins.py`, `check_toolchain_pins.py` and
+  `security_audit.py` all pass with one present only because each is scoped to
+  `services/*` + `packages/*`, so they would miss it by accident of a glob and
+  fail closed on it the day any of them is made structural.
+
+  The scope is **computed, never listed** — `git ls-files '*.py'` minus every
+  manifest tree — so a script added anywhere is checked with no edit, and
+  deleting a tree's manifest moves its files into this scope rather than out
+  of coverage. Sixteen `plugins/*/plugin.py` files share one module name in
+  directories whose hyphens keep them from ever being packages, so the run is
+  split into the minimum number of invocations with no collision, derived
+  rather than configured. mypy's own `--linecount-report` must account for
+  every module asked of it before the run may report clean, and a finding
+  against a file outside the scope fails rather than being recorded.
+
+  Five gates were found reporting OK over a repository containing nothing, by
+  copying `scripts/` into an empty git repository and running all forty:
+  `validate_detections.py` printed a warning and exited 0 over an empty
+  detections corpus — the validator for the number the front page quotes,
+  certifying zero rules as valid; `check_grafana_dashboards.py` failed on an
+  empty dashboards directory and *passed* on a missing one, so the larger loss
+  was the one it forgave; `check_go_module_paths.py` reported "OK: 0 published
+  Go module path(s)"; `check_repo_self_links.py` reported every self-link
+  healthy over zero files, having replaced a lychee run that could not tell a
+  rate-limited 403 from a live link; and `audit_health_probes.py --check`
+  printed a table header and exited 0 over zero services. Each now fails and
+  says what it opened. `check_repo_self_links.py` also reported a file it
+  could not decode as checked, and now names it.
+
+  The ratchet in `scripts/check_mypy_baseline.py` gains a `file -> scope`
+  direction and goes **919 → 994**: +89 newly visible, −14 fixed. Of the 89,
+  20 are `import-untyped` against the deliberate no-dependency environment the
+  baseline is recorded in and the rest are annotation and narrowing findings.
+  A separate `--warn-unreachable` pass over the same scope reported 8
+  statements, all one shape: a defensive `isinstance` guard against untrusted
+  YAML or JSON that the parameter's own annotation declares impossible. None
+  is dead at runtime, so the annotations are what is wrong and the flag is
+  deliberately not enabled — recording those 8 would invite someone to delete
+  the guards to clear them.
+
+- **`scripts/check_logger_kwargs.py` — no stdlib logger may be called with a
+  structlog keyword.** `logging.Logger.warning` accepts exactly `exc_info`,
+  `stack_info`, `stacklevel` and `extra`; structlog's bound logger accepts any
+  keyword and turns it into the event dict. Both libraries are used in this
+  tree, so `logger.warning("x", reason=exc.reason)` is correct in one module and
+  a `TypeError` in the next, and the two call sites are identical to read — only
+  the binding decides.
+
+  This needs a checker rather than a grep because of *where* it hides. All five
+  instances `#818` fixed were inside `except` blocks, where the raised
+  `TypeError` replaces the exception being handled and no sibling handler can
+  catch it. A misused keyword on the happy path is found by the first person to
+  run the code; the same keyword in a fallback runs only when something has
+  already gone wrong. The report sorts by context and names how many findings
+  sit on such a path.
+
+  The scanner resolves each module's logger flavour rather than assuming one:
+  every binding, not just `logger`; `self._log` and class-body loggers reached
+  through the instance; `from app.core.logging import get_logger` followed to
+  the defining module, because both in-repo `get_logger` helpers return
+  structlog while their name says nothing; `.bind()` / `.getChild()` chains;
+  annotations, including parameters, for a logger that is handed in; and
+  `logging.warning(...)` on the root logger. A `**kwargs` splat onto a stdlib
+  logger cannot be decided statically and is reported separately rather than
+  counted as clean, and a receiver it cannot classify is counted as
+  `unresolved`, never as clean.
+
+  It covers all 1,408 Python files including the ~150 under `scripts/`,
+  `tests/`, `tools/` and `plugins/` that belong to no tree and so are checked by
+  no `[tool.mypy]` at all. It classifies 514 stdlib and 970 structlog call sites
+  with 18 unresolved receivers, and reports zero defects — and fails outright if
+  it classifies no stdlib logger, because "found nothing" and "resolved nothing"
+  otherwise print the same word. Pointed at the pre-`#818` files it reports all
+  five, each labelled `[inside except]`.
+
+  Three shapes were added after the first version reported a clean tree and the
+  shapes were then found *in* that tree: an inline
+  `logging.getLogger(__name__).warning(...)` with no binding to look up
+  (`detection_proposals.py`), a class-body logger reached as `self.logger`
+  (`core/config.py`), and an annotation with no factory call in sight. All three
+  were invisible to a scanner that only read assignments of a name.
+
+- **CI now runs the interpreter production runs, and `gofmt`, `services/realtime`
+  and the published image list are gated.** Three loose ends `#817` named and
+  did not close.
+
+  *Python.* Twenty-four workflows ran 3.12 while all thirteen service images
+  ship 3.11. Every manifest declares `^3.11`, which permits both, so nothing
+  written down was violated — which is exactly why it survived. Standardised on
+  **3.11**, in 41 replacements across those 24 workflows, because 3.11 was
+  already the answer everywhere except CI: the images ship it, the devcontainer
+  installs it, `ruff.toml` targets `py311`, five of six `[tool.mypy]` tables set
+  `python_version = "3.11"`, and all twenty-two manifests floor at 3.11 or
+  below. Moving the images to 3.12 instead would have meant changing all of
+  those *and* raising the published floor for seven installable packages — a
+  breaking change for downstream consumers, to fix a CI hygiene problem. Testing
+  at the declared floor is also the stronger guarantee. Nothing broke: 2726 API
+  tests, eleven service suites at their coverage floors and three Python SDKs all
+  pass on 3.11, and the mypy baseline is byte-identical (because those five
+  `python_version` pins meant mypy was already checking 3.11 semantics while
+  running on 3.12). `PYTHON_INTERPRETER_SPLIT` is deleted rather than emptied: a
+  split that can be recorded is a split that can grow.
+
+  *gofmt.* CI ran `go vet` and `go build` and never `gofmt`; 28 files across four
+  modules had drifted. The new job walks every `.go` file rather than iterating a
+  matrix, because a matrix is a list somebody has to remember to add to — which
+  is how `packages/sdk-go` came to be compiled by nothing. Formatting landed as
+  its own commit; nine files also had reStructuredText ``code`` markers in Go doc
+  comments, which have no inline code span, so gofmt was rewriting them to two
+  *left* curly quotes. The 58 marker pairs are gone, which leaves gofmt stable.
+
+  *`services/realtime`.* Published to GHCR on every release and built by nothing
+  — no build, test, lint or type-check job anywhere — despite being one of the
+  two ends of the Kafka spine, carrying the OpenTelemetry instrumentation that
+  keeps the distributed trace continuous, and holding the TypeScript CORS guard.
+  It now has all four, installing with `npm ci` from its committed lock.
+  `@types/node` moves `^20` → `^22` to match the Node 22 runtime, and a
+  `tsconfig.check.json` type-checks the test file, which `rootDir: src` had left
+  checked by nothing.
+
+  Three new bidirectional pairs in `check_toolchain_pins.py` — `module -> format`
+  / `format -> module`, `image -> CI` / `CI -> image`, `target -> ship` /
+  `ship -> target` — each of which rediscovers its defect when run against the
+  previous commit. Five parser blind spots were found and fixed in the gate
+  itself, every one present in this tree: matrix legs read file-wide (so
+  `ci.yml`'s two `service:` matrices merged), the block-list matrix form
+  unreadable, `working-directory` truncated at the space inside a matrix
+  expansion, `working-directory` unreachable when it is a step's first key, and
+  `gofmt` matched inside step names and quoted `echo` strings — the last of which
+  also let a quoted path in a `compose-smoke.yml` shell array count as CI
+  coverage for eleven services, so the check would have reported OK about the
+  very gap it exists to find. Each published image now prints the step that
+  exercises it instead of contributing to a tally, and the gate asks
+  `git rev-parse` for its root instead of inferring it from its own file
+  location. 35 self-test cases, 49 unit tests.
+
+- **`scripts/audit_health_probes.py` now checks the thirteen copies of
+  `app/_health.py` are identical.** The module's own docstring claimed they
+  were kept in sync and nothing verified it — they happened to be, so the
+  claim was true by luck. It also pointed at `scripts/sync_health_module.py`,
+  which does not exist in this tree.
+
+- **A gate that reads the one place a dead path could get in.** A comment is
+  the only prose no check in this tree opens: `check_repo_self_links.py`
+  reads markdown and matches `github.com` URLs, lychee resolves links, and
+  neither looks inside source files — which is where most cross-file
+  references in this repository actually live. That is how
+  `docker-compose.yml` came to name
+  `docs/architecture/decisions/0001-llm-gateway-in-core.md`, a path with no
+  directory behind it, and survive every gate. `scripts/check_comment_paths.py`
+  reads comments in fourteen languages plus Python docstrings and asserts
+  that every repository path they name exists.
+  The corpus was measured before the gate was written, because a naive
+  version would have been mostly noise: of **3,092** path-shaped strings in
+  non-markdown comments, most are MIME types, MCP method names
+  (`tools/call`), Splunk REST routes (`services/search/jobs`), container
+  images or URL routes. Three structural filters — a known file extension, a
+  first segment that names something at the top of this repository, and not
+  a URL / template / glob / gitignored artefact — cut that to **1,251**
+  claims about this tree, resolved against the repository root *and* each
+  ancestor of the referring file (a comment in `services/agents/tests/`
+  saying `tests/conftest.py` means the one beside it).
+  Extension-less directory references are **deliberately not checked** and
+  the gate says so in its own output: 286 resolve and 52 do not, and
+  hand-classifying the 52 put genuine rot at roughly one in five, which is
+  the precision at which a gate gets ignored.
+  Ten exceptions are recorded, each with a reason and each verified in both
+  directions — an entry whose path now resolves, or which no longer appears
+  in any comment, fails the build rather than sitting there.
+
+### Changed
+
+- **A hosted deployment's hostname no longer appears in self-hosted docs as the
+  reader's own URL.** Seven files under `apps/docs/` pointed at the managed
+  instance: two `curl` examples told a self-hoster to push their SIEM data to
+  somebody else's ingest endpoint, a sample address appeared in a console
+  illustration, three white-paper links and a benchmark-scoreboard link sent
+  open-source readers to the hosted console, and a JSON Schema `$id` claimed the
+  hosted docs domain. These now use `example.com`, in-repo GitHub links, or the
+  project's own documentation URL. Pages genuinely *about* the managed offering
+  keep naming it, as does the docs build configuration.
+
+- **The Slack bot no longer deep-links an unconfigured deployment to somebody
+  else's console.** `AISOC_WEB_BASE_URL` defaulted to a hosted hostname, so a
+  self-hoster who deployed the bot without setting it got case cards pointing at
+  another instance. It now defaults to `http://localhost:3000`, matching the
+  compose default it had silently disagreed with, and both documented defaults
+  were corrected with it.
+
+- **A permanent playbook-step failure is no longer retried as if transient.**
+  `dispatch_step` raises before any I/O when the run context has no tenant,
+  and the engine retried it with exponential backoff: 2s, 4s, then 8s, to
+  arrive at the message it already had on the first attempt. The cost is not
+  the fourteen seconds — it is that a permanent misconfiguration presents to
+  an operator mid-incident as flakiness, so their next move looks like "wait"
+  when it is "go and set the variable".
+
+  `BridgeUnavailable` stays the base class every caller catches, and the
+  permanent half is now `BridgeMisconfigured`, marked with a new
+  `PermanentStepFailure` that any handler can raise and the engine honours.
+  The line: **permanent** when the cause is this deployment's configuration or
+  a violation of the API's own contract — the enable switch, the service
+  token, the missing tenant, a non-retryable 4xx, a JSON body with no
+  `executed` field; **transient** when the cause is reachability — a transport
+  error, any 5xx, `408`/`425`/`429`, and a body that did not parse as JSON at
+  all, which is overwhelmingly an ingress error page rather than the API. A
+  failed step records `permanent` and `attempts`, so the run says why it was
+  tried once and not four times.
+
+- **`Backup → destroy → restore` and `docker compose up — full stack` report
+  a verdict on every pull request, so both can be required checks.** Both
+  workflows were path-filtered at the workflow level, and a workflow that does
+  not trigger reports no check at all — so a required check would never
+  arrive and the pull request would block forever. That is the only thing that
+  had been standing between the disaster-recovery path being tested and it
+  being tested and unable to regress; `docs/audit/CLAIM_TO_GATE_MATRIX.md`
+  already cited the DR job as the `GATED` evidence for backup encryption,
+  which makes a gate that might not run a liability rather than a control.
+
+  The condition moved from the trigger into the jobs. `integration.yml` gained
+  a `changes` job that reads the diff once; `spine`, `migrations` and
+  `upgrade` skip on it as before, while `backup-restore` always runs and
+  guards its expensive steps, so the check name is produced by the same single
+  job either way. `compose-smoke.yml`'s `smoke` job does the same inline. The
+  DR filter was also missing `scripts/backup_crypt.py` — where every byte of
+  the AES-256-GCM implementation lives — so a change to the encryption did not
+  run the gate that proves the encryption works.
+
+- **Compose smoke says which services it built and which it pulled.** It boots
+  published `:main` images unless a build context changed, so a green run
+  frequently never compiled the service under review — a required check that
+  can pass without exercising the change is the defect this whole effort is
+  about. The run now reports provenance per service, read off the images that
+  are actually running rather than predicted from the decision: a pulled image
+  carries a RepoDigest and a locally built one does not. It fails when a
+  build-context change was detected and nothing was built, and says plainly,
+  when nothing changed, that the run proves the published images still boot
+  together and does not exercise this pull request's source.
+
+  The build contexts themselves are now derived from `docker-compose.yml`
+  rather than listed in the workflow under a "keep this list in sync" comment.
+  A service added to compose and forgotten in that list would have had its
+  source changes pulled from the registry instead of built — the gate booting
+  a stale image and passing, inside the check that exists to catch exactly
+  that. The derived set matches the old list exactly today, so nothing about
+  today's behaviour changes.
+
+- **The tenant-predicate gate can now tell a guard from a log line, and the
+  ratchet shrank from 34 to 32.** It credited any query addressed by a key
+  passed to a call that also received the caller's tenant — which
+  `investigations.py` does correctly fourteen times — but a guard that logs
+  and continues was indistinguishable from one that raises. The only real
+  instance of the fail-soft shape was caught solely because its unscoped query
+  lived in a different function; written inline it would have been credited.
+  The distinction is now made structurally, and the undecidable remainder is
+  refused rather than guessed: a guard whose result is tested in a branch that
+  only logs demonstrably continues on failure and earns nothing; a guard whose
+  callee raises is enforcing; a callee the module cannot resolve is not
+  credited, so the statement becomes a finding that needs a reason.
+
+  The gate also recognises an RLS context bound on the connection, on a table
+  that carries a policy — the mechanism four ratchet entries described instead
+  of a defect. Re-checking all four rather than trusting them found that none
+  of the four reasons was accurate: two named a `_set_rls_context` that wrote
+  the wrong session variable (fixed, and those two entries are now retired by
+  the rule), and two named "a per-tenant RLS session" that their only caller
+  deliberately does not use — `_purge_alerts` runs with row security *off* and
+  appends the tenant predicate itself. Those two keep their exemption with a
+  corrected reason. Credit granted this way is counted and printed on every
+  run, because it lapses on a deployment whose role bypasses RLS.
+
+  Two further blind spots, found by checking what the gate *credits* rather
+  than what it flags: its RLS inventory globbed only
+  `services/*/migrations/*.sql`, so twelve tenant-scoped tables in four
+  alembic-managed services read as unprotected however many policies they
+  carried; and a policy created inside a PL/pgSQL `EXECUTE` is invisible to
+  it, which is why `060_rls_coverage.sql` spells out 56 literal `ALTER TABLE` /
+  `CREATE POLICY` statements instead of looping over an array. And the rule
+  credited the *session* as a validated key — `db` is passed to the guard and
+  appears in every raw statement's expression, so `keys & resolved` matched
+  whatever the query was really keyed on; a call receiver is now excluded
+  structurally rather than by naming `db`. `--self-test` grew from 8 cases to
+  15, covering all of it in both directions.
+
+- **`check_gate_coverage.py` decides what a check is from what a script does,
+  not what it is called.** It classified by filename — `check_*`,
+  `validate_*`, `_conformance.py`, plus a hand-kept list of five exceptions
+  for the ones whose names did not announce a verdict. That is the same defect
+  the script exists to catch, one level up: a gate named something unexpected
+  was simply not inventoried, and an uninventoried gate is indistinguishable
+  from one that does not exist.
+
+  Nineteen were in that state and every one is a CI gate. Fifteen are run by a
+  workflow with `--check` — `generate_connector_count.py`,
+  `generate_connector_docs.py`, `generate_detections.py`,
+  `generate_slo_alerts.py`, the four `export_*` scripts, `build_marketplace.py`,
+  `build_quarantine_index.py`, `curate_detections.py`, `project_stats.py`,
+  `storage_cost_model.py` and two more. Deleting any of those steps would have
+  left the script reporting full coverage over a smaller tree.
+
+  Classification is now three structural signals, all read from the tree: a
+  declared verdict flag (`--check`, `--verify`, `--strict`, `--fail-*`,
+  `--max-*`, `--self-test`); an exit status derived from findings the script
+  accumulates; or a workflow job whose output another job branches on, which
+  is how `wet_eval_check.py` gates — it always exits 0 by design and publishes
+  its verdict as a JSON status file. The first two are intrinsic, so a gate
+  nothing calls is still inventoried and the "unreachable check" direction
+  does not become vacuous.
+
+  Polarity is the distinction that keeps it from over-reporting: `if
+  offenders: return 1` is a finding, `if not specs: return 1` is a generator
+  aborting on an empty read. A script that only talks to a running service is
+  excluded for the same reason — its non-zero exit is an operational error,
+  not a verdict on the tree.
+
+  The classifier is checked in reverse too: a script CI runs with a verdict
+  flag that the classifier does not inventory now fails as
+  `classifier-blind-spot`, so the classifier cannot silently narrow. The
+  inventory goes 42 → 59, and the first run of the new one found a real
+  orphan — `list_python_services_with_tests.py`, whose own docstring says
+  "wire this into CI itself once the matrix has stabilised" and which had
+  stayed unwired. It is wired now, and passes: all 13 tested Python services
+  are gated.
+
+- **`ruff` moved to the 0.16 line across all fourteen declarations, the tree
+  was reformatted under it, and the lint gate stopped ending at `services/`.**
+  The bump alone reds every open pull request, because `ruff format --check`
+  is a hard gate on the required `Python — Lint & Type-check` job and 0.16
+  formats differently from 0.4.10. So the migration is the reformat. Measured
+  under 0.16.9 (what the range resolves today, and byte-identical to 0.16.8 on
+  both format and lint): **218 files reformatted**, 862 insertions against
+  1075 deletions, almost all of it collapsing calls that 0.4.10 wrapped and
+  0.16 fits inside the 140-column limit. It is its own commit with no other
+  change in it.
+
+  All fourteen declarations now read `>=0.16.8,<0.17` — seven manifests
+  (`services/{api,fusion,osquery-tls}`, `packages/{aisoc-cli,aisoc-detections,
+  plugin-sdk-py,sdk-py}`), three workflows (`ci.yml`, `ai-sdk.yml`,
+  `python-detections.yml`), `.devcontainer/Dockerfile`, and the three
+  `poetry.lock` files that resolve it, now at 0.16.9.
+
+  The three lint findings 0.16 reports on `services/` are fixed rather than
+  suppressed: two `C420` dict comprehensions become `dict.fromkeys` (both
+  values are string literals, so the shared-value hazard the rule exists
+  around does not apply), and one `UP031` percent-format becomes an f-string
+  in a chunker test that counts characters — all three rewrites asserted
+  equal to the originals before the change was kept.
+
+  **Scope.** The gate read `ruff check services/`, which left `scripts/` —
+  every CI gate in this repository, the code the rest of its claims are
+  verified by — linted by nothing at all. That is the same gap
+  `check_mypy_baseline.py` closed with its unmanaged scope, and it is closed
+  the same way here: lint now covers `services/ scripts/ tests/ tools/`, the
+  trees the repo-root `ruff.toml` governs that nothing else lints, and
+  `ruff format --check .` covers the whole repository because formatting has
+  no semantic content and `.` needs no edit when a tree is added. That
+  surfaced 17 real findings outside `services/`, each fixed at the source: two
+  `B007` loops switched to `.values()`, a `B904` re-raise in
+  `security_audit.py` now chains `from exc` so the original traceback
+  survives, two `E402` imports that genuinely follow a `sys.path` mutation
+  carry a reason next to the marker, and two over-length lines were wrapped.
+
+  Two exclusions, both named rather than implied. `plans/` is excluded in
+  `ruff.toml`: it is the archived prototype subtree `codeql.yml` and
+  `check_mypy_baseline.py` already exclude and the project rules forbid
+  editing, and it holds 844 lint findings and ~280 unformatted files — they
+  are excluded because they cannot be fixed, which is not the same as being
+  clean. `E501` is ignored for `scripts/detection_specs.py` and
+  `scripts/detection_specs_part2.py`: both open their rule table with
+  `# fmt: off`, so the formatter is already opted out of that layout by a
+  deliberate decision, and all 199 long lines there are single dict or string
+  literals — 72 positive fixtures, 66 negative fixtures, 50 `match_when`
+  clauses, 11 descriptions. Two named data modules, not `scripts/`; exactly
+  one long line elsewhere under it needed wrapping.
+
+  `packages/` and `plugins/` stay outside the lint gate on purpose and the
+  gap is a number rather than a shrug: 91 findings and 2 respectively. Two of
+  the five packages are already linted by their own workflows under their own
+  configs, and bringing the three published SDKs under this gate means
+  behaviour-touching fixes — `subprocess.run` check semantics, blind
+  `except Exception` handling, `zip(strict=)` — that belong in a change
+  reviewed as such rather than in a formatter migration.
+
+- **`mypy` moved to 2.3.1 across all ten declarations, and the baseline it
+  ratchets became reproducible outside CI.** The bump alone makes
+  `scripts/check_mypy_baseline.py` exit 1 on 35 mismatched `(tree, file, code)`
+  entries, so the re-record is the work — and a re-record is the moment a
+  ratchet can quietly grow, so every entry was triaged before being banked.
+
+  **Zero new findings.** All 35 are the same code in the same direction:
+  `import-untyped` went 38 → 3 and nothing appeared, nothing grew. The cause
+  is a behaviour change rather than a code improvement, and is recorded as
+  such: mypy 2 extends `ignore_missing_imports = true` to silence
+  `import-untyped`, which 1.x did not. Isolated on a two-line file — under
+  1.20.2 the finding is reported with the option either way; under 2.3.1 it is
+  reported only with the option off. So the ten trees that set it lose the
+  "this third-party import carries no type information" signal, every one of
+  the 35 was `yaml`, and `packages/aisoc-cli` — strict, with no such option —
+  still reports its three. `enable_error_code = import-untyped` does not
+  bring it back; `ignore_missing_imports` wins. The alternative, dropping the
+  option, would surface `import-not-found` for every uninstalled dependency in
+  a deliberately dependency-free run, which is a statement about the runner
+  rather than the tree. Banked at 955, with the reason on the record.
+
+  **The baseline was only reproducible on a CI runner, which is not
+  reproducible.** Measured rather than assumed: the interpreter is not the
+  variable people assume — Python 3.13 against 3.11 moves exactly 2 findings
+  in 1 file (PEP 701 changed f-string sub-expression line attribution in 3.12,
+  splitting findings 3.11 reports once) — while installing eight project
+  dependencies moves 59. mypy reads type information out of installed
+  packages, so a contributor with a service virtualenv active got mismatches
+  in both directions and nothing saying the cause was their environment. A
+  second cause surfaced while measuring the first: a `.mypy_cache` written
+  under different conditions is reused by the next run, and the same tree
+  answered 990 cold against 988 warm.
+
+  Both are now closed at the source. The gate passes `--no-site-packages`
+  (measured on `services/connectors`: 73 findings bare, 140 with eight
+  dependencies installed, 73 either way with the flag — and a no-op in CI's
+  own dependency-free environment, verified by re-recording under 1.20.2 and
+  getting the committed file back byte for byte) and `--no-incremental`. It
+  records the mypy version in an `(environment)` block and refuses to compare
+  across majors, because a major *moves* findings and every difference would
+  otherwise print as a file-level diff that describes the version. The
+  interpreter difference is reported as a note rather than a refusal, so a
+  contributor on 3.12 can still run the gate. Verified: the same 955 from a
+  bare interpreter and from one with the project's dependencies installed.
+
+  `mypy` is now in `check_dependency_pins.py`'s `CRITICAL` set, so the ten
+  declarations have to move together the way `ruff`'s fourteen do. Nothing
+  enforced that before, which is how a single-path bump could be proposed at
+  all. One real bug was caught by the re-recorded baseline while this was
+  being written — a `used-before-def` introduced into the gate's own
+  self-test — and fixed rather than banked.
+
+- **`sqlglot` moved to the 30 line across all eight declarations, and the
+  forward-compatibility matrix leg was rewritten so it can still reach past
+  the pin.** The bump itself was never the work: a single-path proposal moved
+  1 of 8 declarations and left six workflows at `>=23,<27`, which
+  `scripts/check_sqlglot_pin.py` fails closed on — correctly, since that gate
+  exists because sqlglot 27 renamed the SELECT's FROM argument key and
+  silently stripped the tenant predicate, the table allowlist and the `url()`
+  exfiltration ban from every single-table query while reporting success. All
+  eight now read `>=30,<31` (`services/api/pyproject.toml` plus `ci.yml`,
+  `integration.yml` ×2, `isolation-live.yml`, `cross-tenant-rbac.yml`,
+  `check-openapi.yml`, `reproducible-builds.yml`), and
+  `services/api/poetry.lock` resolves 30.19.0 inside it.
+
+  One major wide rather than four. The previous range permitted 23–26 and
+  exactly one of those was ever exercised, so three majors were installable
+  and untested; 27, 28 and 29 are likewise unexercised, and a range states
+  what may be installed rather than what upstream has released.
+
+  Measured before moving, on 64 adversarial cases written against the
+  documented policy rather than reusing the module's fixtures — DDL, DML,
+  admin verbs, multi-statement input, seven ClickHouse table functions
+  including ones hidden in subqueries and CTE bodies, non-allowlisted tables
+  reached through JOIN, subquery, UNION arm and CTE, and five forged
+  `tenant_id` predicates. 26.33.0 and 30.19.0 return the same disposition on
+  all 64 (23 rewritten, 33 `LakeSqlForbiddenError`, 8 `LakeSqlSyntaxError`)
+  and the rendered SQL of all 23 rewritten cases is byte-identical. Two cases
+  differ in wording only and both remain refusals: `DETACH TABLE` now reaches
+  the statement-kind check instead of failing to parse, and `KILL`'s class
+  moved to `sqlglot.expressions.ddl`, which the parse error quotes. The
+  in-tree suites pass 58/58 on each major.
+
+  The forward leg is the part that needed a decision. It read `>=27,<31`,
+  which only reached past the pin while the pin sat below 27; there is no
+  sqlglot 31, so with the pin on the 30 line every way of naming a ceiling is
+  worse than leaving it off — `>=31` cannot be installed and reds the job
+  forever, `>=30,<31` duplicates the shipped leg and reports two greens for
+  one piece of evidence, and retargeting to `>=27,<30` tests majors below the
+  pin, which is regression coverage for versions nothing installs and leaves
+  nothing between the next major and production. The leg is now unbounded
+  above, so it resolves whatever is newest and arms itself the day a higher
+  major is published with no edit. Because that means it re-runs the shipped
+  version today, a `Forward coverage` step emits a warning annotation saying
+  so rather than letting a duplicate green pass for evidence, and
+  `check_sqlglot_pin.py` gained the structural half in both directions: the
+  forward leg must carry no upper bound and must not float below the shipped
+  floor, and the step's `SHIPPED_CEILING` must equal the shipped range's `<N`
+  bound so a stale copy cannot report the wrong verdict. Seven injected
+  violations in `--self-test`, which runs before the gate. What is
+  deliberately not asserted is that a higher major exists: upstream's release
+  schedule is not this repository's to require, and a gate red until sqlglot
+  ships 31 would be red for a reason no change here could fix.
+
+- **Four root-workspace dependency bumps landed as one lockfile change.**
+  `cytoscape` 3.34.0 → 3.34.3, `lucide-react` 1.28.0 → 1.48.0,
+  `@modelcontextprotocol/sdk` 1.29.0 → 1.30.1 and `tsx` 4.23.1 → 4.23.15 all
+  resolve through the single root `pnpm-lock.yaml`, so merging them
+  separately makes each one rebase the next until they all report
+  `CONFLICTING`. Regenerated once from the four manifests together: 47
+  insertions against 56 deletions, versus 1,130 insertions across the four
+  individual proposals, because each of those re-churned the same peer keys.
+  The `esbuild` resolutions are byte-identical before and after — `0.25.12`
+  and the `vite>esbuild` / `tsup>esbuild` / `bundle-require>esbuild`
+  override's `0.28.1` — so the `tsx` bump does not reach Turbopack's bundler,
+  which is the reason those overrides are scoped to named parents rather than
+  applied workspace-wide.
+
+- **Three more root-workspace bumps landed as one lockfile change.**
+  `@testing-library/user-event` 14.6.4 → 14.6.7, `autoprefixer` 10.5.2 →
+  10.6.1 and `zustand` 5.0.14 → 5.0.15, regenerated once from the three
+  manifests together: 19 insertions against 22 deletions, versus 636
+  insertions across the three individual proposals. The only transitive
+  movement is `caniuse-lite` 1.0.30001803 → 1.0.30001810, which
+  `autoprefixer` carries as a data table. Verified on the merged result
+  rather than on the three green ticks, because none of these three has a CI
+  job that exercises what it changes beyond the shared web gates:
+  `pnpm install --frozen-lockfile`, `eslint .` (0 errors), `tsc --noEmit`,
+  `vitest run --coverage` (62.17% statements, gate green), `next build` and
+  `storybook build` all pass.
+
+- **Five more root-workspace bumps landed as one lockfile change.**
+  `@vitest/coverage-v8` 4.1.10 → 4.1.11, `axe-core` 4.11.4 → 4.13.0,
+  `react-hot-toast` 2.6.0 → 2.6.1, `framer-motion` 12.43.0 → 13.4.0 and
+  `zod` 4.4.3 → 4.6.5 (the last in `services/mcp`), regenerated once: 61
+  insertions against 84 deletions, versus 1,040 insertions across the five
+  individual proposals.
+  The `@vitest/coverage-v8` bump is the first pull request the new `vitest`
+  group produced, and it closes the exact-version peer drift that group was
+  added for — `pnpm install` stops reporting
+  `unmet peer @vitest/coverage-v8@4.1.11: found 4.1.10`.
+  `framer-motion` is a major and what installs is **13.4.3**, not the 13.4.0
+  in the proposal's title, because `^13.4.0` resolves above it. Verified on
+  13.4.3 rather than on the proposed number: `tsc --noEmit` passes, which is
+  the gate that would see a removed API, and this app's entire framer-motion
+  surface is `motion`, `AnimatePresence` and `useReducedMotion` across 37
+  import sites. v13 drops the optional `@emotion/is-prop-valid` peer that
+  v12 declared, and this workspace does not use emotion. 615 tests pass with
+  zero errors and coverage unchanged to the digit (62.17% / 57.71% / 54.77% /
+  64%), `next build` generates all 104 static pages, and `storybook build`
+  succeeds.
+
+### Fixed
+
+- **A new user who followed only the README could not log in.** `make up`
+  worked, `make smoke` passed 8/8, and then authentication was impossible for
+  three independent reasons at once. The only account was `admin@aisoc.local`,
+  and `LoginRequest.email` is a pydantic `EmailStr`, which rejects RFC 6761
+  special-use domains — so the address returned `HTTP 422 "value is not a
+  valid email address: The part after the @-sign is a special-use or reserved
+  name"` *before the password was ever compared*. The bcrypt hash migration
+  001 seeded matched neither the `changeme` that four documentation pages
+  published nor the `admin` its own inline comment claimed; checked with this
+  service's `verify_password`, every candidate returned `False`, so it
+  corresponded to no known secret. And nothing existed to create a user with.
+  `make demo` repaired it incidentally by writing a valid address, which left
+  the demo path working and the path for running AiSOC on your own data
+  broken.
+
+  The first administrator is now created by the deployment rather than
+  committed to the repository. `services/api/app/scripts/bootstrap_admin.py`
+  creates `admin@aisoc.internal`, generates a password, and prints it once —
+  it is stored nowhere. `make up` calls it, so the documented quick start ends
+  with a credential on screen; `make bootstrap` runs it on its own and
+  `make bootstrap ARGS=--reset-password` mints a new one. It is idempotent: a
+  second run reports the existing account and changes nothing, which is what
+  makes it safe for `make up` to call unconditionally. The address is
+  validated with the same library the login route uses, so an address that
+  cannot sign in is refused here with an explanation instead of becoming an
+  account that fails at a login form with a schema error.
+
+  Migration 001 no longer seeds a user at all, and `059` deactivates the
+  orphaned row on databases that already ran it. A gate
+  (`tests/test_first_run_gate.py`) now asserts that no migration ships a
+  password hash and that every login example in the documentation uses an
+  address the API accepts — the four pages were each self-consistent with the
+  broken seed, which is why reading them found nothing.
+  `golden-pipeline.yml` runs `make bootstrap` against the live stack and
+  authenticates with the credential it printed, so the quick start's last step
+  is covered by the same job that covers its first.
+
+- **The README never told anyone to create `.env`.** `make doctor` correctly
+  reported it missing and printed the fix; the quick start it was meant to
+  support skipped the step. It is now the second line of the quick start.
+
+- **`make up` printed an API docs URL that 404s.** The README was corrected on
+  its own; the tooling was not, so `make up`, `install.sh`, `install.ps1`,
+  `scripts/lab.sh` and three documentation pages went on telling every new
+  user to open `http://localhost:8000/docs` while the app mounts `/api/docs`.
+  `test_readme_api_docs_url.py` now walks the tool output as well as the
+  README.
+
+- **`make doctor` reported a port held by a foreign process as held by us.**
+  The check was `docker compose ps -q <service>`, which lists containers in
+  any state — so a Postgres that exited *because* the port was taken still
+  counted, and the doctor printed "port 5432 in use by aisoc postgres" while
+  an unrelated process had it. The two remedies are opposites. It now asks
+  which host port our own container actually publishes, names the container or
+  process that holds the port otherwise, and reports a service already
+  remapped to a different port as fine rather than as a conflict.
+
+- **`make up` hit port conflicts with no explanation.** `docker compose up`
+  reports `port is already allocated` against whichever container lost the
+  race, after a minute of unrelated output and without naming what holds it.
+  `make up` now runs the port check first (`doctor.sh --ports-only`) and stops
+  before starting anything.
+
+- **The compose security note recommended a remedy that does nothing.** Both
+  compose files told operators to change a host binding with a
+  `docker-compose.override.yml`. Compose *appends* sequences when it merges,
+  so an override without `!override` publishes the new binding alongside the
+  old one and leaves the conflict in place. Both notes now show the tag, and
+  `ports: !reset []` for removing a publishing entirely.
+
+- **AI triage could not reach a model in the default deployment, and it was
+  not a missing key.** `docker-compose.yml` set `LLM_GATEWAY_URL` on the `api`
+  and `agents` services. Nothing read it. Both resolvers honoured only
+  `OPENAI_BASE_URL`, which compose never set, and each carried a comment
+  explaining that the refusal was deliberate — routing through the gateway
+  should be an explicit choice so it is never ambiguous whether the bearer is
+  the gateway master key or a provider key. The reasoning was sound and the
+  result was that every `aisoc-<role>` alias went to `api.openai.com`, which
+  cannot resolve one, and the caller's `except` rendered that as "no LLM
+  available". `preflight_llm()` logged exactly this condition at boot with the
+  remedy, so the diagnosis existed and the wiring did not.
+
+  `LLM_GATEWAY_URL` is now the lowest-precedence base URL, and the ambiguity is
+  resolved rather than avoided. **The model decides the route:** the gateway is
+  adopted only for a gateway alias, which resolves nowhere else, while a
+  concrete `AISOC_MODEL_PIN_<ROLE>` — the documented direct-to-provider escape
+  hatch — is left pointing at its provider. **The route decides the bearer:**
+  when AiSOC picks the gateway itself it sends `LITELLM_MASTER_KEY`, which
+  compose now supplies to both services, and never a provider key. An explicit
+  `OPENAI_BASE_URL` still outranks both. The rule lives once, in
+  `services/agents/app/llm/routing.py`, shared with the BYOK resolver and
+  mirrored in `services/api/app/services/model_aliases.py` for the service that
+  cannot import it.
+
+  Consumers audited and fixed alongside it: the API copilot and the NL-query
+  translator (both already went through the shared helpers); the agents
+  **contextual copilot**, which built `ChatOpenAI(model=…)` with no base URL at
+  all and reported "LLM not configured" from a key check that could not see the
+  gateway's; the **detection builder** (`/nl-detection`), the only consumer that
+  could not be pointed anywhere — it POSTed to a hardcoded
+  `https://api.openai.com/v1/chat/completions` with `OPENAI_MODEL`; the four API
+  endpoints (translation, hunts, knowledge base, phishing) that read
+  `LLM_BASE_URL` and defaulted to OpenAI without consulting `OPENAI_BASE_URL`;
+  the BYOK / "explain this alert" resolvers in both services, which defaulted
+  straight to `https://api.openai.com` and took an alias there; and
+  `GET /llm/status`, so the indicator describes the route the explain path
+  actually takes. The **MITRE RAG embedding** path is a deliberate exclusion —
+  `infra/litellm/config.yaml` declares chat aliases only, so an embedding call
+  routed there would 400 on every batch. It has its own
+  `AISOC_EMBEDDING_BASE_URL` / `AISOC_EMBEDDING_MODEL` pair and the gate checks
+  the exclusion in both directions.
+
+- **The LLM gateway moves from the `full` profile into CORE, so the documented
+  default install can actually do AI triage.** It was `full`-profile on the
+  reasoning that the gateway is "only needed when a provider key is
+  configured" — which skipped a step: every task role resolves to an
+  `aisoc-<role>` alias, and an alias resolves at the gateway and nowhere else,
+  so a CORE deployment could not use a key either. `make up`, the quickstart's
+  Path B, and a plain `docker compose up -d` all now start it.
+
+  With no provider key it boots, serves its seven aliases and answers
+  `/health/liveliness` (verified against the bundled config with both provider
+  keys empty); AiSOC makes no LLM call and the deterministic path is
+  unchanged. CORE goes from 10 to 11 services and ~6 GB to ~6.5 GB — the image
+  is 1.67 GB and idles at 451 MiB, measured, so "one lightweight container"
+  was not true and the README's numbers moved rather than staying put. The
+  gateway is also the only party that can report what a call cost, so CORE's
+  cost figures were previously unmeasurable by construction. Reasoning and the
+  two rejected alternatives: `docs/decisions/0006-llm-gateway-in-core.md`.
+  While correcting that table, the `full` row's service count was checked and
+  was wrong: `make up-full` starts **21** services, not 30 (30 is `full` plus
+  the `monitoring`, `chatops`, `extras` and `osquery` profiles).
+
+- **`OPENAI_MODEL` replaced the triage role's model on the highest-volume path
+  in the product.** `.env.example` shipped `OPENAI_MODEL=gpt-4-turbo-preview`,
+  a model no gateway config in this tree has ever defined. The auto-triage
+  worker layers a tenant's BYOK configuration over the role pin — but the
+  resolver's `LlmConfig` collapsed provenance into a single `source` word, so
+  the worker could not tell a per-tenant override from the process-wide env
+  baseline and bound all three fields unconditionally. Once traffic reached the
+  gateway that would have produced `Invalid model name` on every triage call:
+  the failure the commercial deployment already hit, where the copilot and every
+  triage agent degraded to empty output.
+
+  `LlmConfig` now carries `model_from_tenant` / `base_url_from_tenant` /
+  `api_key_from_tenant`, computed from state the resolvers already tracked, and
+  only a field the tenant actually set is treated as an override. A real BYOK
+  model still wins. `.env.example` ships `OPENAI_MODEL=aisoc-summary` — an alias
+  the bundled gateway defines — and the variable is documented as the BYOK /
+  explain path only, never a task role.
+
+- **A model with nowhere to go is now an error instead of a fallback.**
+  `make_chat_model` and `chat_completions_url` raise `UnroutableModelError`,
+  naming the alias and the remedy, when a gateway alias is requested with no
+  gateway configured — rather than building a client destined to 404 and
+  letting a caller read that as "the LLM is unavailable". `run_auto_triage`
+  constructs its model inside its own `try` so the failure arrives as
+  `AutoTriageError` like every other LLM failure; `auto_triage_node` catches
+  that specifically, so constructing outside it would have failed a whole graph
+  run over a configuration problem the deterministic path handles. The
+  deterministic floor is unchanged and still reports `call_count=0 models=[]
+  total_tokens=0` with no `recommended_actions`. `preflight_llm()` now reports
+  both directions at boot: an alias with no gateway, and a concrete model
+  pointed at the bundled gateway.
+
+- **The natural-language playbook drafter could never reach an LLM.**
+  `nl_drafter._llm_factory` called `make_chat_model()`, and `role` is a required
+  positional parameter; every other caller in the tree passes one. The
+  `TypeError` was caught by the `except Exception` two lines down, which logged
+  "no chat model available" and returned `None`, so the drafter fell back to its
+  deterministic substrate path on every call, permanently, while reporting the
+  condition as a missing provider. Every test monkeypatches `_llm_factory`, so
+  the one line that mattered was the one line nothing exercised. Now passes
+  `"nl"`, the declared role in `app.llm.model_pins`.
+
+- **UEBA could never write a baseline or an anomaly, and said it was
+  healthy the whole time.** Three separate defects on one code path, each
+  reached by the first scoreable event rather than by some rare branch:
+
+  - `EntityBaseline.peer_group_id` was declared by the model and created by
+    no migration. SQLAlchemy names every mapped column in its `SELECT`, so
+    the first database call `score_event` makes raised
+    `UndefinedColumnError`.
+  - `ueba_peer_groups.id` was created `UUID DEFAULT gen_random_uuid()` and
+    declared `String(64)`, while `PeerGroupService` writes group names like
+    `dept:engineering` into it — `InvalidTextRepresentation` on insert. The
+    column follows the model, because the model matches the data.
+  - `ueba_anomalies.event_type` was 64 characters wide against a model
+    declaring 128, so an event type between the two lengths passed every
+    test and failed at insert time.
+
+  Fixed in `services/ueba/alembic/versions/0004_baseline_peer_group_and_column_parity.py`.
+
+- **And with the schema right, the baseline still could not accumulate.**
+  `_welford_update` edited the per-feature dictionary in place. Its caller
+  passes a *shallow* copy of `EntityBaseline.feature_stats`, so the object
+  being edited was the one SQLAlchemy had loaded from the column; by the
+  time the caller assigned the result back, old and new compared equal and
+  SQLAlchemy left the column out of the `UPDATE` — a `JSON`/`JSONB` column
+  has no change tracking unless wrapped in `MutableDict`. Measured on a
+  live stack: 36 events for one entity, every one processed without error,
+  and the stored baseline frozen at `count: 1` while `window_end` advanced
+  on every one. No entity could reach `min_baseline_samples` (30), so
+  `compute_z_score` returned `None` forever and no anomaly was ever scored.
+  The service logged `features_unscoreable` 36 times, which reads as "too
+  quiet to score" rather than as a bug. The updater now returns new
+  dictionaries and mutates nothing.
+
+- **A UEBA handler exception killed the subscription silently.** The
+  consume loop had no `except` at all: the first event that raised left the
+  `async for`, the `finally` stopped the consumer, and the exception went
+  into a task held in a module global — so it was never
+  garbage-collected, asyncio never emitted "Task exception was never
+  retrieved", and nothing was logged. The container stayed `running` with
+  restarts 0 and `/health` answered a hardcoded 200, permanently.
+
+  The policy is now the one `services/fusion` and `services/agents` already
+  follow: **log loudly, dead-letter, and keep the subscription.** A single
+  unprocessable event must not stop the stream. Refused events go to
+  `aisoc_dead_letters` — the table fusion already writes and
+  `GET /api/v1/health/dead-letters` already reads, with its per-reason
+  breakdown — rather than to a second dead-letter path nobody would know to
+  check.
+
+- **`/readyz` reported that a consumer task had been *created*, not that it
+  was running.** Three services created theirs as a fire-and-forget
+  `asyncio.create_task` and called `mark_ready()` on the next line
+  (`ueba`, `fusion`, `agents`). `app/_health.py` gains
+  `register_subscription(app, name, probe)`; `/readyz` evaluates every
+  registered probe per request and answers 503 naming the detached ones.
+  `/livez` deliberately still does not consult them — wiring a detached
+  consumer into liveness makes an orchestrator restart a pod over a fault a
+  restart cannot fix. Each of the three also gained a done-callback that
+  retrieves and logs its task's outcome, and UEBA's `/health` now carries
+  `attached`, the processed / failed / dead-lettered counters and the last
+  error instead of a hardcoded `{"status": "ok"}`.
+
+- **The same audit across every other consumer.** `services/fusion`'s
+  `_consume_loop` guarded `_process_message` but left
+  `lake.flush_if_stale()` outside the guard, so a ClickHouse outage raising
+  there would have ended the loop with the archive fault reported as
+  nothing; it is now guarded and the alert path survives it.
+  `services/agents`' `_process_with_retry` was already total, and the loop
+  now guards it anyway rather than depending on a callee staying that way.
+  `services/realtime` logged "Kafka consumer failed to start (will retry)"
+  and never retried — kafkajs reports a dead consumer through its `CRASH`
+  event, not by rejecting the promise, so a consumer that died after a
+  successful start stayed recorded as attached for the life of the process.
+  Both of its consumers now run under a supervisor with bounded backoff,
+  and `/health` answers 503 listing any detached topic instead of a
+  hardcoded `status: 'healthy'`.
+
+- **A consumer that retried a permanent failure in silence, forever.** The
+  `graph_ws` broadcaster in `services/ingest` could not die the way the UEBA
+  consumer did — its loop `continue`s past an error — but it answered every
+  error the same way: a flat 50ms sleep with the error discarded. Against a
+  broker that was never coming back that is twenty reconnect attempts a
+  second behind a container reporting `running`, restarts 0 and `/health`
+  200, with no line in any log and no counter anywhere. Not a silent death;
+  a permanent failure wearing the costume of a transient one.
+  Most of those errors never reached the loop at all. `kafka.NewReader`
+  falls back to a **silent logger** when `ErrorLogger` is nil, and with a
+  `GroupID` set the consumer group's dial, join and rebalance failures are
+  reported *only* through it — `ReadMessage` stays blocked — so the single
+  most likely permanent fault, an unreachable or misnamed broker, was
+  discarded inside the library. `ErrorLogger` is now wired.
+  Errors are classified into what the loop can do about them: **transient**
+  (retry, with exponential backoff capped at 30s instead of a flat 50ms),
+  **permanent** (the loop stops, because a loop over a fault no retry can
+  clear turns a misconfiguration into indefinite churn — the same reasoning
+  the UEBA consumer records), and **poison** (one undecodable envelope,
+  counted and skipped without backing off a healthy subscription). A fourth
+  state is a duration rather than a class: a `no such host` can be a startup
+  race for a few seconds and a variable nobody set for ever, so it is
+  reported as transient and then, after two minutes, as *not resolving* —
+  the point at which the operator's next move stops being "wait".
+  Permanence is decided by an enumerated set of protocol codes, not by
+  negating `kafka.Error.Temporary()`: `REBALANCE_IN_PROGRESS` is
+  non-retriable in the protocol's sense and happens on every deploy, so
+  deriving the set that way would have stopped the consumer on a routine
+  rebalance. A test walks the entire error table in both directions.
+
+- **Readiness that reported on the process and not on the subscription.**
+  Ingest's `/readyz` now names every registered background subscription and
+  its state, in the healthy case too, so a 200 says what was checked rather
+  than only that nothing was wrong. The verdict stays keyed on the publish
+  path deliberately: unlike the Python services, consuming is not ingest's
+  job, and failing readiness for an opt-in WebSocket fan-out would pull the
+  pipeline's front door out of the load balancer to fix a broadcast. The
+  surface that depends on the subscription reports on it directly —
+  `/v1/graph_ws/stream` answers 503 with the reason instead of completing a
+  handshake onto a socket that will stay silent — and
+  `aisoc_graph_ws_source_attached` / `_errors_total` / `_not_resolving` are
+  the alertable signals.
+
+- **Two scheduler loops that logged that a tick failed and never what.**
+  `retention_purge` and `hunt_scheduler` logged `err=%s` with
+  `type(exc).__name__` and nothing else: `err=ProgrammingError` every thirty
+  seconds says a tick failed, never why, and never whether waiting is the
+  right response. Both now report the sanitised message and escalate from
+  `warning` to `error` once the run of failures has outlived a transient
+  explanation.
+
+- **Nothing invoked the four alembic chains.** `honeytokens`,
+  `osquery-tls`, `purple-team` and `ueba` own their schemas through
+  alembic; every container command was a plain `uvicorn`, so the documented
+  quickstart booted them with empty schemas and none of their
+  row-level-security policies. Each image now runs `python -m app._migrate`
+  before its server: it applies the chain as the owner credential, takes a
+  shared transaction-scoped advisory lock so four chains starting at once
+  queue instead of deadlocking, reads the applied revision back, and
+  refuses to start the server unless it matches head. An exit code is not
+  evidence — `alembic upgrade head` exits 0 when it applies nothing, which
+  is exactly what happened when the chains shared one version table. All
+  four also gained a compose healthcheck; they had none, which is why a
+  container that had done nothing still read as `running`.
+
+- **Two alembic chains could never run.** `services/honeytokens/alembic/` and
+  `services/purple-team/alembic/` each contained an empty `__init__.py`, which
+  shadows the installed `alembic` package whenever the working directory is on
+  `sys.path` — so `alembic upgrade head` failed with
+  `No module named 'alembic.config'` from inside the service directory, and
+  `env.py`'s own `from alembic import context` would have failed the same way.
+  Removed, matching `services/ueba/alembic/`, which never had one. All four
+  service chains are now verified upgrade → downgrade → upgrade against a live
+  Postgres.
+
+- **`docker compose down && docker compose up` could not bring Kafka back.**
+  `kafka_data` is a named volume and ZooKeeper had none, so the second `up`
+  on kept data generated a fresh cluster id and the broker refused it with
+  `InconsistentClusterIdException`. `make down && make up` — documented as
+  "stop the stack, keep the data" — therefore left every Kafka-dependent
+  service in `created`, and only `make clean`, which deletes the data,
+  recovered. ZooKeeper now persists `/var/lib/zookeeper/data` and `/log`.
+
+- **`osquery-tls` published a container port nothing listened on.** Compose
+  mapped `127.0.0.1:8091:8007` while the service runs uvicorn on 9001. With
+  no healthcheck either, the container read as `running` against a closed
+  socket. Found by adding the healthcheck and watching it never leave
+  `starting`.
+
+- **`docker-compose.override.yml` was committed.** Its own header reads
+  "untracked, never committed": it is a QA port remap that moved PostgreSQL
+  to 55432 and ClickHouse to 58123/59000, contradicting every port the
+  documentation quotes. Removed.
+
+- **The connector catalog proxy never authenticated, and served a stale list
+  on every request because of it.** `_fetch_catalog()` issued a bare
+  `client.get(url)` with no `Authorization` header at a connectors service
+  that is default-deny on every route, so it was answered `401` on every
+  single call and fell through to the catalog bundled in the API image *every
+  time*. The bundle had **26 entries against a live registry of 84**. Nothing
+  failed: the wizard rendered a confidently wrong list, and because
+  `connector_type` is validated against that same list, the 58 connectors it
+  had never heard of were rejected as "unknown connector_type".
+
+  The proxy now presents the service credential and the tenant it is acting
+  for, mirroring the fusion gateway. Every call site passes the tenant
+  explicitly — it is a required parameter, not a defaulted one, because a
+  defaulted parameter is one call sites forget.
+
+  The fallback is kept, and given a stated job: **keep the console usable when
+  the connectors service is not deployed or not answering.** For that to be
+  defensible it has to be distinguishable from the real thing, so
+  `/connectors/catalog` now returns `source` (`live` / `bundled`), `degraded`
+  and `reason`. A deployment with no connectors service is `bundled` but not
+  degraded — there the bundle *is* the source of truth, and flagging it would
+  train operators to ignore the flag.
+
+  While degraded, an unrecognised `connector_type` returns **503 rather than
+  422**: a connectors service rolled ahead of the API image legitimately knows
+  types that image does not, and "unknown connector_type" sends an operator to
+  debug a connector that is fine.
+
+- **The bundled catalog is generated, not refreshed by hand.**
+  `scripts/generate_connector_catalog_fallback.py` builds it from the
+  connector registry and `--check` fails the build on drift, so the artefact
+  cannot fall behind the registry it copies. The gate compares **three**
+  independent readings of connector identity, in both directions: what
+  `_CONNECTOR_CLASSES` declares (read through the AST by
+  `generate_connector_types.parse_registry`, so there is one definition of
+  "the registry" rather than two), what reaches `CONNECTOR_REGISTRY` at
+  runtime, and what each `cls.schema()` **advertises**.
+
+  The third is the reading nothing looked at. `list_connector_schemas()`
+  iterates the registry but takes each entry's `connector_id` from the schema,
+  so a class registered as `tenable_io` whose `schema()` said `tenable` would
+  be offered in the wizard under a name `get_connector_class()` cannot
+  resolve — 84 independent opportunities for two declarations to disagree.
+  Identity is read off the class, never the filename: `jira_connector.py`
+  declares `jira` and `tenable.py` declares `tenable_io`, and `--self-test`
+  asserts that property rather than trusting a comment. The self-test runs
+  before the gate in CI and injects nine defects — a dropped connector, a
+  renamed one, a class that never registers, a deleted artefact, an unhooked
+  consumer, an empty corpus — requiring each to be caught.
+
+- **An event ingested under a connector type with no profile became an alert
+  with no host, no user and no source IP.** `_canonicalAliases` in
+  `services/ingest/internal/normalizer/normalizer.go` already resolved
+  `actor.user.name`, `device.name` and `src_endpoint.ip` from the spellings
+  connectors actually use, but the pass that applied it was gated behind the
+  canonical-envelope branch. Anything reaching the generic fallback — every
+  push through `/v1/ingest/batch`, which sends a flat payload and so never
+  matches that branch — resolved `title` and `external_id` and nothing else.
+
+  Identity is what the rest of the platform is built on: entity extraction,
+  the Investigation Rail's pivots, the `{tenant}:{entity}:{tactic}`
+  correlation key, the entity graph and UEBA all key off those three fields.
+  An alert still appeared, which is what made it look like it had worked, but
+  it carried no entity chips and correlated into the `unknown` bucket. The
+  alias pass now runs for every profile and fills only destinations the field
+  map left empty, so a vendor profile's own mapping still wins.
+
+  Three defects in the same family, found while fixing it:
+
+  - **A nested vendor object was written whole into a scalar identity slot.**
+    Fourteen of the 84 registered connectors emit `actor`, and four emit it as
+    the vendor's object rather than a name, so `actor.user.name` became a map
+    — an entity that renders as a map and correlates as garbage. Identity
+    resolution now takes strings only and digs one level (`actor.name`,
+    `actor.displayName`, `user.name`) for the scalar underneath.
+  - **A vendor profile's severity ladder is spelled the way its vendor spells
+    it.** `crowdstrike_falcon`'s is capitalised, and a pushed payload is
+    whatever the caller wrote, so a lowercase `high` scored 0 and rendered as
+    Unknown. The shared five-tier ladder is consulted when the profile's own
+    has no entry for the value; `critical` stays its own tier.
+  - **A vendor profile left `message` empty for a pushed payload**, because it
+    maps its vendor's field name, so the promoter generated
+    "Security Finding from <product>" over the title the caller actually sent.
+
+- **`connector_type` values the product advertises did not reach their
+  profile.** The connectors service declares `crowdstrike` and `okta`; the
+  ingest profiles were keyed `crowdstrike_falcon` and `okta_system_log`. The
+  README's own push example used `crowdstrike`, so the example a new user
+  copies missed the lookup, fell to the generic fallback and lost its vendor
+  attribution — 80 of the 84 declared connectors had no profile entry under
+  the name they are registered with.
+
+  A `connectorTypeAliases` map resolves both spellings rather than renaming
+  either. The longer names are load-bearing elsewhere — `packages/types`'
+  `ConnectorType` union, the CLI's default, the graph extractor, the actions
+  credential resolver — so renaming one side would have broken the other.
+
+- **Two registered connectors reached no normalization path at all.**
+  `auditd` emitted `source` without `raw_event`, so it failed the canonical
+  envelope check and lost the host it carries; it now emits both.
+  `email_inbox` returns the message envelope shaped for
+  `email-forwarded.yaml`, so it matched neither branch and strict mode
+  rejected it outright; it now has a profile mirroring that template, the way
+  `ai_runtime` mirrors `ai-runtime.yaml`.
+
+- **The connector-type ratchet is at zero: ten `ConnectorType` union members
+  named nothing the normalizer could resolve.** They were the console's older
+  vocabulary, a third name space beside the ids `services/connectors` declares
+  and the keys `connectorProfiles` uses, and they were recorded rather than
+  fixed because the file was shared with console work in flight.
+
+  Six denote a source the platform really does ingest, under a longer name,
+  and now fold onto the declared id through a new `connectorTypeCanonical` map
+  applied once at the top of `Normalize` — so the profile lookup, the alias
+  map, `canonicalClassByConnector` and the product identity on the canonical
+  path all agree on one name. The connectors' own `connector_name` values are
+  what make the fold safe rather than a guess: `qradar` *is* "IBM QRadar",
+  `chronicle` *is* "Google Chronicle", `syslog_cef` *is* "Syslog / CEF".
+
+  - `ibm_qradar` → `qradar`. `services/fusion/alert_sink.py` and
+    `services/actions/executors/siem.py` already aliased exactly this pair.
+  - `google_chronicle` → `chronicle`
+  - `palo_alto_cortex` → `cortex_xdr` (whose description reads "Palo Alto
+    Cortex XDR incidents via the public REST API"; XSIAM is a distinct later
+    product and stays reachable under `cortex_xsiam`)
+  - `slack` → `slack_audit`, the only Slack data the platform ingests
+  - `syslog` → `syslog_cef`
+
+  Four denote nothing the platform ingests and are removed from the union:
+  `vectra_ai` (no Vectra connector exists), `teams` (a ChatOps destination,
+  not a source) and `custom_webhook` / `http_pull` / `kafka` (transports — the
+  webhook path is the tenant inbox, which keys off a template id and never
+  sets `connector_type`). Nothing in the tree referenced any of them;
+  `ConnectorType` has no consumer outside its own file.
+
+  What this cost while it stood: an event tagged `ibm_qradar` reached no
+  profile and no connector, so strict mode rejected it outright and lenient
+  mode minted `OcsfProduct{Name: "ibm_qradar"}` — a second, parallel alert
+  source for the same QRadar deployment `qradar` already fed. The new Go tests
+  assert the two spellings produce one event (same product, class, category
+  and severity, with `critical` staying the fifth tier and category 2 so
+  `should_promote()` has no severity floor to clear), and that the fold cannot
+  be used to smuggle an unknown type past strict mode. A third test reads the
+  connector ids out of `services/connectors/app/connectors/` rather than
+  hardcoding them, and fails on an empty read instead of passing.
+
+- **The dashboard published two numbers that contradicted the database, and a
+  third surface that contradicted both.** A live acceptance pass measured a
+  tenant with two cases closed in the last seven days at a 90-minute mean.
+  `/mssp/portfolio` reported that correctly as 1.5h. The dashboard reported
+  **CASES CLOSED (7D) 0** and **MTTR 0.0 hrs**, directly above its own
+  "CASES OPENED (7D) 2".
+
+  The portfolio was right and the dashboard was wrong, for two separate
+  reasons that each read plausibly in isolation:
+
+  - `cases_closed_7d` filtered `status = 'resolved' AND updated_at >= …`.
+    `resolved` is an *intermediate* state — the lifecycle's terminal one is
+    `closed`, and it is that transition which writes `closed_at` — so a case
+    that completed its lifecycle was invisible to the count. `updated_at` was
+    also the wrong clock: it moves whenever anyone edits the case, so an old
+    case gets a comment and re-enters the window while a closed one
+    eventually leaves it.
+  - `mttr_hours` averaged `alerts.resolved_at - alerts.created_at`, a
+    different lifecycle on a different table from the one the portfolio
+    measures. Nothing in ordinary case work writes that column, so the
+    average was over zero rows and `float(None or 0.0)` published the empty
+    result as a confident `0.0`.
+
+  Both now come from `app/services/resolution_time.py`, which owns the window
+  and the SQL expression that *both* surfaces use, so the two cannot quote
+  different MTTRs for one tenant again. The portfolio keeps computing its
+  figure inside one bound cross-tenant statement — one round trip for the
+  whole portfolio — and interpolates the shared fragments rather than calling
+  the shared function; a test asserts it still does, and the load-bearing
+  assertion is that the two surfaces produce the *same* number from the same
+  rows rather than that each matches a hardcoded 90.0.
+
+  The third surface was the `MTTR` tile in the Security Operations Center
+  strip, reading `alerts.mttr` off `/metrics/dashboard` — the same dead column,
+  and rendered with an `m` suffix although the field is hours, so a real
+  1.5-hour MTTR would have displayed as "1.5m" had it ever been non-zero.
+
+  Rather than make the three means nullable — a breaking response change for
+  every existing client — each now travels with the number of rows it was
+  averaged over (`mttd_sample_count`, `mttr_sample_count`,
+  `mttc_sample_count`, and `alerts.mttr_sample_count`). A mean over zero rows
+  is unmeasured, not zero, and the tiles say "not measured" instead of
+  claiming an unbeatable response time for a tenant that has resolved nothing.
+  The fields are additive: a client that ignores them sees what it saw before.
+
+- **The alerts list was empty on every deployment, under a row count that was
+  real.** `AlertListResponse` returns the rows under `items`; the web client
+  read `raw.alerts`, which is never present, so `Array.isArray(undefined)` was
+  false and each page resolved to `[]` while `total` carried the true figure.
+  The queue therefore rendered "1,247 alerts" above an empty table with no
+  error to explain it, and an operator's most reasonable reading of that screen
+  was that their estate was quiet. The client now reads `items`, still accepts
+  the legacy `alerts` key the responder routes emit, and a test asserts the two
+  halves of the contract against each other so they cannot drift apart again.
+
+- **The entity-risk queue sent a tenant slug where a UUID was required, then
+  blamed a healthy service for the rejection.** `apps/web/next.config.js`
+  inlined `NEXT_PUBLIC_TENANT_ID` with a fallback of the literal string
+  `'default'`. Three tenant-scoped surfaces pass that value as a query
+  parameter to routes typed `tenant_id: UUID` — `/fusion/entity-risk/*`,
+  `/honeytokens/*` and `/business-context/*` — and all three answered 422.
+
+  Two things kept it hidden. `lib/api.ts` carries the correct canonical UUID
+  as its own fallback, so reading it suggested the console was already doing
+  the right thing; Next's inlining runs first, which made that fallback
+  unreachable code. And the slug is not a dependable handle either: migration
+  001 seeds tenant `…0001` with slug `default` and the demo seed renames that
+  slug to `demo`, so on a seeded install the literal matched neither the id
+  nor the slug. The entity-risk client also read the build-time constant
+  rather than `getActiveTenantId()`, so the queue ignored both the logged-in
+  user and the tenant switcher; it now resolves the tenant the same way
+  `request()` resolves the `X-Tenant-Id` header.
+
+  `components/fim/FimDashboard.tsx` is deliberately pinned to `'default'`
+  instead: `services/osquery-tls` types its tenant as a plain string and
+  enrols nodes under that literal, so this one surface is keyed on that
+  service's own convention and reading the shared UUID here would match no
+  enrolled node. The two tenancy models still need reconciling in
+  osquery-tls.
+
+  With the request failing, the queue rendered five invented entities —
+  `jsmith@acme.corp`, `updates.evil-cdn.xyz`, "last seen 5 months ago" on a
+  stack that had been up for an hour. Above them, and *outside* the amber
+  banner that disclosed them, four cards read "Contributing alerts 26" and
+  "Alert → Incident 13.0:1" off the same sample payload. A disclosure that
+  covers the rows and not the headline numbers is decorative, so the banner
+  moved above the cards and every card now reads "not measured" when its
+  request fails; the derived alert-to-incident ratio is withheld whenever the
+  counts it divides are unknown.
+
+  The banner also named the wrong subsystem. It said "Fusion service
+  unreachable" while fusion was healthy and the actual failure was a 422 —
+  a diagnosis that sends an operator to debug something that is not broken,
+  which is worse than none. It is now derived from the response status: a 422
+  reads as a console bug rather than an outage, a 5xx names fusion because
+  that is when fusion is genuinely at fault, status 0 reads as unreachable,
+  and an unrecognised failure stays vague rather than guessing. Every variant
+  says the queue is *unknown* rather than empty.
+
+- **`/alerts/[id]` rendered a confidence of 21 as `2100%`, and negative
+  evidence as `+-0.30`.** Confidence reaches the console on two keys at two
+  scales: the API surfaces `confidence` as an integer 0-100, while fusion's
+  `confidence_score` is the raw [0.0, 1.0] float the band was derived from.
+  `normalizeAlert` accepted whichever key appeared first and passed it
+  through unchanged, so `Alert.confidenceScore` meant one thing or the other
+  depending on the payload — and its consumers guessed differently.
+  `AlertDetailView` multiplied by 100; `AttackStory`, on the same page,
+  divided and rendered "21/100". Each was right for one payload shape, and
+  each had a passing test because its own mock used the scale it assumed.
+
+  Normalised once at the boundary to the canonical 0-100 integer, deciding the
+  scale from the *key* rather than the magnitude: a genuine confidence of 1 is
+  indistinguishable from a raw score of 1.0 by value alone, so the tempting
+  `v <= 1 ? v * 100 : v` would render the least-confident alert in the estate
+  as the most confident. The two mocks that encoded the old scale were
+  corrected with it, since sample data on a different scale than the real
+  payload is what hid the bug.
+
+  The rationale rows hardcoded a `+` prefix on a signed contribution, so a
+  factor that argued *against* the verdict read `+-0.30`; they now carry one
+  sign, matching the glyphs the narrative builder uses. Those rows also
+  clamped `contribution / weight` into [0, 1], which rendered every negative
+  factor at zero width — an invisible bar beside a nonsense label. Width now
+  follows the magnitude and colour follows the sign.
+
+- **Every entity chip in the Investigation Rail was a 404.**
+  `alert_rail.py` built its pivots as `/attack-graph?entity=…` and there has
+  never been an `attack-graph` route, so host, user, asset, IP and domain chips
+  all failed before the query parameter mattered. The rail's own docstring
+  described the working behaviour ("the same `?entity=` query the
+  AttackGraphView already parses"), and `pivot.ts` states as fact that the rail
+  emits `/graph?entity=…`; the code agreed with neither. Pivots now target
+  `/graph`, which reads the parameter and selects the node.
+
+  The existing test pinned all six strings under a docstring claiming the pin
+  "prevents an accidental rename". It cannot — it compares the producer against
+  a copy of itself, which is how a route that never existed stayed asserted.
+  `services/api/tests/test_pivot_routes_resolve.py` derives the route table
+  from `apps/web/src/app` and checks it against what `build_related_entities`
+  actually returns, so the comparison now runs in the direction that drifts.
+
+  The same test caught a second defect in the producer: values went into the
+  URL unencoded, so an asset named `Finance & Legal #2` pivoted to
+  `Finance & Legal` and looked like it had worked. Values are now encoded the
+  way `pivot.ts` encodes them.
+
+- **The Investigation Rail's Details tab showed analysts the markup.**
+  `build_narrative` documents its output as markdown-light — `**bold**`,
+  backtick code spans, `- ` bullets, blank-line paragraphs — and the rail put
+  the string in a `whitespace-pre-wrap` paragraph, which preserves the
+  newlines and the asterisks alike. The panel read `**Medium** alert: … on
+  **Finance & Legal #2**`.
+
+  `components/alerts/NarrativeMarkdown.tsx` renders exactly that dialect and
+  nothing more; an unrecognised construct falls through as literal text rather
+  than being dropped. It builds React elements, never markup: the narrative
+  embeds the alert title and entity names, which originate in connector
+  payloads, so an HTML path here would make anyone who can name a host an XSS
+  author. It introduces no heading, leaving the page's heading order intact.
+
+- **Six funnel metrics were published as zero whatever the database held.**
+  `_funnel_window` merges `_triage_quality`'s output into the dict it returns,
+  but the `FunnelMetrics(...)` call never named `triaged_alerts`,
+  `abstentions`, `abstention_rate`, `ungrounded_demotions`,
+  `mean_groundedness` or `scored_verdicts`, so all six fell back to their
+  field defaults on every response. A published zero is a stronger claim than
+  silence: it reads as "this tenant never abstained, and nothing was ever
+  demoted for being ungrounded". The existing test asserted the six names were
+  present in `model_fields`, which they were — declaring a field and forwarding
+  it are different things. The replacement drives the endpoint and fails for
+  any field the window computes and the response drops, including ones added
+  later.
+
+- **`false_positive_rate` and `escalation_rate` published `0.0` on an empty
+  denominator.** `x / n if n > 0 else 0.0` renders an undefined ratio as a
+  measured zero, and for these two the zero is flattering: "0% false
+  positives" and "0% escalated" are the two best numbers on the SOC metrics
+  page, and a tenant that had resolved nothing and gated nothing scored both.
+  This is the same defect as the MTTD/MTTR/MTTC means that shipped a NULL
+  average as a confident `0.0`, one step removed, and it takes the same fix:
+  `/metrics/soc` now reports `false_positive_rate_sample_count` and
+  `escalation_rate_sample_count` alongside the rates, and the console renders
+  "not measured · no resolved alerts in 7d" rather than a percentage. The
+  fields are additive and optional, so a console running against an older API
+  keeps its previous behaviour rather than blanking the tiles — a paired test
+  holds that direction too, because "blank everything" would be a worse
+  regression than the bug.
+
+- **The connector fleet badge claimed every source was reporting when none
+  was.** `ConnectorFleetPanel` rendered the badge whenever the endpoint
+  answered, and with zero connectors `failed + degraded` is zero — so a green
+  "All sources reporting" sat directly above the panel's own "No connectors
+  configured". Zero sources reporting is not the same statement as all of
+  them reporting, and the green is the part an operator scans for. There is
+  now no badge until there is a fleet, and when there is one it names the
+  count it is vouching for.
+
+- **Two dashboards published fabricated security data as tenant state.**
+  `DashboardView` and `SOCMetricsDashboard` both wrapped their SWR
+  `fallbackData` in `demoFallback()`, which is `undefined` outside the hosted
+  demo — and both then defeated that gate a few lines later with an
+  unconditional `const resolved = isValid ? data : MOCK`. The mock was
+  therefore exactly what rendered during first paint and after any API error,
+  which for a self-hoster with an empty or unreachable backend is the whole
+  session.
+
+  What that put on screen as the reader's own numbers: a connector inventory
+  they do not run (`CrowdStrike EDR`, 412 events), a MITRE tactic ranking, a
+  24-hour alert-volume curve, MTTD 1.4h / MTTR 6.2h, and an LLM spend line of
+  $76.65 naming three models they had never configured. Three "vs yesterday"
+  trend deltas sat beside the real alert counts as literals — `/metrics/dashboard`
+  publishes no period-over-period comparison, so there was nothing to derive
+  them from.
+
+  Every panel now renders one of three honest states: real figures, an empty
+  state naming what would populate it, or an error state carrying the failure
+  and a retry that re-issues the request. Sample data still populates the
+  hosted demo, which is the only reason it exists.
+
+- **The MSSP console showed six invented tenants and made no API call at all.**
+  `MSSPDashboardView.tsx` declared `const TENANTS = [...]` — "Acme Financial",
+  "GlobalRetail Corp", "MedSecure Health" and three more, with invented alert
+  counts, MTTD/MTTR figures, risk scores, analyst headcounts and ARR — handed
+  it to `useState`, and never fetched anything. Every operator on every
+  deployment saw the same six rows, permanently, with no state in which they
+  would not. The "Export Report" button raised a success toast and did nothing.
+
+  It now reads `GET /api/v1/mssp/portfolio` and
+  `GET /api/v1/mssp/portfolio/alerts` with no sample-data fallback and no SWR
+  `fallbackData` (supplying it disables revalidation, so a placeholder becomes
+  what the view permanently shows). Four states, each saying which it is:
+  loading; a `403` explained as "you do not manage any tenants" rather than an
+  outage; a portfolio failure surfaced with its message and a retry; and an
+  empty portfolio that distinguishes "this organisation manages no tenants"
+  from "you were granted none" using `portfolio_wide` and `scoped_tenants`,
+  because those have different fixes. The alert feed has its own states so a
+  failure there does not claim the portfolio is down. Export now writes a CSV
+  of the rows on screen — a real action rather than a toast.
+
+  **ARR, risk score and analyst allocation are gone, not sourced.** There is no
+  revenue, composite-risk or analyst-allocation data anywhere in this product.
+  A column of nulls would still imply the measurement exists.
+
+- **`/analytics/team` ranked six invented analysts by invented accuracy.**
+  "Sarah Chen, 47 cases closed, 96.2% accuracy, score 945" and five more, plus
+  a highlights feed of things that never happened. Nothing in the platform
+  measures per-analyst performance — no route, no table, no column — so the
+  sample is confined to the hosted demo via `canUseDemoData()` and everyone
+  else is told plainly that the measurement does not exist yet. The aggregate
+  tiles read `—` rather than dividing by zero.
+
+- **`apps/web/src/components/landing/MitreStrip.tsx` is deleted.** Its twelve
+  ATT&CK tactic tiles carried unsourced coverage counts — 27 of 42 for Defense
+  Evasion, 9 of 11 for Initial Access — that correspond to nothing in the
+  tree. The component was imported nowhere and rendered on no route: the
+  landing page composes fifteen sections and this was not one of them, so the
+  caveat in its body copy was the only thing between those numbers and a
+  reader, and it would have stopped being so the moment somebody mounted the
+  section. Improving the disclaimer would have left the numbers in place for
+  the next person to inherit. Its entry in `ALLOWED_ILLUSTRATIVE` goes with
+  it; `scripts/check_mock_data_gated.py` checks that allow-list in both
+  directions, so a stale exemption fails the build rather than accumulating as
+  cover. The one MITRE figure the project does publish — 97.0% in
+  `BenchmarkBand` — is labelled "substrate" and is unchanged.
+
+- **The welcome banner quoted counts it had no source for and linked to a case
+  most deployments do not have.** It advertised "26 vendors" against a registry
+  of 84 and "25 named runbooks" with nothing holding either to the tree. The
+  connector figure now comes from `CONNECTOR_COUNT`, which is generated from
+  the connector registry and held to it by `scripts/generate_connector_count.py
+  --check`; the playbook figure is gone rather than guessed, because no
+  equivalent source exists. Its second call to action linked to
+  `/cases/INC-RT-001`, which exists only after the demo seed has run, so on
+  every other deployment the banner's own CTA was a dead link — that tip is now
+  gated on demo mode, takes its href from `demoDeeplink()` and says on its face
+  that it is sample data.
+
+- **The Live Feed labelled an empty panel "Demo".** The seeded events were
+  gated behind `canUseDemoData()` in an earlier pass but `statusToLabel` was
+  not, so outside the hosted demo the panel rendered nothing at all under a
+  "Demo" pill whose tooltip read "showing demo data" — asserting the presence
+  of sample data that had just been correctly withheld. The pill now describes
+  what is on screen (`Live`, `Connected`, `Connecting…`, `Reconnecting…`,
+  `Offline`) and can only say `Demo` when seeded events are actually rendered,
+  and the idle panel carries an empty state naming what would fill it.
+
+- **The fabricated-data gate could not see either of the two worst cases.**
+  `scripts/check_mock_data_gated.py` recognised only mock data that announces
+  itself: all three of its patterns required a `MOCK_` / `DEMO_` name *and* an
+  assignment through a state setter or SWR `fallbackData`, which models one
+  situation — a view that fetches and substitutes a sample when the fetch
+  fails. A dataset written inline under an ordinary name, in a component with
+  no fetch at all, matched nothing; and with no fetch there was no real path
+  for a fallback to fall back *from*, which is the worse defect, not the
+  lesser one. The gate reported "All sample-data fallbacks are gated behind
+  demo mode" while both fabricated tables shipped.
+
+  A third check looks for what makes fabricated domain data harmful rather
+  than for what an author happened to call it: a module-scope array of records
+  that names an entity a customer would recognise — a company, a person, a
+  host, an IP, an address — *and* attaches numbers to it. Numeric keys that
+  describe how something is drawn are excluded, which is what keeps it quiet:
+  93 module-scope object arrays in the console, 7 matched, and the 4 already
+  behind `demoFallback()` were the mocks. It newly caught
+  `MSSPDashboardView.tsx` and `TeamAnalyticsView.tsx`.
+
+  The reviewed-exception list is checked in **both** directions: an entry that
+  no longer matches anything fails the gate, so an exemption cannot outlive the
+  code it excused and become cover for whatever is written next under that
+  name. One entry, `MitreStrip.tsx` — a public landing-page illustration whose
+  visible copy already tells the reader the tiles are illustrative.
+  `tests/test_mock_data_gate.py` covers both properties, including that filter
+  lists, graph stylesheets, decorative SVG coordinates and pricing copy stay
+  unflagged; a gate that cries wolf on every configuration array gets deleted,
+  which is worse than the gap.
+
+- **`SavedViewsBar` updated its parent while rendering.** The auto-apply of a
+  default saved view ran in the render body and called `onApply`, which for
+  every caller is a setState on the page component. React rejects that outright
+  and makes no promise about processing the update, so the filters an analyst
+  expected restored were not reliably applied. The comment described a ref-flag
+  that did not exist; it was `useState` with no effect anywhere. The chip
+  highlight is now derived rather than stored, and the one genuine side effect
+  — handing the filters to the page — happens in an effect. The existing
+  "exactly once" test could not catch this because its `onApply` was a bare
+  spy that set no state; the new test uses a real parent.
+
+- **A self-hosted install handed its own users links into the maintainers'
+  deployment.** Beyond the CORS and demo-credential entries above, ten shipped
+  defaults resolved to the hosted host when left unconfigured, so an operator
+  who never set an override sent their users somewhere else:
+
+  - `getPublicSiteUrl()` (`apps/web/src/lib/site.ts`) fell back to the hosted
+    origin, which is the `metadataBase` for the whole app — every canonical
+    tag, Open Graph URL, JSON-LD block and sitemap entry on a self-hosted
+    console pointed at another deployment. Now `http://localhost:3000`. The
+    hosted brand was also carried in `DISCOVERY_KEYWORDS`, the root layout's
+    OG/Twitter descriptions, its `sameAs`, and the PWA manifest description.
+  - Published investigation replays built share links from a module constant
+    `https://tryaisoc.com/r`, and tenant invite links had **two** independent
+    hard-coded defaults — one on the endpoint, one on the provisioner — free to
+    drift apart, which is the part that makes this hard to notice. Both now
+    resolve through a single `console_base_url()` reading
+    `CONSOLE_PUBLIC_BASE_URL`, with a documented deployment-neutral fallback.
+  - Approval email defaulted to a `From:` on the hosted domain, which fails
+    SPF/DKIM for anyone else. It now prefers the operator's own
+    `MAILGUN_DOMAIN`.
+  - `plugins/aisoc-direct/plugin.yaml` pre-filled the hosted osquery endpoint
+    as the field default; `services/osquery-tls` declared a hosted
+    `public_hostname` (and had no reader at all — the comment claimed a use it
+    did not have).
+  - The simulation-mode call to action pointed operators at docs on the hosted
+    domain rather than the project's own documentation site.
+  - The GitHub Action's PR comment hotlinked a badge served by the hosted
+    deployment, in the same line that promises "no data leaves your CI"; the
+    report card's coverage footer linked the hosted tool while its sibling
+    already linked the repository.
+  - `playwright.config.ts` defaulted one project to the hosted host and the
+    adjacent project to `localhost` — same env var, two answers.
+
+  Two admin console pages also rendered the hosted hostname as body text, and
+  the demo-mode 403 told every operator "This is the public AiSOC demo at
+  tryaisoc.com" regardless of where it was running.
+
+  A new gate, `scripts/check_hosted_hostname.py`, keeps this from coming back.
+  It is deliberately not "the string must not appear": the hostname stays in
+  99 files that genuinely describe the managed offering — the fly/cloudflare/
+  terraform deploy configs, the marketing pages, the changelog, and two
+  `uuid5` namespace seeds that are compatibility constants rather than URLs.
+  It pins an exact occurrence count per path and fails in **both** directions:
+  a new or grown occurrence, and an exemption that outlived the occurrence that
+  justified it. A stale exemption is a standing permit for a future leak, and a
+  one-directional allow-list never notices one. It resolves its repo root from
+  the working directory rather than its own file location (a sibling gate did
+  the latter and reported a confident OK about a tree it never opened), refuses
+  a tree that fails a sentinel check, treats a zero-match scan as broken rather
+  than clean, and ships a `--self-test` proving the detector separates a
+  known-bad from a known-good sample and that the comparison rejects a vacuous
+  pass. Covered by `tests/test_hosted_hostname_gate.py` (39 cases) and
+  `.github/workflows/hosted-hostname.yml`, which runs on pull requests *and* on
+  pushes to `main` so an edit made at merge time cannot slip past.
+
+- **The capability contract was not consulted on the dispatch path an agent
+  uses.** `POST /actions` has run the contract through
+  `approval_gate.apply_matrix` since the approval gate was fixed.
+  `live_actions.dispatch()` — the registry-driven path next to it, used by
+  the agent loop, the console dry-run and now the playbook engine — ran
+  `autonomy_safety.decide()` and nothing else. `decide()` reads
+  `ACTION_BLAST_RADIUS`, a second risk ladder keyed on `ActionType`, and for
+  **nine verbs it is the weaker of the two declarations** (`block_ip`,
+  `block_domain` and `reset_password` are blast `medium` against impact
+  `high`; `run_script` is blast `high` against impact `severe`;
+  `quarantine_file` is blast `low` against impact `moderate`). So the same
+  verb was graded differently depending on which door it came through, and
+  the weaker grade belonged to the door an agent uses. `dispatch()` now
+  applies the contract and `approval_matrix.evaluate` — each input may raise
+  a requirement and none may lower it, so switching it on cannot make
+  anything auto-execute that did not before.
+
+  `LiveActionRequest` gains `confidence`, because the matrix needs both axes
+  and the request carried only one. Absent is the lowest band, not a free
+  pass: defaulting permissive turns a scoring bug into an autonomous
+  containment.
+
+  Three further holes closed in the same wiring:
+
+  - **A contracted verb with no `ActionType` skipped governance entirely.**
+    `_action_type_for` returned `None` for `revoke_session` and the whole
+    gate was `if action_type is not None`, so a MODERATE-impact identity
+    action reached its executor with no tier check, no blast check and no
+    contract applied. Those verbs are now graded from the contract's own
+    impact under the tenant's tier.
+  - **A tenant `force_auto` override could lower a contract that declares
+    `analyst`.** `ActionContract.approval` says the tenant's autonomy policy
+    "can raise this but never lower it"; the override reached AUTO anyway,
+    because the contract was not in the path. It still lifts the *tier
+    ceiling*, which is what it is for, and no longer lifts the floor.
+  - **An execution with no probe left the verification field blank.** Probes
+    are keyed on `ActionType`, so a contracted verb without one had nothing
+    to record. A blank field and a confirmed one are indistinguishable to a
+    reader, so the honest answer — `unverified`, with the reason — is written
+    explicitly.
+
+- **A playbook step the engine could not run reported success.** Twelve of
+  the twenty-two `StepType` members had no entry in the engine's handler
+  table. The run loop answered those with `{"skipped": true}` and left the
+  step's status at its `SUCCESS` default, so a playbook containing them ran
+  to `COMPLETED` having done nothing it said it did. `approval` is the one
+  that mattered: it is a human decision point, it appears in 14 steps across
+  the shipped packs, and it passed on its own — the run continued straight
+  into the action an analyst was meant to authorise. An unimplemented step
+  type now fails closed with `unimplemented: true` and an error naming the
+  verb, is not retried (a missing handler will still be missing next
+  attempt), and halts the run under the default `on_failure: abort` while
+  still honouring an explicit `continue`. A dry run reports `would_fail` for
+  such a step instead of a bare `dry_run: true`.
+
+  `apps/docs/docs/concepts/playbooks.md` had documented the safe behaviour
+  all along — "recorded as `SKIPPED` … so unknown actions never silently
+  succeed" — and has been corrected to describe what the code now does. The
+  same page described a manual approval gate backed by
+  `POST /v1/playbook-runs/{id}/approve`, where "the engine pauses on the
+  condition until the field flips, then resumes". No such endpoint exists and
+  the engine has no pause or resume; that section now says so and points at
+  the actions service, which does hold an action for an analyst.
+
+- **A playbook run reported COMPLETED when its steps had failed.**
+  `on_failure: continue` decides whether the run keeps going; it was also
+  deciding what the run was called afterwards. 346 of the 380 steps in the
+  shipped packs carry it, so a containment playbook whose every response step
+  failed still finished green. A run that ends with any failed step is now
+  FAILED, with an error naming how many and which, and the author's
+  `continue` policy still governs whether the remaining steps are attempted.
+
+- **The NL drafter rewrote steps to make its own output pass lint.** Because
+  the schema declared 9 of 22 step types, `_collapse_step_types_for_schema`
+  mapped the other 13 onto a "nearest neighbour" — `run_av_scan` and
+  `revoke_session` both became `investigate`, `approval` became `condition` —
+  keeping the original in `params.original_type`. The playbook that shipped
+  said it would investigate when the author had asked to disable an account,
+  and an approval gate came out as an ungated branch. The projection and its
+  second validation pass are removed; the schema covers the full range, so a
+  validation failure is now a real failure. The drafter's system prompt also
+  restated the vocabulary by hand and had drifted from it — offering
+  `webhook` as a trigger, which no validator in the repo accepts, and capping
+  `retry_max` at 5 against a model allowing 25 — and is now generated from
+  `StepType` and `bounds.py`.
+
+- **The playbook lint job validated two files and reported "2/2 passed".**
+  `scripts/lint_playbooks.py` claimed in its own docstring to check "any
+  `*.playbook.json` files anywhere in the repo" and only ever scanned the two
+  under `services/agents/data/playbooks/`. Pointed at the whole tree, 32 of
+  the 62 playbooks in `playbooks/packs/v1/` did not match the published
+  schema. It now scans recursively, treats finding no files as a broken scan
+  rather than a clean bill of health, and no longer crashes in its own error
+  path when a file passed on argv sits outside the repo.
+
+- **20 shipped playbooks carried a duplicated tag.**
+  `scripts/generate_playbooks.py` emitted `[category, *tags]` where several
+  categories already lead their tag list with the category name, producing
+  e.g. `["supply-chain", "supply-chain", "npm", …]`. Fixed in the generator,
+  which is what the reproducibility gate diffs, rather than in the 20
+  generated files.
+
+- **`packages/types/src/playbook.ts` published a fourth playbook
+  vocabulary.** A 28-member `ActionType` union (`notify_email`,
+  `create_ticket_jira`, `collect_forensics`, `run_query_splunk`, …) matching
+  neither the schema nor `StepType`; a `PlaybookStep.action: ActionConfig`
+  shape the engine does not parse; `depends_on`, `run_parallel`,
+  `blast_radius_check` fields nothing reads; and `waiting_approval` /
+  `paused` run states the engine cannot enter. Nothing imports the package,
+  which is why it drifted unnoticed — and is also why it mattered: it is what
+  the next integrator would have built against, and the server would have
+  rejected their code. Rewritten to mirror `StepType`, `PlaybookStep`,
+  `RunStatus` and the dispatch report, and `check_playbook_schema_parity.py`
+  now compares the published union against the engine's in both directions.
+
+- **The agent recommended evidence acquisition the platform could not
+  perform.** `capture_forensics` was an `ActionType` with no executor
+  anywhere, and `services/agents/app/agents/investigation_agent.py` proposes
+  it by name whenever an investigation reaches the C2 or exfiltration stage,
+  with `requires_approval=True`. So on the most serious class of incident the
+  product raised an approval for forensic acquisition and failed with `No
+  executor found for action type` when an analyst approved it — a control
+  reachable from a recommendation and dead on approval.
+
+  It now has a Microsoft Defender arm that collects an investigation package,
+  declared LOW impact and **analyst-gated**. Analyst rather than automatic for
+  the reason that separated `suppress_alert` from `update_alert_disposition`
+  at an identical impact tier: the question is what bounds the verb. The
+  writeback is bounded by a disposition mapping that refuses to close a
+  confirmed true positive; this verb has no bound at all — it collects
+  whatever the vendor package contains from whichever host it is pointed at,
+  and the result is a copy of somebody's endpoint in a vendor cloud behind a
+  download URI. Pointed at the wrong host that is a data-handling event nobody
+  can take back.
+
+  Only Defender, deliberately. MDE's investigation package is a whole-host
+  artefact bundle whose completion state and download URI are both readable.
+  CrowdStrike RTR's `get` retrieves one *named file*, which is a different
+  verb with a different blast radius; wiring it here would make one capability
+  mean two things depending on the tenant's vendor. Without MDE credentials
+  the executor simulates and says which credentials would enable it, rather
+  than reporting an acquisition that did not happen.
+
+  The probe is real and reads the package back. Acquisition is asynchronous,
+  so the vendor's response is emphatically not the confirmation — it says a
+  machine action was queued. `Succeeded` **and** a retrievable download URI is
+  VERIFIED; `Failed` / `TimeOut` / `Cancelled` is FAILED, which is the alarm
+  worth having; `Pending` / `InProgress` is UNVERIFIED, because not finished
+  is not the same fact as not happening. Reading the status alone would
+  certify a collection that finished with nothing to download.
+
+- **A delivered ChatOps prompt nobody had answered would have reported as a
+  completed action.** `ChatOpsVerifyExecutor` worked, sat in
+  `EXECUTOR_REGISTRY`, and no live-action adapter reached it, so the only
+  route to it was the legacy `ActionType` endpoint — which has no capability
+  contract, no approval matrix and no autonomy policy in front of it. Leaving
+  it unreachable was the right call at the time: it returns
+  `ActionStatus.RUNNING` to mean "the prompt went out, nobody has answered",
+  and `_to_live_status` folded everything that was not `FAILED` or a
+  simulation into `SUCCEEDED`.
+
+  The fix is the missing state rather than the exemption.
+  `LiveActionStatus.AWAITING_COMPLETION` means the vendor was touched and the
+  outcome is not yet known — the opposite of `PENDING_APPROVAL`, which means
+  nothing ran because policy wants a human first. Post-action verification
+  does not run against it, since there is no effect to read back yet. The same
+  state is what evidence acquisition needed, so one addition covers both
+  executors that had no honest result to return.
+
+  Registered against Slack and Teams, LOW impact and analyst-gated. Not
+  automatic like `notify` at the same impact, because `notify` addresses a SOC
+  channel and this addresses the account under investigation: sent
+  automatically on a true positive it tells an attacker they have been
+  detected, and the verb cannot know whether the person it is asking is the
+  suspect. Its dry run simulates in the adapter rather than stripping
+  credentials — the base adapter's strip-and-fall-through would turn a preview
+  into a failure for an executor that has no simulation branch by design.
+
+- **Nothing compared what the agent recommends against what the platform can
+  execute.** `scripts/check_action_contract.py` compared four registries
+  inside the actions service and could not see a fifth: the verbs
+  `services/agents` puts in front of an analyst. It now parses every
+  `ProposedAction(action_type=...)` call site — including the conditional form
+  `attack_path_agent` uses — and fails when a proposed verb has no executor,
+  naming the file and line. Run against the tree before this change it reports
+  `capture_forensics` at `investigation_agent.py:157`.
+
+  Both exemption lists in that gate are now empty, and
+  `test_capability_reachability.py` asserts that emptiness directly, so a verb
+  can only be exempted by editing a reviewable assertion rather than appending
+  to a list.
+
+- **Two response verbs worked and could not be reached.** `ack_alert` and
+  `suppress_alert` have had Splunk, Elastic and Defender arms since Phase 3.3
+  and were wired into `EXECUTOR_REGISTRY` — and appeared in none of the three
+  registries that make a verb dispatchable: the live-action adapters, the
+  capability contracts, or the capability vocabulary. Governed dispatch
+  answered `executor_not_found` for code that ran, which reads as a
+  misconfigured integration rather than a capability nobody connected. This is
+  the mirror image of a defect already fixed here in the other direction,
+  where eleven capabilities had a contract and no executor at all — including
+  `unisolate_host`, so the rollback for the most disruptive action in the
+  product resolved to nothing.
+
+  Both verbs now have six vendor adapters (one per vendor arm), a capability
+  contract, an entry in the vocabulary on both sides of the mirror, and a
+  verification probe. Each adapter pins `alert_vendor` so a tenant with two
+  SIEMs configured does not have the target chosen by credential ordering; the
+  pin is still checked against the credentials, so pinning a vendor the tenant
+  has not configured simulates rather than claiming an arm that could not have
+  run.
+
+  `ack_alert` is LOW impact and automatic: it marks a finding in-progress and
+  owned by AiSOC, removing nothing from anyone's view, and two analysts
+  working the same notable is the cost of not doing it. `suppress_alert` is
+  LOW impact and **analyst-gated**, because what makes the disposition
+  writeback safe to automate is the mapping that refuses to close a confirmed
+  true positive, and this verb has no such bound — it closes whatever it is
+  pointed at, on the caller's say-so.
+
+- **A one-directional gate would have missed all of it.** `check_action_contract.py`
+  now compares the four registries a verb needs in **both** directions, and
+  `test_capability_reachability.py` injects drift in each direction and asserts
+  the gate names it. The dominant failure shape in this repository is a check
+  that compares A against B and never B against A, so drift in the direction
+  things actually change passes while the check prints OK — the graph-schema
+  check reported OK with 17 node labels declared and 28 implemented.
+
+  Running it found three more mismatches beyond the two above. `create_ticket`
+  and `notify` were registered, contracted and dispatchable across four
+  vendors while absent from `KNOWN_CAPABILITIES` and the connectors
+  `Capability` enum, so the registry logged `capability_unknown` for them at
+  every startup; both are now in the vocabulary. `chatops_verify` has an
+  executor no adapter reaches, and three `ActionType` members
+  (`capture_forensics`, `add_ioc_to_blocklist`, `run_playbook`) have no
+  executor at all — the first of those is proposed by name by the
+  investigation agent on the C2/exfiltration path, so the product recommends
+  evidence acquisition it cannot perform. Those four are recorded in the
+  gate's exemption lists with the reason each is open. Both lists are
+  ratchets: an entry that gains an implementation and is not removed fails the
+  build.
+
+- **The disposition writeback now verifies itself against the vendor.** It
+  shipped declaring no verification probe, which was honest — a declared probe
+  that does not run is the defect the contract gate exists to catch — but the
+  standing rule is that an unverifiable action is not an autonomous one, and
+  this action is automatic. The probe re-reads the finding and compares its
+  state against the plan re-derived from the same verdict through the same
+  `plan_writeback` the executor used, rather than being told separately what
+  to expect. Splunk ES reads back the `incident_review` collection (a new
+  `SplunkClient.get_notable_event_state`) and confirms status `5` on a close,
+  or status `1` *and* the owner AiSOC set on an escalation, since status alone
+  cannot distinguish a notable an analyst had already picked up. QRadar
+  confirms `CLOSED` through `get_offense`, whose docstring had claimed to be
+  the writeback probe since it was written and had no caller.
+
+  A QRadar **escalation** deliberately reports `unverified`: escalating leaves
+  the offense `OPEN`, which is also its prior state, so confirming "still
+  OPEN" would certify a write that never happened — the same shape as the
+  isolation probe that returned `bool(device_id)` and would have certified an
+  uncontained host. Elastic, Sentinel and Defender expose no read of a
+  finding's state and report `unverified` too. `ack_alert` and
+  `suppress_alert` are verified against the same read-back.
+
+- **A dry run called the customer's production SIEM.** The live-action dry-run
+  path works by stripping credentials so the executor falls through to
+  simulation, and the strip list did not match what the client factory reads:
+  the Splunk adapters stripped `splunk_host` / `splunk_token` / `splunk_index`
+  while `_splunk_client` reads `splunk_url` *first* and also accepts basic
+  auth. `splunk_url` is exactly what the credential resolver writes for a
+  connector-configured tenant, so a "preview" built a real client and called
+  Splunk. Elastic had the identical mismatch (`elastic_host` stripped,
+  `elastic_url` read). The strip lists are now the factories' own exported key
+  tuples, and a test re-derives each read set from the factory source so the
+  two cannot drift again.
+
+- **An `alert_vendor` pin was honoured without checking that vendor's
+  credentials existed.** `_ack_vendor` returned the pinned vendor
+  unconditionally. A dry run strips credentials, so the pin survived the strip,
+  resolved to "splunk" with no client, and hit an `assert` — crashing an action
+  that was meant to be a harmless preview. A pin naming a vendor the tenant had
+  never configured reported a vendor arm that could not run. A pin is now
+  checked against the credentials, and an unusable pin resolves to *nothing*
+  rather than falling through to whichever other SIEM happens to be configured:
+  "write this to Splunk" must not become "write this to Elastic".
+
+- **`CreateNotableEventExecutor` raised `TypeError` on every live call.** It
+  passed `title=` / `description=` / `fields=` to a client whose signature is
+  `(rule_name, event_data, severity, owner, status)`. Invisible because
+  simulation mode never constructs the client — the same defect class as the
+  `max_results` / `max_count` drift fixed earlier on this module. Every SIEM
+  executor-to-client call is now pinned by an autospec'd signature test, which
+  a hand-written fake with `**kwargs` could never have caught.
+
+- **Every live Okta password reset raised `TypeError` and came back FAILED.**
+  `ResetPasswordExecutor` documents `parameters.send_email` as "used only for
+  the Okta path", reads it, and passed `send_email=` to
+  `OktaClient.reset_password(self, login_or_id)` — which did not accept it. The
+  executor's `except Exception` turned the `TypeError` into a FAILED
+  `ActionResult`, so the verb did not crash; it simply could never succeed
+  against Okta, and the failure read as an Okta problem. Simulation mode never
+  constructs a vendor client, which is why no test saw it: the one that covers
+  this executor stubs the client as `async def reset_password(self, *_args,
+  **_kw)`, and a fake that accepts anything proves the dispatch order and
+  nothing about the call. The client now takes `send_email` and maps it to
+  Okta's `sendEmail` parameter, and `test_identity_client_signatures.py`
+  autospecs all three IdP clients across every executor arm — the companion to
+  `test_siem_client_signatures.py`, for the third instance of the same defect.
+
+- **The lake's tenant isolation could be switched off by resolving a
+  dependency one major version higher.** `lake_sql.rewrite_for_tenant` is the
+  only thing separating one tenant's events from another's in ClickHouse: it
+  parses untrusted operator SQL with sqlglot, enforces the table allowlist
+  against the parse tree, bans ClickHouse table functions, and injects the
+  `tenant_id` predicate. sqlglot 27 moved the SELECT's FROM clause from
+  `args["from"]` to `args["from_"]`. The table walk read the old key, got
+  nothing, and took the branch written for `SELECT 1` — "no FROM, so no tenant
+  data, nothing to do". Every single-table query then came back with no
+  allowlist check, no table-function ban and no tenant predicate, reported as
+  a successful rewrite.
+
+  `services/api/pyproject.toml` declared `sqlglot >=23.0.0,<31.0.0` while the
+  Dockerfile and every CI workflow declared `>=23,<27`, so this was reachable
+  by installing the service exactly as declared, and CI could not see it
+  because CI installed the narrow range. Verified on sqlglot 30.19.0 against
+  the pre-fix rewriter: `SELECT user_name FROM aisoc.raw_events` returned
+  unscoped, `SELECT * FROM system.tables` was accepted, and
+  `url('https://attacker.example/x', JSONEachRow)` was accepted — the last of
+  which makes the warehouse issue outbound HTTP with its own network identity.
+
+  Three changes rather than one, because pinning alone would leave the trap
+  armed for the next bump. The FROM clause now resolves by node type instead
+  of by key name. `rewrite_for_tenant` ends with an audit that takes its own
+  independent census of the statement's tables and raises the new
+  `LakeSqlIsolationError` unless every one of them was scoped, the tenant
+  survived into the rendered string, and every rendered SELECT that reads a
+  lake table carries the tenant in its own WHERE — so a partially scoped
+  UNION fails too. And all seven install paths now declare one identical
+  range, enforced by `scripts/check_sqlglot_pin.py`, with
+  `.github/workflows/lake-isolation.yml` running the rewriter suites against
+  both the shipped range and the next major so a future bump fails loudly
+  instead of quietly downgrading isolation.
+
+- **Scheduled hunts ran against credentials that could not exist, so every one
+  of them returned zero hits.** The event-warehouse drivers resolved their
+  endpoint and secret from `settings.ES_URL` / `ES_API_KEY` / `SPLUNK_URL` /
+  `SPLUNK_HMAC_TOKEN` / `CHRONICLE_PROJECT_ID`. None of those were declared
+  fields on `Settings`; each was read through `getattr(settings, name, None)`,
+  so the miss was silent, and `Settings` sets `extra="ignore"`, so an operator
+  who followed the resulting "set them in environment variables" message and
+  exported `ES_URL` got the same message back. The scheduler treats the
+  resulting `HuntNotConfigured` as a soft skip, so the failure was invisible.
+
+  Credentials now resolve from the tenant's own `connectors` row — the one the
+  console wizard writes, encrypted by the credential vault — which is where
+  `federated.py` and `case_fanout.py` already read theirs. The warehouse is
+  per-tenant by construction as a result: a managed provider can point each
+  customer at their own cluster, which resolving from process settings made
+  impossible even in principle. `ES_URL` / `ES_API_KEY` are now declared
+  fields and remain as a deployment-wide fallback for single-cluster installs.
+
+- **Provider selection ignored which SIEM the tenant had connected.**
+  `resolve_provider` returned the first driver whose `translated_query_key`
+  appeared in the hunt, and the natural-language translator emits ES|QL, SPL
+  *and* KQL for every question — so `esql` was always present and
+  Elasticsearch was always chosen, including for tenants who run only Splunk.
+  Selection is now driven by the tenant's enabled connectors first and the
+  available translation second.
+
+- **`POST /nl-query/execute` documented two request fields it ignored.**
+  `es_url` and `es_api_key` were described as overrides and silently dropped.
+  `es_url` now selects among the caller's own Elasticsearch connectors by
+  host, matched against connectors they own and never used as an outbound
+  target; `es_api_key` is refused with 400, because credentials belong in the
+  vault-encrypted connector rather than in a request body.
+
+- **`wet-eval.yml` reported success on eight consecutive weekly runs while
+  evaluating nothing.** The preflight step exited 0, every subsequent step was
+  `if: should_run == 'True'` and skipped, the notice step succeeded, and the
+  job went green. A green check that means "I did not run" is worse than a red
+  one: it is the only signal a reader gets and it says the opposite of the
+  truth. Preflight is now its own job and the run is gated on
+  `needs.preflight.outputs.should_run`, so with no funded key the benchmark
+  job reports as **skipped** — visibly distinct from success in the checks
+  list — and the preflight writes to the run summary that the published
+  numbers were not refreshed. Failing outright was the alternative and is
+  wrong here: a fork cannot configure the secret, and a weekly red cross
+  nobody can clear trains people to ignore the page. Staleness of the
+  published numbers is separately gated and does fail closed
+  (`scripts/check_scoreboard.py`, 45 days).
+
+- **The claim-gate figures gate checked every restatement of the tally except
+  the document making the claim.** `readme_gates.py` compared the README and
+  `evidence-pack.md` against the matrix rows and never compared the matrix's
+  own Summary block, so `docs/audit/CLAIM_TO_GATE_MATRIX.md` summarised
+  "GATED: 108" against 109 counted rows and every check in the repository
+  passed. The file even carries a counting note about this exact class of
+  error; it recurred because the gate written afterwards pointed outward only.
+  The matrix is now the first source checked, the bullet-list form its summary
+  uses is matched (the previous pattern needed both figures on one line and
+  silently matched nothing there), and three cases in
+  `tests/test_readme_figures_gate.py` pin it. The stale count is corrected and
+  the tally is **122 rows — 113 GATED, 9 PARTIAL, 0 NO GATE**, recomputed with
+  the script rather than typed.
+
+- **The OpenAPI gate's documented escape hatch did not exist.** The workflow
+  header told a maintainer to "re-run with `--allow-breaking`" and
+  `scripts/openapi_diff.py` claimed the flag was what "the release flow uses" —
+  but the workflow triggered on `pull_request` only, with no dispatch, no input
+  and no label check, and the diff step never passed the flag. `--allow-breaking`
+  had **no caller anywhere in the tree**. A maintainer facing a correct,
+  deliberate break had no action that worked, and the two statements describing
+  the procedure were both false.
+
+  The hatch is now a PR label, `breaking-change-approved`, chosen over a
+  `workflow_dispatch` boolean because applying a label leaves an attributable
+  record of who authorised the break and when on the PR timeline. The job reads
+  that timeline and names the approver in its output. It re-runs on `labeled`
+  and `unlabeled`, so the label is a live control rather than one that waits for
+  the next push.
+
+  Approval is not a skip, and the flag is no longer usable as a silent bypass:
+  `--allow-breaking` now *requires* `--changelog` and `--changelog-base`, so it
+  cannot be wired up without also wiring up the thing that records what was
+  approved. The detector still runs, and the job summary lists every breaking
+  change being permitted next to the CHANGELOG note that justified it. The
+  approval is refused if there is no `### BREAKING` section under
+  `## [Unreleased]`, or if that section is byte-identical to the base branch's —
+  checked in both directions, because "a BREAKING section exists" alone would
+  let the first note in a release cycle excuse every later break in that cycle.
+
+  The version-bump half of the old promise was dropped rather than implemented:
+  this repository accumulates under `[Unreleased]` and bumps `VERSION` at
+  release-cut, so a per-PR version check would demand something no PR can
+  correctly do. The comment now says what the control does.
+
+  Thirteen new tests, all of which fail against the pre-change tree. Four are
+  wiring assertions over the workflow YAML itself — that some step passes
+  `--allow-breaking`, that the step passing it is guarded by the label and
+  presents its evidence, that the unapproved path still blocks, and that
+  `labeled` is in the trigger types. A unit-tested function with no caller is
+  indistinguishable from a working feature until something asserts the call.
+
+- **`screencast.yml` could never get past its third step.** Its
+  `cache-dependency-path` named `apps/web/pnpm-lock.yaml`, which does not
+  exist — this is a pnpm workspace with one lockfile at the root — and
+  `setup-node` hard-fails when the cache path matches nothing. Every other
+  workflow in the repo already pointed at the root lockfile; being
+  `workflow_dispatch`-only meant no scheduled run ever exercised it.
+
+- **Four more known-red CI entries, and the reason each could sit on `main`.**
+  None was anyone's recent breakage; all four reproduced on a pristine
+  checkout. What they had in common is more useful than what broke: in every
+  case the thing that should have objected either did not run, was not
+  required, or could not fail.
+
+  - **`Backup → destroy → restore` had lost its object store for the second
+    time.** `minio/minio` was withdrawn from Docker Hub (the repository 404s),
+    the job was moved to the quay.io mirror pinned by digest, and quay.io now
+    answers **401 UNAUTHORIZED for every tag and for that digest** — the whole
+    repository, not one tag. A third MinIO coordinate would be the same bet a
+    third time, so the fixture is now Versity's Apache-2.0 S3 gateway
+    (`ghcr.io/versity/versitygw`, pinned to the v1.8.0 multi-arch index
+    digest). It is a real S3 server rather than a mock, so `backup.sh` and
+    `restore.sh` still drive `aws s3 cp/ls/rm` and `s3api head-object` for
+    real; and it is on GHCR, which this workflow's own images already use and
+    which cannot be withdrawn independently of the CI it runs on. The job also
+    gained a readiness probe: `docker run -d` succeeding only means the
+    container was created, and the previous shape would have spent the bucket
+    loop's retries before failing with a connection error that said nothing
+    about why.
+  - **`docker compose up — full stack` failed building `services/realtime`,
+    and not for the reason it looked like.** The lock and the manifest do
+    agree (`npm install --package-lock-only` is a no-op against the committed
+    lock), the Dockerfile does copy `package-lock.json` into both stages, and
+    Node 22 is consistent across the Dockerfile, CI and `@types/node`. The
+    failure was `esbuild`: a transitive of `tsx` that the image never runs,
+    whose install script hardlinks the platform binary into place and then
+    immediately execs it to read its version, with no retry — under BuildKit
+    that exec loses a race with the writer still holding the inode and fails
+    `ETXTBSY`. The builder stage now installs with `--ignore-scripts`, which
+    it can do because the only thing it needs from devDependencies is `tsc`.
+    The emitted `dist/` is byte-identical. The runtime stage deliberately
+    keeps its install scripts: what it installs is what ships.
+  - **`test_business_context_hotpath.py` reached a real database.**
+    `FusedAlertTriageWorker.triage()` opens asyncpg connections through
+    `business_context._load_tenant_rules` and `ledger.persist_auto_triage`, so
+    with an inherited `DATABASE_URL` two tests failed with `InterfaceError:
+    cannot perform operation: another operation is in progress` — pytest-asyncio
+    gives each test its own event loop, and the module-level pool one test
+    opens is unusable by the next. The agents unit suite now declares that it
+    runs with no database, in `tests/conftest.py`, and **enforces it**: the
+    inherited DSN is removed and a real asyncpg connection raises. The guard
+    is a `BaseException` on purpose — every call site it covers is wrapped in
+    a fail-soft `except Exception`, which is correct in production and is
+    exactly why the bug was invisible, so an `Exception` here would be
+    swallowed by the handlers it exists to police. Two tests that drive the
+    real client against a DSN they set themselves are marked
+    `touches_database`. Replaces two earlier workarounds that did not work:
+    `os.environ.setdefault("DATABASE_URL", "")` is a no-op precisely when the
+    variable is set.
+  - **`test_a_missing_handler_is_not_retried` asserted nothing that could
+    fail.** It named `RUN_AV_SCAN` as its missing handler; that stopped being
+    true when the response verbs were wired into `_HANDLERS` via
+    `RESPONSE_STEP_TYPES`, so the step took the *retry* branch and was
+    attempted four times over fourteen seconds — the behaviour the test's own
+    docstring forbids — while reporting green. Its one behavioural assertion,
+    `_elapsed_ms == 0`, could not notice: `t0` resets at the top of every
+    attempt, so the field is the duration of the final attempt alone, and it
+    reads 0 both when the engine skips the retry loop (which writes a literal
+    `0`) and when a handler fails in under half a millisecond. The test now
+    takes its step type from the registry instead of naming one, so it cannot
+    silently rot the same way again, and asserts the property directly by
+    recording backoff sleeps. The file went from 14.13s to 0.16s. The
+    `patch_handlers` fixture now saves originals with `setdefault`, so a
+    second install of one key cannot write a test double permanently into the
+    process-wide handler registry.
+
+  Why `main` carried them: `backup-restore` and `docker compose up — full
+  stack` fail hard but are **not** among the nine required checks, and compose
+  smoke is pull-by-default — it only builds a service when that service's
+  build context changed, so it is usually green without building the thing
+  that was broken. `test_business_context_hotpath.py` runs inside `Python —
+  Tests`, which **is** required, and passed only because GitHub's runners have
+  nothing on 5432 and the agents step sets no `DATABASE_URL` — green by
+  property of the runner, not of the code. `test_playbook_engine_correctness.py`
+  was named by no workflow at all; it is one of **62 of the 82** test files
+  under `services/agents/tests` in that position. The playbook and per-tenant
+  business-context files are added to the agents test list (gated agents tests
+  529, up from 303); the remaining gap is real and is not closed here.
+
+- **Four tests failed on a clean checkout and belonged to nobody.** A suite
+  with known-failing tests teaches everyone to skim past red, so each is now
+  either fixed or skipped with a reason that says what to do about it.
+
+  - `test_hunt_scheduler_cron.py::TestNextFireAt::test_basic_hourly` asserted
+    croniter's answer (the top of the next hour) from a class that, unlike its
+    neighbour, carried no `_CRONITER_AVAILABLE` guard — so without the
+    dependency it failed rather than skipped. Not environmental: the fallback
+    is an interval stepper with defined behaviour that nothing was checking.
+    It now asserts the right answer on each path, so both are tested.
+  - `test_router_report.py::test_findings_with_html_tags_are_escaped` required
+    the literal `&lt;script&gt;`, which only the `markdown` branch produces —
+    the `<pre>` fallback escapes the already-escaped body again and emits
+    `&amp;lt;script&amp;gt;`. That is more escaped, not less, so a correct
+    branch was reporting a security failure. It now asserts the property that
+    matters (nothing reaches the document as an executable tag, and the
+    payload is still present rather than dropped) on either branch.
+  - `test_router_report.py::test_html_wraps_markdown_with_document_chrome`
+    genuinely needs `markdown` — a declared dependency of the service — and
+    now skips with that stated, while CI installs it and runs the file, which
+    it had never done.
+  - `test_graph_freshness.py::test_graph_writer_does_not_block_fusion_on_failure`
+    treated "something answered on port 8080" as "the ingest service
+    answered". Its only escape hatch was a connection error, so an unrelated
+    local service returning 401 became a failure reading "fusion should never
+    block on graph". It now checks `GET /health` reports `service: ingest`
+    before asserting anything, and the skip names what did answer.
+
+- **The same commit did not build the same way twice, and one of the ways it
+  could build did not start.** `One real event through the real pipeline`
+  failed and then passed on re-run with no code change. The API container had
+  died at import with `AssertionError: Status code 204 must not have a
+  response body` from `app/api/v1/endpoints/community.py:183` — a file
+  byte-identical to `main`, on a branch that touched nothing under
+  `services/api`.
+
+  Measured, from the failed run's own log: `poetry install` hit a transient
+  error, the Dockerfile's pip fallback took over, and it pinned
+  `fastapi>=0.111,<0.112` and installed 0.111.1. In the same build `fusion`'s
+  poetry install succeeded and took 0.141.1. One commit, two resolvers, two
+  answers.
+
+  `community.py` has `from __future__ import annotations`, so its `-> None`
+  return annotation reaches FastAPI as the string `"None"`. FastAPI resolves
+  it through `ForwardRef` to `NoneType` — truthy — rather than the falsy
+  `None` singleton it gets without PEP 563, concludes the route returns a
+  body, and asserts that a 204 does not. **Every release from 0.111.0 through
+  0.116.2 raises; 0.117.0 and later do not.** The declared range was
+  `>=0.111,<0.142`, so 29 of the 120 releases it permitted could not import
+  the service at all, and the fallback pinned squarely inside that band. The
+  earlier triage read the shape as innocent because it was checked without
+  PEP 563 active, which is the one condition that makes it fail.
+
+  The fix is determinism rather than a widened assertion:
+
+  - **All thirteen Python services install from a committed `poetry.lock`.**
+    Three had one; ten now do. Two `--no-cache` builds of one commit produce
+    an identical `pip freeze` (129 packages, same SHA-256), and a new
+    `Reproducible builds / twice` job asserts it on every change.
+  - **The pip fallbacks are gone** from all eight Dockerfiles that had one.
+    Each carried its own copy of the dependency list under a comment asking
+    for lockstep, and each had drifted. A build that fails is recoverable; an
+    image that boots on versions nothing tested is not.
+  - **Four services that hand-listed their dependencies in the Dockerfile**
+    (`honeytokens`, `purple-team`, `ueba`, `mesh`) now install from a lock
+    too. All four had drifted from the manifest they mirrored — `mesh` shipped
+    `cryptography<50` against a manifest reading `<51`.
+  - **The FastAPI floor is 0.117** in all thirteen manifests and every
+    workflow. `services/api/tests/test_fastapi_floor.py` pins the boundary and
+    fails on 0.116.2 with the original error; a matrix leg imports the service
+    at both ends of the declared range.
+
+- **`Event spine (real containers)` had a genuine race, not a flaky
+  environment.** The graph-writer assertion was
+  `docker compose logs … 2>/dev/null | grep -q "<early string>"` inside a step
+  running under `set -euo pipefail`. `grep -q` exits the instant it matches —
+  and that string is line 4 of the service's output — which closes the pipe
+  while Compose is still writing; Compose exits 255 on the broken pipe and
+  `pipefail` promotes that over grep's 0. The pipeline reported failure over a
+  line that was present, which the failing run proves: the log dump its own
+  error handler printed 115 ms later contains the exact string.
+
+  Reproduced deterministically rather than inferred — with a large log the
+  pipeline returns 255 every time, with a small one that fits the pipe buffer
+  it returns 0 every time, and the match is in both. That size dependence is
+  why it read as a flake. `2>/dev/null` made it worse by discarding the only
+  message that distinguished "Compose failed" from "the line is absent", so
+  the run reported the wrong cause. Fixed by capturing the logs once and
+  grepping the capture, and by checking Compose's own exit status separately —
+  not by a retry or a longer sleep, which would have converted a real race
+  into a slower real race. `scripts/doctor.sh` has the same shape twice and is
+  unaffected: it does not set `pipefail`.
+
+- **Two more gates were exempt from the empty-corpus rule only by accident.**
+  `check_route_auth.py` and `check_tenant_query_predicates.py` did not exit 0
+  over an empty tree, but neither had a corpus floor: each happened to fail
+  first on its own stale-exemption ratchet, because every entry stopped
+  matching at once. That is a true statement about the wrong thing, and it
+  disappears the moment somebody empties the table. Both now refuse the
+  corpus itself, ahead of every output mode including `--inventory`, which CI
+  runs as its own step — a green step printing `TOTAL 0` is the same defect
+  one level out. The route gates share one floor, in
+  `check_route_tenant_scope.py`, because they share one collector; the
+  predicate gate refuses each of the three ways its scan can empty
+  separately, since files, tenant-scoped tables and statements reaching zero
+  are three different losses and the middle one is the quiet one. Proven both
+  ways: with every exemption table emptied the floor is still what refuses,
+  and the real repository is unaffected.
+
+  `check_route_auth.py` now imports its scanner as a module rather than by
+  name. It took `REPO_ROOT` and `SERVICES_DIR` by value at import time, so the
+  shared self-test rebinding them would have left this gate scanning the real
+  checkout while believing it was pointed at an empty one — a self-test that
+  proves nothing, which is the shape the whole exercise is about.
+
+- **`check_gate_contract.py` can now ask "the directory exists and is empty",
+  not only "the repository is not there".** Its scratch tree omitted
+  `services/` and `detections/` entirely, so a gate opening with
+  `if not X.is_dir(): return 2` refused it for a reason that says nothing
+  about its corpus — and the way a corpus is actually lost is a renamed
+  package or a glob that stopped matching, neither of which removes the
+  directory. A second **skeleton** shape creates them empty and every check is
+  probed against both. The cost was measured rather than assumed before
+  committing to it: 64 of the 71 checks already refused the skeleton, and of
+  the five that did not, three were defects now fixed and two were already
+  recorded exceptions. The exception table is keyed by shape and has five
+  entries. Probe runtime went from ~8 s to ~16 s.
+
+- **`check_route_tenant_scope.py` reported OK having scanned zero routes.** It
+  refused a tree with no `services/` directory, which is not how a scan loses
+  its corpus: a renamed package, a changed decorator spelling or a walk that
+  stops descending all leave the directory in place. Against a `services/`
+  tree with no routes in it the gate printed `scanned 0 routes across 0 files`
+  and then `OK: every route taking a tenant identifier authenticates` — the
+  same sentence CI shows on a real pass. It now exits 2, and `--self-test`
+  carries the case. Naming the count was only half the fix: the number was
+  already printed, directly above the clean verdict.
+
+- **The dependency audit reported success over a tree with no manifests.**
+  `security_audit.py`'s pnpm, python and go arms each discovered zero targets
+  and printed `0 findings`, which is the sentence a clean audit of twenty
+  services prints. The file already treated an unscanned service as a failure
+  rather than a warning — the gap was that a corpus of zero was never
+  *unscanned*, just empty. All three now record a coverage gap when discovery
+  finds nothing, and `validate-ignores` refuses a missing policy file instead
+  of reporting `Validated 0 ignore entries` and exiting 0. `get_repo_root()`
+  also stopped falling back to `Path.cwd()`, which meant a run from anywhere
+  else audited whatever manifests happened to be under it.
+
+- **The dependency audit only ever looked at one of the repository's two pnpm
+  install roots.** `run_pnpm_audit` ran `pnpm audit` in the repo root and
+  nowhere else, so `apps/mobile` — a deliberately separate install root, with
+  its own `pnpm-workspace.yaml` so its installs stop rewriting the root lock —
+  was never scanned. Two high-severity advisories stood open there while the
+  `security-audit` job reported a clean workspace, which is the same shape as
+  the stale `poetry.lock` that once dropped `services/slack-bot` and hid eleven
+  advisories. Install roots are now discovered from the tree (every directory
+  holding a `pnpm-lock.yaml`), each is audited, and a finding names the root it
+  came from rather than a generic "pnpm workspace". A tree with no lockfile
+  anywhere is recorded as a coverage gap instead of reported as clean.
+
+  The two advisories it surfaced (`GHSA-5p2g-fcmc-qvqq`, `GHSA-w3rx-r6r6-pgpr`
+  in `image-size`) are suppressed with an expiry rather than fixed, because no
+  fix is reachable: `apps/mobile` resolves `image-size 1.2.1` solely through
+  `metro 0.83.3`, no patched 1.x exists, every metro release through 0.87.1
+  still requires `^1.0.2`, and `image-size` 2.x drops the callable default
+  export `metro/src/Assets.js` calls — so an override would break asset
+  resolution at bundle time rather than bump a version. Dependabot's updater
+  reaches the same verdict independently (`security_update_not_possible`).
+  Both are denial-of-service only and build-time, reachable only from an image
+  already committed to this repository.
+
+- **Twenty-two dead paths in comments and docstrings**, found by the new
+  gate on its first run. Among them: cost provenance pointing at migration
+  `055` when the file is `063`; the Wazuh severity table pointing at
+  `apps/docs/connectors/` instead of `apps/docs/docs/connectors/`; eight
+  copies of the vendored `tenant_scope.py` pointing at a
+  `check_vendored_tenant_scope.py` that is spelled `sync_`; eleven files
+  pointing at a root-level `tests/test_security_defaults.py` that lives
+  under `services/api/`; and three separate pointers at CI checks that had
+  never been written, one of which `check_action_contract.py` already
+  documented as fictional in its own docstring.
+
+- **`main` went red because an install list depended on an extra it never
+  declared, and an upstream release stopped supplying it by accident.** The
+  `Python — Service unit tests (fusion, honeytokens, purple-team)` job failed
+  on `purple-team`'s `test_every_api_route_requires_auth` with
+  `ModuleNotFoundError: No module named 'greenlet'` — 99 other tests in the
+  job passed. Nothing about `purple-team` had changed: the test has imported
+  `app.api.routes` since it was written, that module has always imported
+  `sqlalchemy.ext.asyncio`, its `pyproject.toml` has always declared
+  `sqlalchemy[asyncio]`, and its `poetry.lock` resolves `greenlet 3.5.6`. The
+  declaration was right and the install path was wrong: this job consults
+  neither the manifest nor the lock, it pip-installs a hand-curated list, and
+  that list named a bare, unbounded `sqlalchemy`.
+
+  It passed for months anyway. Through SQLAlchemy 2.0.x, `greenlet` was
+  required *outside* the `asyncio` extra whenever `platform_machine` matched
+  one of `aarch64 | ppc64le | x86_64 | amd64 | AMD64 | win32 | WIN32` — true
+  on `ubuntu-latest` — so a bare `sqlalchemy` installed it incidentally and
+  the extra was load-bearing and unnamed at the same time. SQLAlchemy 2.1.0
+  removed that clause, leaving `greenlet>=1; extra == "asyncio"` as the only
+  requirement. 2.1.0 was published at 20:12:49 UTC on 2026-09-24; the last
+  green commit on `main` (`ba0c6429`) is timestamped eleven minutes before it
+  and the first red one (`ad775e8d`, #829) ten minutes after. #829 was an
+  LLM-routing change that touched no file under `services/purple-team` and
+  nothing in that import chain — it is the commit whose run happened to
+  re-resolve first, not the cause. So this was neither a dependency that went
+  missing nor an import path newly reached; it was an unpinned install
+  re-resolving across an upstream minor.
+
+  The job now installs `"sqlalchemy[asyncio]>=2,<3"`, matching both the
+  manifest and the wave-2 matrix job, which had it right all along.
+  `greenlet` is deliberately *not* added as a top-level pin: the extra exists
+  to pull it, and naming the transitive package instead would record the
+  workaround rather than the dependency. `isolation.yml`, which had done
+  exactly that — bare `sqlalchemy` plus an explicit `greenlet` — now declares
+  the extra and drops the compensating entry.
+
+- **The wave-1 service-test job installed twelve packages with no version
+  bound, which is the outage that already happened, still loaded.** A CI job
+  pip-installing a hand-curated list named a bare, unbounded `sqlalchemy` and
+  passed for months only because a platform marker happened to pull
+  `greenlet`; when 2.1.0 deleted that clause, every import of
+  `sqlalchemy.ext.asyncio` began failing at collection. That one was bounded.
+  The other twelve in the same list were not, and the job's own comment said
+  so — *"Bounding the range is the second half: unbounded, any upstream
+  release lands here before anyone reads it."* `pydantic`,
+  `pydantic-settings`, `pytest`, `pytest-asyncio`, `structlog`, `redis`,
+  `aioredis`, `httpx`, `aiokafka`, `asyncpg`, `clickhouse-driver` and `pyyaml`
+  now carry the range the three services under test declare, so the job
+  installs what they ship rather than whatever PyPI is serving this morning.
+
+  Two things fell out of doing it, both pre-existing and both invisible while
+  the install was unbounded. `redis` was installed bare while
+  `services/fusion` declares `redis[hiredis]` — the same dropped-extra shape
+  as the `sqlalchemy` break, an install path quietly installing a smaller set
+  than ships. And the three manifests **could not be satisfied at once**:
+  `services/fusion` declared `httpx = "^0.26.0"` while `honeytokens` and
+  `purple-team` declare `>=0.27.0`. The unbounded install resolved 0.28.1, so
+  fusion was being tested on a version its own manifest forbade and shipping
+  0.26.0 — tested and shipped were different software, which is the exact
+  thing `check_dependency_pins.py` exists to prevent. fusion moves to
+  `>=0.27,<0.29`, matching api / actions / mesh / osquery-tls / slack-bot /
+  teams-bot, and its lock re-resolves to 0.28.1 so the three now agree and the
+  job tests what fusion ships. All three suites pass on the bounded set
+  (fusion 308, honeytokens 66, purple-team 100, every coverage floor met).
+
+  Still unbounded and reported rather than silently fixed: `services/connectors`
+  and `services/threatintel` also declare `httpx = "^0.26.0"`, and neither is
+  in this job.
+
+- **`services/connectors` reached `sqlalchemy.ext.asyncio` without declaring
+  the extra that makes it importable.** `app/db/engine.py` calls
+  `create_async_engine`, and the manifest declared `sqlalchemy = "^2.0.0"`.
+  It resolved only because of the same pre-2.1.0 accident, which means the
+  next SQLAlchemy bump would have dropped `greenlet` from the lock the image
+  installs from and broken the poller in production rather than in CI. It was
+  the only service in this position — every other service that imports the
+  module already declared `[asyncio]`. Re-locking with the extra changes two
+  lines and no resolved version.
+
+- **`scripts/check_dependency_pins.py` now compares extras, not just
+  version ranges.** `sqlalchemy` and `sqlalchemy[asyncio]` are two different
+  dependency sets, and the gate that exists to assert every install path
+  agrees was reading the name and the range and discarding the extras — so it
+  reported agreement between a manifest and a workflow installing strictly
+  less software. Extras are now part of a declaration's identity in both
+  syntaxes (PEP 621 brackets and Poetry's `extras = [...]` table, the latter
+  being the one that was silently dropped), with three directions checked
+  because the direction nobody aims a gate at is the one that rots:
+  `manifest -> install path` (a workflow or image dropping an extra a
+  manifest declares), `source -> manifest` (code importing the module an
+  extra enables under a manifest that does not declare it, read out of the
+  source so the manifest is not asked to vouch for itself), and
+  `extra -> lock` (an extra declared while the lock resolved nothing it
+  provides — "the extra is declared and the library is absent" is now a
+  sentence this gate can say). Run against the pre-fix tree it names all
+  three defects above and the files holding them; `--self-test` injects each
+  direction separately, and six tests in
+  `tests/test_dependency_pin_gate.py` pin the parsing and the directions.
+
+- **`scripts/check_toolchain_pins.py` compares every Node install root
+  against every other.** There are four — the workspace root, `apps/mobile`,
+  `services/realtime` and `services/mcp/cursor-extension` — and the gate read
+  dependency resolution out of the first one only, so the `image-size` split
+  above was invisible to it. It now discovers install roots structurally,
+  reads both pnpm and npm override spellings and both lockfile formats, and
+  checks in both directions: an override declared in one root against what
+  every other root resolved, and each root's own lockfile against its own
+  manifest. Exemptions are keyed on the exact versions they were verified
+  against, so a bump re-opens the question rather than inheriting the
+  clearance. Running it against the pre-fix tree names the defect and the
+  file; running it over a lockfile it cannot parse, or a tree with no
+  install root, fails rather than reporting a clean comparison it never
+  performed. The gate found a third instance of the same class on first run
+  (`ws` 6.2.6/7.5.13 in `apps/mobile`, verified clean against OSV and
+  recorded).
+
+- **CI installed `cryptography>=41,<46` for services whose manifests required
+  `>=46,<51`** — two ranges with no overlap, so the version CI tested could
+  never be the version the image shipped. `connectors` and `osquery-tls` also
+  floored at `44.0.1` for CVE-2024-12797 while CI was free to install `41`.
+  One range, `>=46,<51`, now covers every manifest, Dockerfile and workflow,
+  including `packages/aisoc-cli`, whose Ed25519 plugin signatures the API
+  verifies. `PyJWT` was unbounded in eight workflow install paths and is now
+  `>=2.8,<3` everywhere; `poetry` itself was 1.7.1 in five images, 1.8.2 in
+  three and unpinned in two workflows, and is now `2.4.1` everywhere.
+
+- **`ruff` was declared six different ways while `ruff format --check` gated
+  on one of them.** `services/api` permitted `<0.17.0`, `fusion` `^0.2.0`,
+  the published packages `>=0.3`, and the devcontainer installed it unpinned —
+  while CI enforces `>=0.4.4,<0.5`. A contributor installing their own service's
+  dev group got a ruff that reformats the tree and reds their PR with no
+  dependency change in the diff. All fourteen declarations now read
+  `>=0.4.4,<0.5`. The devcontainer also told contributors to `uv sync` against
+  `services/api/uv.lock`, which has never existed in this tree.
+
+- The workspace-wide `esbuild` override ban now applies to every install
+  root instead of the repository root alone. `apps/mobile` was the one place
+  the mistake that broke Turbopack's font import map could have been
+  reintroduced without anything noticing, because its bundler is Metro and
+  the damage would surface in a different workspace.
+
+- **Dependabot proposed Expo SDK 57 packages for an SDK 54 app, from an entry
+  that was never meant to see them.** `pnpm-workspace.yaml` excludes
+  `apps/mobile` with a `!apps/mobile` negation and pnpm honours it — the root
+  lockfile has no `apps/mobile` importer. Dependabot's manifest scan does
+  not: it expands `apps/*`, finds `apps/mobile/package.json` and proposes
+  updates for it from the root `/` entry, where none of the Expo holds
+  written into the dedicated `/apps/mobile` entry apply. The result was
+  `expo-constants 18.0.14 -> 57.0.19` — a release-train version, not a
+  package version — carrying no lockfile change at all, since from the root
+  entry's point of view the lockfile is the root one and the package is not
+  in it. `pnpm install` resolves it to `expo-router 6.0.24 unmet peer
+  expo-constants@^18.0.13`, while `tsc --noEmit` stays green, so the mobile
+  job would have passed. Fixed with `exclude-paths: ["apps/mobile/**"]` on
+  the root entry, which is version-updates-only and so leaves that
+  directory's security alerts with the entry that owns them.
+
+- **The root entry's holds are written per dependency name, so a breaking
+  major of anything not already on the list still arrives as an ordinary
+  weekly bump.** `vitest` 4.1.11 → 5.0.1 was the demonstration. Every
+  `ignore` in that entry names a specific package someone had already been
+  burned by — `eslint`, `typescript`, `storybook`, `@storybook/*` — and
+  nothing holds majors as a class, so "stop proposing breaking majors"
+  described four names rather than a rule. Measured on the proposal: all 59
+  test files and all 615 tests passed, then the run failed with 59 unhandled
+  rejections reading `TypeError: Expected string coverage payload, received
+  object` from `V8CoverageProvider.onAfterSuiteRun`, and a coverage report of
+  `All files | 0 | 0 | 0 | 0`. vitest 5 changed the V8 coverage payload
+  shape and `@vitest/coverage-v8` stayed on 4.1.10, because its own manifest
+  range was still satisfied and it peer-requires `vitest` at an *exact*
+  version rather than a range. Separately, the root `pnpm.overrides` pins
+  `@vitest/mocker` to `>=4.1.11 <5` while `vitest@5.0.1` depends on
+  `@vitest/mocker@5.0.1`, so the override wins silently and the proposal's
+  lockfile carries a vitest 5 runtime with a vitest 4 mocker. Held at the
+  major for `vitest` and `@vitest/*`, and grouped within the major so the
+  exact-version peer pair stops drifting — `pnpm install` on the current
+  lockfile already reports `unmet peer @vitest/coverage-v8@4.1.11: found
+  4.1.10`, which is survivable inside a major and is why nobody had noticed.
+
+- **`update-types: ["version-update:semver-major"]` cannot hold a 0.x
+  dependency, so the Storybook hold covered every member of the family
+  except the one that needed it.** For a pre-1.0 package the breaking change
+  arrives in the minor slot, and `@storybook/test-runner` is the only
+  pre-1.0 member: 0.23.0 declares
+  `peerDependencies: { storybook: "^0.0.0-0 || ^8.2.0 || ^9.0.0" }` and
+  0.24.5 declares `"^0.0.0-0 || ^10.0.0 || … || ^11.0.0-0"`. Its version line
+  is independent of Storybook's the way the Expo packages' are, but its peer
+  tracks the Storybook major exactly, so 0.24 is the Storybook 10 line of
+  the package and installs against this workspace's `storybook@9.1.20` as an
+  unsatisfied peer. Nothing in CI could catch it — no workflow runs
+  `test-storybook`, and the only Storybook job runs `build-storybook`, which
+  never loads the runner — so the proposal was green on all 22 required
+  checks while migrating the whole jest tree 29 → 30 underneath it. The
+  minor channel is now held for that package alongside the family's major.
+
+- **The `services/realtime` Dependabot entry let the eslint family arrive one
+  package at a time.** `@eslint/js@10.0.1` declares
+  `peerDependencies: { eslint: "^10.0.0" }`, so bumping it alone against this
+  service's `eslint@^9` installs a tree `npm ls` reports as `invalid` in nine
+  places — and nothing else notices: `npm ci`, `tsc`, `eslint src test` and
+  the test run are all green on it, and the effective rule set grows by three
+  rules rather than shrinking. Unlike the root workspace this service does
+  not use `eslint-plugin-react`, and `typescript-eslint@8.70.1` already
+  accepts `eslint@^10`, so the family is grouped rather than held: it can
+  move whenever all of it arrives in one reviewable pull request.
+
+- **The `services/api` pip entry had no holds, against two ratchet gates.**
+  `ruff` is declared in fourteen files (a count
+  `scripts/check_dependency_pins.py` enforces agreement across) and `mypy` in
+  six, plus `.github/workflows/ci.yml` for both, and Dependabot can only edit
+  one of them.
+  Measured rather than assumed: `ruff` 0.16.8 reformats 90 files and reports
+  3 lint errors where the pinned 0.4.10 reports `All checks passed!` and
+  `1229 files already formatted`; `mypy` 2.3.1 makes
+  `scripts/check_mypy_baseline.py` exit 1 with 35 `(tree, file, code)`
+  entries no longer matching. Both failures land on the required
+  `Python — Lint & Type-check` check, which is to say on every open pull
+  request rather than on the bump's own. Held at the majors (and, for `ruff`,
+  the minors, since 0.4 → 0.16 is a minor step under semver while 0.4.x
+  patches still flow). `sqlglot` is deliberately *not* held: an `ignore` rule
+  suppresses security updates as well as version updates, and a single-path
+  sqlglot bump already cannot merge because `scripts/check_sqlglot_pin.py`
+  fails closed when the seven install paths disagree.
+
+- `.github/dependabot.yml`'s `apps/mobile` entry gains the `typescript`
+  semver-major hold that the `/` and `/services/realtime` entries already
+  carry. Its CI gate is `tsc --noEmit`, so it was the only Node install root
+  running `tsc` without the hold — the same shape as the `image-size`
+  finding, a decision taken for the workspace that never reached the root
+  installing separately.
+
+- **`_SECRET_PATTERNS` was declared with a type its value cannot have, which
+  switched off checking of the secret-masking loop.** The annotation in the AI
+  SDK's redaction module read
+  `tuple[tuple[str, re.Pattern[str]], None | str] | tuple`, whose first member
+  is a two-element tuple — structurally impossible for the eight-pair value, so
+  it only ever matched through the bare `| tuple`. That erases the element type
+  to `Any`, which is why nothing objected to calling `.subn` on something typed
+  as possibly a `str`. In a path whose job is to stop secrets leaving the
+  process, a checker that has been silently switched off is worse than none.
+  Declared `tuple[tuple[str, re.Pattern[str]], ...]`, which is what it is.
+
+- **Five LLM input-contract handlers raised `TypeError` instead of degrading.**
+  `/translation`, `/phishing`, `/knowledge-base`, `/hunts` and `/detection-loop`
+  each catch `LLMContractViolation` — the untrusted-input boundary refusing a
+  prompt — and logged it as `logger.warning("<event>", reason=exc.reason)`.
+  `logger` is `logging.getLogger`, not structlog, and the stdlib `Logger`
+  rejects an unknown keyword with a `TypeError`. An exception raised inside an
+  `except` block is not caught by a sibling handler, so the `except Exception`
+  sitting directly beneath it never saw it: the one path whose job is to
+  degrade gracefully was the only path that raised. `phishing.py` carries a
+  comment explaining that the log line was added *because* the handler used to
+  swallow everything — the fix for the silent failure was itself throwing. Only
+  six of thirteen trees declare `[tool.mypy]`, so an AST scan swept the rest of
+  `services/` and `packages/`; those five were the only instances repo-wide.
+
+- **Six guards inspected a different call's result from the one they
+  guarded.** `x.get(k) if isinstance(x.get(k), dict) else {}` calls `get`
+  twice; it is safe for a plain dict and that is not a property anything
+  enforces, which is what the twenty `union-attr` findings underneath it were
+  reporting. Fetched once and then tested, in `playbook_step_dispatch`,
+  `siem_writeback` and `sla`.
+
+  Together with a `_compute_durations` return annotation that claimed
+  `dict[str, int | None]` while returning a `str` severity, these take the mypy
+  ratchet from 690 to 656. `packages/sdk-py` declared `[tool.mypy]` with no
+  `python_version`, so it was type-checked against whichever interpreter the
+  job ran and its share of the baseline moved with CI rather than with the
+  code; it is pinned to 3.11 like the other five, and the toolchain gate now
+  fails on a tree that asks to be type-checked without saying against which
+  Python. What remains on the ratchet is annotation hygiene and artefacts of
+  the deliberate no-dependencies environment the baseline is recorded in — the
+  19 surviving `union-attr` are all `mock.call_args` in tests.
+
+- **A cancelled context-graph walk crashed the context bundle.**
+  `_fetch_neighborhoods` and `_fetch_ueba_baselines` filter
+  `asyncio.gather(..., return_exceptions=True)` results with
+  `isinstance(r, Exception)`, then unpack the survivors as a tuple.
+  `asyncio.CancelledError` is a `BaseException` and not an `Exception` on 3.8+,
+  so a cancelled child task passed the filter and reached the unpack as
+  `TypeError: cannot unpack non-sequence CancelledError`. `services/slack-bot`
+  carries a comment spelling out this exact trap; these two sites got it wrong.
+  Both now filter on `BaseException`.
+
+- **A Google Workspace key that was valid JSON but not an object failed inside
+  the JWT signing path.** `json.loads` returns a `str`, `list` or `int` for a
+  document that is valid JSON and not an object, and the constructor accepted
+  it; the failure surfaced later as `TypeError: string indices must be integers`
+  at `self._key["client_email"]`, at the moment an operator triggered a live
+  action. The configuration is wrong either way — it now says so when the
+  credential is saved rather than when it is used.
+
+- **`DEFAULT_SLA_TARGETS` was declared twice with disagreeing bodies, and
+  neither matched the migration.** The second definition won by being later in
+  the file and put `info` at `(480, 1440, 2880)`; the first said
+  `(240, 960, 2880)`; migration 040 seeds `(240, 1440, 4320)`. A tenant's
+  info-tier deadline therefore depended on whether it had a seeded row
+  (240 min) or fell back to Python (480 min) — and `alert_queue` reads exactly
+  this row as the `sla_due_at` catch-all for severities outside the four-tier
+  ladder. One definition now, matching the migration, which is what is in the
+  database.
+
+- **`diff_fingerprints` was declared to return `dict[str, list[str]]` and never
+  has.** It returns `unchanged_count` as an `int`, which the connector
+  scheduler stores and a test asserts on. Because the scheduler assigns the
+  result straight into a `dict[str, Any]` variable, the wrong declaration
+  narrowed that variable and made the three correct lines underneath it look
+  like type errors instead — one wrong annotation producing four findings across
+  two modules. Declared `dict[str, Any]`, which is what both consumers and the
+  JSONB column already expect.
+
+- **`posture_loader` returned `None` from a function declared to return a
+  dict** when a 200 response carried no `config` key, while the non-200 branch
+  immediately above already returned `{}` for the same "nothing to load"
+  outcome.
+
+- **A load generator that could tick forever and send nothing.**
+  `services/demo-producer` silently `continue`d when `http.NewRequestWithContext`
+  failed, which only happens for a malformed URL — the one error in that
+  loop no retry can clear. It now says so and stops.
+
+### Removed
+
+- **The identity timeline's phantom second source.** It queried a table named
+  `aisoc_events` that no migration creates, nothing writes to, and that appears
+  nowhere else in the repository — with its failure swallowed at `DEBUG`. It
+  read as a second source of evidence while returning nothing on every
+  deployment. The remaining source now reports itself on the response
+  (`sources_unavailable`) when it cannot be read, so an empty timeline caused
+  by a broken query is distinguishable from one caused by no matches.
+
+- **The Chronicle warehouse scaffold.** It read `hunt.translated_query["udm"]`,
+  nothing in the repository emits UDM, and it gated on two settings that were
+  never fields — so it could not be selected and could not run, while
+  `available_providers()` reported it as a supported warehouse. Adding a real
+  one is a `register_provider` call plus a UDM translator.
+
+### Security
+
+- **Fifty-eight routes across four services carried no authentication at all,
+  and the previous gate could not see them.** `check_route_tenant_scope.py`
+  asks a conditional question — *if* a route takes a tenant, where did the
+  tenant come from — so a route that takes no tenant was never in its reach.
+  37 `services/agents` routes took none. Reproduced against the real routers
+  with credential material configured, so the result is not "the service was
+  unconfigured": an anonymous caller with no `Authorization` header created a
+  playbook (201), listed all 64 (200), **executed one** (202) and deleted it
+  (204), then read copilot conversations and ran a threat hunt. All seven
+  refuse with 401 now, while a valid console session still gets a non-empty
+  response.
+
+  `services/agents` keeps **dual-mode** auth rather than a bearer-only
+  scheme, because the console reaches it directly through a Next rewrite on a
+  session cookie: the guard is #813's `require_console_or_service_auth`,
+  extended rather than replaced. Its WebSocket could not use the same
+  dependency — a browser cannot set an `Authorization` header on a handshake,
+  and an `HTTPException` has no defined rendering on a WebSocket scope — so
+  `_ws_principal` reads the credential from the header or `?token=`, verifies
+  it with the *same* vendored logic, and closes with 1008 before `accept()`.
+  That route previously took its tenant from a query parameter defaulting to
+  the literal `"default"`, which names no tenant anywhere in this schema, and
+  would start a fresh investigation on the connection.
+
+  Also closed: `connectors` (9 data routes, including the one that decrypts a
+  saved instance's credentials to test them and the two that push into a
+  customer's ITSM), `fusion` (5), `osquery-tls` (7), `threatintel` (1),
+  `actions` (1) and 20 in `services/api` — among them `PUT /deployment/config`,
+  `POST /deployment/airgap/bundle`, `POST /compliance/evidence/collect`, both
+  LLM-backed `/translate` routes and the seven STIX/TAXII routes.
+
+  Two counts in the original report were **wrong, in the safe direction**, and
+  the reason matters: `slack-bot` (5) and `teams-bot` (4) were never open. An
+  AST pass sees no `Depends` and calls a route unauthenticated, but Slack Bolt
+  verifies a request signature, `/approval-card` compares a shared internal
+  token in constant time, and the Teams webhook verifies an HMAC-signed card
+  payload with a replay window. `scripts/check_route_auth.py` models these as
+  **conditional** exemptions that name the verifier and lapse the moment the
+  handler stops calling it.
+
+- **Thirty routes across six services let the caller name the tenant they were
+  reading.** `/fusion/entity-risk/*` was the reported instance and the worst
+  one: three routes on the API gateway and three on the fusion service took
+  `tenant_id` as a query parameter with no auth dependency at all. The console
+  reaches fusion *directly* through a Next rewrite when `FUSION_URL` is set, so
+  those routes were reachable from any browser on the internet, and an
+  anonymous request naming another tenant's UUID returned that tenant's
+  entity-risk queue, stats and per-entity detail. The engine's own docstring
+  asserted the missing control — "the tenant_id is part of the key prefix and
+  the API service re-checks tenant on read" — and the second half was not true
+  on either side. Key prefixing isolates whichever tenant it is handed;
+  validating the parameter's *value* fixes nothing, because a UUID that parses
+  is still a UUID the caller chose.
+
+  An AST pass over all 600 routes in `services/` found the same shape in five
+  more places, in two flavours. Taking a tenant with no authentication:
+  `services/agents` `/triage/{run_id}`, `/cases/{id}/triage`,
+  `/cases/{id}/investigate`, `/investigations` and `/explain`; and six
+  `services/osquery-tls` routes. Taking one *with* authentication but never
+  intersecting it with the caller's scope: `honeytokens`, `purple-team` and
+  `ueba`, where a router-level service token proved the caller was a trusted
+  service but said nothing about which tenant it was acting for.
+
+  The tenant now comes from the credential. A new
+  `app/security/tenant_scope.py`, vendored into the six services that need it,
+  resolves either a console session (the first-party HS256 access token, whose
+  verified `tenant_id` claim is authoritative) or a trusted service declaring
+  the tenant it acts for on `X-AiSOC-Tenant-ID`. A `tenant_id` on the request
+  survives only as a *filter*, intersected with that scope, so an MSSP
+  operator can still narrow to one managed customer while naming an outside
+  tenant narrows to nothing and returns 403. A service token that declares no
+  tenant resolves to an empty scope and is refused: absent is never all, which
+  is the shape every cross-tenant leak in this codebase has had. The HS256
+  verification is stdlib-only and mirrors `services/realtime/src/auth.ts`,
+  rejecting `alg: none`, a refresh token presented for access, and an expired
+  or wrongly-signed token.
+
+  Closing these surfaced a worse variant the parameter audit could not see:
+  eight routes matched on an id with **no tenant predicate at all**.
+  `honeytokens` `GET/PATCH/DELETE /{token_id}` and `/{token_id}/triggers`,
+  `purple-team` `PATCH /executions/{id}/detection` and the three
+  `/tabletop/{session_id}` routes, and `ueba`
+  `PATCH /anomalies/{id}/acknowledge`. Any caller could read, revoke or delete
+  another tenant's honeytoken, overwrite another tenant's detection outcome,
+  or acknowledge away another tenant's anomaly by naming its UUID. All eight
+  now filter on the caller's tenant as well as the id, so a foreign row is a
+  404 — which is what it is, from that caller's point of view.
+
+- **Any authenticated user could disable detection rules inside any other
+  tenant.** `_ensure_mssp_parent`, the guard on the MSSP write surface, had
+  `pass` for a body. Four routes took a caller-supplied child tenant id and
+  wrote it onto a row without checking whose child it was.
+
+  The consequential one was `POST /api/v1/mssp/overrides`. An override with
+  `action: "exclude"` is read back by `resolve_effective_rules`, filtered on
+  `child_tenant_id == <the reader's tenant>`, and the rule is popped out of the
+  set `POST /api/v1/rules/hunt` runs. So naming another tenant's id silently
+  deleted a named detection from their hunts, and the victim's only symptom was
+  a hunt that stopped matching. Reproduced against the previous commit: a
+  tenant's effective ruleset went from one critical cloud rule to zero on an
+  override written by an unrelated tenant.
+
+  Closing those four routes alone would not have been enough, because
+  `POST /api/v1/mssp/children/{id}/onboard` let anyone *become* the parent
+  first — its only check was a `409` when the target already had a parent, so
+  every standalone tenant on a deployment was adoptable by any authenticated
+  user. Adoption now requires the child to have invited that specific parent by
+  setting `settings.mssp_parent_invite` through `PATCH /api/v1/tenants/me/settings`,
+  which only ever writes the caller's own row and is gated on `settings:write`.
+  The invite is single-use. The child-scoped routes answer `404` rather than
+  `403` for a tenant that is not yours, so they cannot enumerate tenant UUIDs.
+
+- **`/api/v1/identity-timeline` read every tenant's alerts.** Both routes bound
+  an authenticated user and never used it: the SQL against `aisoc_alerts`
+  carried no `tenant_id` predicate, so any authenticated caller could pull any
+  tenant's alerts whose title or evidence matched a substring — and the
+  substring is the search term, so the match is caller-controlled. Both routes
+  are now scoped to the caller's tenant.
+
+- **`/api/v1/playbooks` had no authentication at all.** The module declared no
+  `Depends` of any kind across eight routes and there is no global auth
+  middleware, so every route was reachable unauthenticated — including
+  `POST /playbooks/{id}/run`, which executes a playbook against the estate.
+  Each route now demands `playbooks:read`, `playbooks:write` or
+  `playbooks:execute`; all three permissions already existed in
+  `ROLE_PERMISSIONS` and had no reader. `:execute` stays distinct from
+  `:write` so an analyst can run a governed playbook without editing one.
+
+- **`scripts/check_tenant_query_predicates.py` — the predicate question.**
+  Closing the parameter shape surfaced eight routes matching on an id with no
+  tenant predicate; the sweep that found them was opportunistic. This gate
+  asks the question structurally over the whole tree, and the model and table
+  inventories are **derived from the tree** (a model's `tenant_id` column, the
+  migrations' DDL) rather than listed, so a new migration cannot slip past.
+  It matters most where nothing stands behind it: of 95 tenant-scoped tables
+  only 31 carry an RLS policy, and RLS engages only on a session that ran
+  `SET LOCAL app.current_tenant_id`.
+
+  Real leaks it found beyond the known eight:
+
+  - `GET /graph/attack-path/{case_id}`'s **relational fallback** read
+    `aisoc_cases` by id with no tenant predicate. The primary Neo4j path is
+    scoped, but the fallback runs precisely when that path failed — and its
+    own docstring says it exists so deployments without a graph database keep
+    working, i.e. permanently for many of them. An authenticated caller naming
+    another tenant's case UUID got its title, severity, MITRE techniques and
+    alert ids.
+  - `GET /osquery/distributed/{query_id}` was **both** unauthenticated and
+    unscoped. `osquery_distributed_query` has no `tenant_id` of its own — it
+    is reached through its node — so the lookup now joins onto
+    `osquery_node.tenant_id`. Demonstrated with two seeded tenants: before,
+    tenant B naming tenant A's `query_id` got A's host telemetry back; after,
+    nothing.
+  - `alert_explain._resolve_rule_lineage` selected a detection rule by an id
+    lifted out of the alert's `raw_event` — vendor-supplied, so a crafted
+    event could name another tenant's rule and have its definition explained
+    back.
+  - The ITSM webhook inserted its system comment into `aisoc_case_comments`
+    **without `tenant_id` at all**, leaving rows belonging to no tenant since
+    migration 044 added the column.
+  - Thirteen by-id writes (`alerts` escalate/snooze/update, four `connectors`,
+    three detection-rule routes, `claim_alert`, `run_saved_hunt`) were scoped
+    only by a preceding read. Not exploitable as written, and one reorder from
+    being scoped by nothing.
+
+  What cannot be decided statically sits on a **shrink-only ratchet** — 34
+  entries, each with a reason, `MAX_RATCHET` asserted against the table's
+  length, and an entry whose statement is now scoped failing as *stale*. That
+  last property caught two of this change's own edits.
+
+- **Row-level security covered 31 of 95 tenant-scoped tables; it now covers 92,
+  and the seven policies that already existed but could never work are
+  repaired.** On the other 64 tables the query predicate was the only thing
+  between two customers, so one missing `WHERE tenant_id` was a leak rather
+  than something a second layer caught — which is not the design the
+  repository documents. `060_rls_coverage.sql` adds a policy to every
+  remaining table in the API chain, and the four services that manage their
+  own schema (honeytokens, osquery-tls, purple-team, ueba) each carry a
+  matching alembic revision. The three that remain are named rather than
+  rounded away: `users` is excluded so authentication can resolve a principal
+  before a tenant exists, and `case_tasks` / `case_timeline` are ORM models
+  that no migration creates.
+
+  Four things found along the way, each invisible for the same reason:
+
+  - **The application bypasses RLS entirely.** `docker-compose.yml` and the CI
+    service containers run every service as `POSTGRES_USER=aisoc`, which the
+    postgres image creates as a superuser, and a superuser ignores policies
+    even under `FORCE ROW LEVEL SECURITY`. Measured, not inferred: with two
+    alerts seeded one per tenant and the session bound to tenant A, that role
+    sees both and a `NOSUPERUSER NOBYPASSRLS` role sees one. The security doc
+    claimed the opposite — "there is no superuser escape hatch via the
+    application's DB role" — and now carries the grant that makes it true.
+  - **Seven policies were keyed on a session variable nothing sets.**
+    `alert_sla_events` and `tenant_sla_config` read `app.tenant_id`;
+    `custom_parsers` and `retention_policies` read `app.current_tenant`;
+    `compliance_evidence` had no unset-context arm. All five returned zero
+    rows once RLS engaged. `external_assets` and `external_asset_drift` called
+    `current_setting` without `missing_ok`, so an unbound session raised
+    `unrecognized configuration parameter` instead. All seven are normalised
+    to the canonical predicate.
+  - **The agents service had the mirror-image bug.** Its four
+    `_set_rls_context` helpers wrote `app.tenant_id` while every policy reads
+    `app.current_tenant_id`, so the scoping they exist to provide had never
+    been applied — the policies fell through their fail-open arm every time.
+  - **Five tables had RLS enabled without `FORCE`**, so the table owner —
+    which is the application — walked past the policy regardless.
+
+  `tests/isolation/test_postgres_rls.py` is the evidence, wired into
+  `integration.yml`'s migrations job where a real database with the full chain
+  already exists. It seeds an A row and a B row into every RLS-covered tenant
+  table (80 of 80 in the API chain), asserts both are visible unscoped before
+  asserting either absence, then binds the session to A and asserts B's row is
+  unreachable. It also asserts the shipped role's bypass, so a green run here
+  can never be read as "tenant isolation is on in production".
+
+- **The attack-path relational fallback is verified against a real Postgres.**
+  `GET /graph/attack-path/{case_id}` reads `aisoc_cases` by id whenever the
+  Neo4j traversal fails — which for a deployment shipping no graph database is
+  always. It gained a tenant predicate in the previous release, but that fix
+  was covered by a gate and by review only: the statement uses
+  `CAST(:cid AS UUID)`, which SQLite mangles, so no offline suite could execute
+  it. Tenant B naming tenant A's case UUID is now demonstrated to be refused
+  against the database the query is written for, with tenant A's row asserted
+  present first.
+
+- The case-timeline linked-alert hydration in `cases.py` now binds a tenant as
+  defence in depth. Reaching it already required a tenant-scoped case, so this
+  was not a live read, but a poisoned `alert_ids` array would otherwise have
+  surfaced another tenant's alert title.
+
+- **`services/osquery-tls` enrolled every node under the literal `"default"`,
+  which resolves to no tenant on any seeded deployment.** The service keys
+  `tenant_id` as a `String(64)` while the platform keys UUIDs, and nothing
+  translated. Migration `001` seeds the canonical tenant with slug `default`,
+  but the demo seed renames that slug to `demo`, so the literal matched
+  neither the UUID nor the slug and silently matched nothing: FIM events were
+  written under a string the console could never ask for, and the FIM surface
+  returned an empty table that looked like "no file changes" rather than "the
+  read and the write disagree". `app/services/tenant_resolver.py` now resolves
+  the placeholder to the canonical seed tenant by its **stable UUID** —
+  ignoring whatever the slug has been renamed to — falling back to the sole
+  tenant of a single-tenant install, and refusing enrolment for a genuinely
+  unknown ref rather than filing the node under an unreadable tenancy. Skips
+  log at `warning` with the ref; a silent `debug` skip is how the original bug
+  survived.
+
+- **The maintainers' hosted origin shipped in the default CORS allow-list of
+  nine services.** `services/{api,agents,connectors,honeytokens,purple-team,ueba}`
+  (six byte-identical copies of the shared `cors.py`), `services/realtime`, and
+  the Go `ingest` and `enrichment` servers all listed `https://tryaisoc.com` and
+  `https://www.tryaisoc.com` among the origins they trust when
+  `AISOC_CORS_ORIGINS` is unset. That is one deployment's public origin baked
+  into every self-hosted install, trusted for credentialed cross-origin
+  requests its operator never opted into — and if that domain ever changed
+  hands, the grant travels with it. The default is now local development only;
+  the hosted deployment already sets `CORS_ORIGINS` explicitly
+  (`infra/fly/api/fly.toml`), so nothing legitimate depended on the default.
+  `apps/docs/docs/deployment/env-vars.md` documented the old list and was
+  corrected with it, and a new gate pins the six vendored `cors.py` copies
+  byte-identical — nothing enforced that before, and a single drifted copy is
+  exactly how one service would quietly keep the origin.
+
+- **The seeded demo identity was a live, operator-owned domain.**
+  `demo@tryaisoc.com`, paired with a published password, appeared across
+  compose, fly, render, coolify, railway, two workflows, the web Dockerfile and
+  the docs. It told a self-hoster to type somebody else's hostname to sign in
+  to their own install, and published a well-known credential pair against a
+  real domain. Now `demo@example.com` — RFC 2606 reserved, so it can never be
+  registered and can never receive mail, and it still satisfies the
+  `pydantic.EmailStr` check that rejected the earlier `demo@aisoc.local`. Every
+  config and doc moved with it. Safe to re-run: `seed_demo._ensure_user`
+  reconciles on `DEMO_USER_ID`, not on the address, and rewrites a stale email
+  in place.
+
+- **`scripts/check_route_auth.py` — default-deny over all 601 routes.** Every
+  route must carry an auth dependency or appear in one of three tables, each
+  recording why it is public. It reuses the tenant-scope gate's AST collector
+  rather than adding a second parser: building it surfaced that
+  `playbooks.py`'s `ExecuteUser = Annotated[AuthUser, Depends(require_permission(...))]`
+  was reported as an unauthenticated playbook-run, because the vocabulary
+  listed `ReadUser` and `WriteUser` and nobody thought of the third. Auth
+  aliases are now resolved by **what they wrap**, which removes the naming
+  dependency in both directions — the reflex fix of appending the new name to
+  the list is how a list stops describing anything. State after: 517
+  authenticated, 73 public with a recorded reason, 11 verified in-band, 0
+  unexplained.
+
+- **`approval_timers` is in a migration and carries a policy.**
+  `services/slack-bot`'s `PostgresTimerStore` created it at startup with
+  `CREATE TABLE IF NOT EXISTS`, outside every chain in the repository — so
+  `060_rls_coverage.sql` never saw it, it had no `tenant_id` for a policy to
+  filter on, and it decides whether a pending containment auto-rejects. Under
+  the DML-only runtime role the DDL itself fails, because Postgres checks the
+  schema ACL before the existence test, and `main.py` caught that into a
+  warning and fell back to the non-durable store: durable approval timers
+  would have quietly stopped being durable. `062_approval_timers.sql` adds the
+  table, a `tenant_id`, and the canonical policy; the store probes with
+  `to_regclass` and refuses with the migration's name rather than creating
+  anything, carries the tenant in every statement, and binds
+  `app.current_tenant_id` on each pooled connection so the policy engages too.
+  A deployment already carrying the runtime-created table converges on the
+  same shape, with its existing rows defaulting to an empty `tenant_id` that
+  the migration says how to backfill.
+
+- **The zero-CodeQL-alert invariant was documented for four months with
+  nothing enforcing it.** `apps/docs/docs/operations/security.md` has said
+  since 2026-05-15 that "the Python alert count on `main` is zero, and we
+  treat that as a CI gate — a new alert breaks the security workflow". No such
+  gate existed anywhere in the repository. `codeql.yml` uploads SARIF and
+  `github/codeql-action/analyze` does not fail a build on findings; `main` has
+  no branch protection, so "Code scanning results" was not a required check
+  either; `security.yml`'s only hard job is the claim-to-gate matrix; and
+  nothing in the tree queried the code-scanning API. The scan itself was
+  healthy — `main` was analysed continuously, most recently minutes before
+  this was written — so the usual stale-green and mixed-`codeql-action`-pin
+  traps were both ruled out. The enforcement was simply imaginary, which is
+  why two `note`-severity alerts could sit open on `main` under a documented
+  count of zero.
+
+  `scripts/check_codeql_alerts.py` is that gate, wired into the new
+  `.github/workflows/codeql-alert-gate.yml` on push to `main`, on pull
+  requests, on a `workflow_run` after CodeQL finishes, and daily. It fails on
+  any open CodeQL alert at **any** severity — `note` included, since both
+  motivating alerts were `note` and carried no `security_severity_level`, so a
+  threshold anywhere would have reproduced the original silence exactly. It
+  also refuses the vacuous pass: an unanalysed ref, a declared language with
+  no analysis, an analysis older than ten days, or one belonging to a
+  different commit than the one that triggered the run are all failures rather
+  than a clean bill of health, and an input it cannot read exits 2 rather than
+  0. Dismissed alerts stay excluded — that is GitHub's audited escape hatch
+  and the repository uses it for ~20 accepted-risk
+  `py/request-without-cert-validation` findings — but the count is printed on
+  every run so a silent mass-dismissal is visible. `--self-test` injects an
+  alert at each severity plus every shape of vacuous pass and requires the
+  gate to catch all ten; CI runs it immediately before the gate itself.
+
+- **`scripts/validate_playbooks.py` printed to stderr and called `sys.exit(2)`
+  while being imported** (CodeQL `py/print-during-import`, alert #896). Beyond
+  the note, this was a live defect:
+  `scripts/check_playbook_schema_parity.py` imports the module to read
+  `SUPPORTED_TRIGGERS` and wraps the import in `except Exception`, which
+  cannot catch `SystemExit` — a broken environment would have killed the
+  parity gate's interpreter instead of producing its diagnostic. The import
+  now raises `ImportError`, which that handler catches.
+
+- **`python-jose` is gone, and `ecdsa` with it.** `ecdsa` carried
+  CVE-2024-23342 (Minerva timing attack on P-256) with no patched release —
+  OSV records the affected range as introduced at 0 with no fixed event,
+  because upstream states python-ecdsa offers no side-channel resistance and
+  will not fix it. It was an unconditional requirement of `python-jose`, so
+  the suppression was renewed rather than resolved. `services/api` now signs
+  and verifies with `PyJWT`, which it already depended on for the OIDC and
+  SAML paths; `python-jose`, `ecdsa` and `rsa` all leave the dependency tree.
+  Six CI workflows installed `python-jose[cryptography]` and never installed
+  `PyJWT`, and reached `cryptography` — a declared direct dependency of
+  `services/api` — only through that extra; they now install both by name.
+
+- **`image-size` moved to a patched release instead of staying suppressed.**
+  Both advisories were held open on the reading that no fix existed. They
+  record a vulnerable range of `<= 2.0.2`, and npm has published 2.0.3 and
+  2.0.4; a null `first_patched_version` is not the same claim as no fix
+  existing. A pnpm override pins `>=2.0.4 <3`, which
+  `@docusaurus/mdx-loader`'s `^2.0.2` range accepts. This clears the only two
+  high-severity advisories in the pnpm workspace.
+
+- **`apps/mobile` resolved a vulnerable `image-size` that the workspace had
+  already fixed.** Two high-severity advisories — GHSA-5p2g-fcmc-qvqq
+  (CVE-2025-71329, JXL/HEIF parsers) and GHSA-w3rx-r6r6-pgpr
+  (CVE-2025-71330, ICNS parser), both infinite-loop denial of service, both
+  fixed in 2.0.3 — stayed open against `apps/mobile/pnpm-lock.yaml` for a
+  structural reason rather than an unfixed one. The repository root pinned
+  `image-size` to `>=2.0.4 <3` through a pnpm override, and `apps/mobile` is
+  a deliberately independent install root with its own
+  `pnpm-workspace.yaml` and lockfile, created that way so its install would
+  stop rewriting the root lock. The override could not reach it and nothing
+  compared the two. Resolved by declaring the same override in
+  `apps/mobile/package.json`; the lockfile now resolves `image-size@2.0.4`
+  and drops its `queue` dependency with it.
+
+  Metro is the only consumer, and no version of Metro that depends on
+  `image-size` permits 2.x — every one declares `^1.0.2`, which is why
+  Dependabot recorded `security_update_not_possible` and failed its job
+  instead of opening a pull request. Metro 0.83.3's two call sites go
+  through `_interopRequireDefault(require("image-size")).default`, and
+  `image-size@2.0.4`'s CommonJS build still exports a callable `default`, so
+  `metro.getAssetSize` returns correct dimensions against it.
+
+- **The dependency suppression list is empty.** All 42 entries in
+  `scripts/security_audit_ignores.txt` were re-verified against OSV and
+  against the versions the lockfiles actually resolve. Every one was
+  resolvable, and most of the justifications had stopped being true: nine
+  starlette entries blamed a `fastapi<0.137` cap that exists in neither bot
+  service, three cryptography entries blamed `<50`/`<49` caps that exist
+  nowhere in the repository, and the langchain, weasyprint, anyio, aiohttp,
+  h2, idna and pydantic-settings entries each named a version older than the
+  one their lock resolves. The file now records what was measured, so the next
+  review starts from evidence rather than from the previous reason string.
+
+- **The pnpm and Go arms of the audit could report success without scanning.**
+  A failed `govulncheck`, an unparseable `pnpm audit` response and a registry
+  that never answered were all recorded as warnings, which exit 0 — so the job
+  printed "0 findings" for ecosystems it had not read. All three now record a
+  coverage gap, which `exit_code_for` already failed on for the Python arm.
+  That property — an unscanned target fails the build — had no test; it does
+  now.
+
+## [9.0.0] — 2026-09-23
+
+**Ten waves, and one finding under nearly all of them: the mechanism existed,
+was tested, and nothing called it.** v8.0 named that shape and found it a
+dozen times. This release went looking for it deliberately, across the whole
+tree, and found it again in the approval loop, the marketplace, the mobile
+console, the detection engine and the benchmark scoreboard. A passing unit
+test on an uncalled function is indistinguishable from a working feature
+until somebody traces the call graph, and the only defence is to trace it.
+
+The one worth stating first, because it inverts what the feature appeared to
+do: **approving an action executed nothing.** `decide()` flipped a row,
+notified the realtime service and returned 200 without ever touching
+`services/actions`. Every tap of Approve in the responder app recorded a
+decision and ran nothing — while telling the operator the opposite. That is
+the most dangerous shape a security control can have, because what it appears
+to say is "the host is contained". And the other end was missing too: nothing
+in the repository ever created an approval, so the queue had no producer
+either and was structurally empty on every deployment.
+
+### Added
+
+- **Approvals reach a human and then reach the estate** ([#731](https://github.com/beenuar/AiSOC/pull/731),
+  [#735](https://github.com/beenuar/AiSOC/pull/735)). The triage worker raises
+  one approval per proposed action that declares `requires_approval`, keyed
+  deterministically so a Kafka replay re-raises the same approval rather than
+  a second copy an operator cannot tell apart. `decide` carries the decision
+  through to `services/actions` and records on the row whether it executed, in
+  four distinct states, so "was this actually done" is answerable from the row
+  rather than by correlating two services' logs. A refusal returns 502 saying
+  the decision was stored and the action was not run.
+- **The confidence × impact approval matrix now runs.** `approval_matrix.evaluate`
+  was written, documented, unit-tested and listed in the claim-to-gate matrix
+  as GATED, with **zero production callers** — `POST /actions` gated on blast
+  radius alone, a property of the verb, so the same answer came back for a
+  40%-confidence guess and a corroborated finding. Both gates run and the
+  stricter wins, which is the composition rule the matrix already stated, so
+  nothing can auto-execute that did not before. Ten action types tighten, and
+  `/actions` becomes tier-aware for the first time.
+- **A browser-facing proxy for the live-action registry.** Every route sat
+  behind a service token, so nothing could answer "what can AiSOC do to my
+  estate". Discovery and dry-run only: a live containment goes through the
+  approval path so an approver is bound to it.
+- **`apps/mobile`, a native responder app** ([#733](https://github.com/beenuar/AiSOC/pull/733)).
+  The roadmap said the mobile console was "not started", which was true about
+  React Native and misleading about the product — the responder console
+  already existed as a PWA with a service worker, an offline approval queue
+  and Web Push. The native app is a distribution channel, and it exists for
+  one reason: iOS Web Push requires an installed PWA and has been unreliable
+  even then. Unit tests and type-check run in CI; **no device build,
+  simulator run or store submission has been performed**, and a CI gate fails
+  if the README stops saying so.
+- **`@aisoc/sdk` gained the namespaces a responder client needs** — approvals,
+  push, on-call, live actions. All were in `docs/openapi.yaml` the whole time,
+  which is why the gap went unnoticed: the generated types were complete and
+  the hand-written surface was three releases behind.
+- **Marketplace publisher identity, paid listings and entitlements**
+  ([#734](https://github.com/beenuar/AiSOC/pull/734)). Migration `056`. There
+  is no payment processor and no stub of one — wiring payments is an account
+  action. What exists is the enforcement point, which is the part that would
+  otherwise be written last and least carefully.
+- **An egress default-deny NetworkPolicy** ([#736](https://github.com/beenuar/AiSOC/pull/736)),
+  gated by `helm.yml`. Off by default, because a cluster whose CNI does not
+  enforce NetworkPolicy ignores it silently and a control that is silently
+  ignored reads as protection while providing none.
+- **Distinct counting in the windowed detection engine**
+  ([#737](https://github.com/beenuar/AiSOC/pull/737)). "Fifty reads by one
+  principal" is a script retrying; "fifty *different* secrets read by one
+  principal" is a vault being walked. Counting events cannot tell those apart,
+  and 21 of the 74 rules awaiting a windowed evaluator name a `distinct_*`
+  field.
+- **`docs/audit/DEFERRED_SUBPHASES.md`** ([#739](https://github.com/beenuar/AiSOC/pull/739)).
+  Six lettered sub-phases were "tracked in `docs/audit/PROGRESS.md`", which is
+  gitignored and was never committed — so six named commitments had no scope
+  anywhere a contributor could read.
+- **New gates:** `helm.yml` (lint, render, kubeconform, server dry-run against
+  a real kind cluster), `mobile.yml`, `check_go_module_paths.py`,
+  `check_published_packages.py`, and scoreboard staleness.
+
+### Fixed
+
+- **UEBA never scored a single message** ([#730](https://github.com/beenuar/AiSOC/pull/730)).
+  It consumed `security.events`, which nothing in the platform writes — ingest
+  writes `aisoc.raw_events`. So `ueba.anomalies` never carried a message and
+  fusion's UEBA confidence boost, on by default and fully built, could only
+  ever be inert. `feature_extraction.py` recovers the entity and features from
+  the OCSF envelope.
+- **The ingest inbox could not have worked on any deployment.** Routes mount
+  only with `DATABASE_DSN`, which no compose file set, and the templates were
+  never copied into the runtime image, so even a correctly-configured
+  deployment answered 503 for every template. Templates are `go:embed`-ed now:
+  a directory cannot be missing from an image.
+- **CrowdStrike alerts were anonymous.** The connector never read
+  `behaviors[].user_name`, and the canonical field map knew only `actor` while
+  11 of the 68 canonical-envelope connectors spell it `username` or `user`.
+  Since the correlation key is `{tenant}:{entity}:{tactic}`, they all
+  correlated as `unknown`. The alias list is a slice, not more map entries,
+  because Go randomises map iteration and three entries pointing at one
+  destination would resolve differently per process.
+- **An approved action was not the action approved.** `approve_action` rebuilt
+  `ActionRequest` without `parameters` or `principal`, so an action gated
+  *because of what it targets* ran against defaults and reported COMPLETED —
+  and the submit path never stored parameters at all, so no rebuild could have
+  recovered them.
+- **Pending actions lived in a module-global dict.** A restart lost every
+  action awaiting approval and a second replica could not see the first one's,
+  so an analyst taps Approve on a Slack card and gets "Action not found" for
+  an incident that is still live. Migration `055`.
+- **Neither ChatOps bot could send an unsolicited message.** Replies go through
+  Bolt's `respond()`, which writes to a `response_url` that only exists inside
+  an inbound interaction, so the bot could answer a question and not ask one —
+  while `rich_approval_card_blocks` sat fully written with no production
+  caller and the Approve/Deny handlers sat wired and waiting.
+- **A plugin could never be rejected for a bad signature.**
+  `_get_registered_pub_key` returned `None` unconditionally, so `publish_plugin`
+  skipped verification entirely. The signing path existed end to end, had a
+  CLI command, and was incapable of saying no.
+- **No registry allow-list and no digest pinning**, both of which the notes
+  claimed existed. There was a deny list of three metadata hostnames, and
+  nothing resolved a tag to a digest — so `:latest` stayed mutable and "what
+  is this deployment running" had no answer after the fact. The signature gate
+  does not close that: it verifies whatever arrived.
+- **`aisoc plugin publish` POSTed to a route no router has ever served.**
+  Broken as shipped.
+- **The public scoreboard was frozen for ten weeks and every check passed**
+  ([#738](https://github.com/beenuar/AiSOC/pull/738)). "Freshness" meant the
+  accuracy value was current and nothing read the row's date; the newest row
+  was taken by file position rather than by date; `--refresh` rewrote only the
+  accuracy, so a refreshed row described today's code and claimed to have been
+  measured in July. And there was no writer at all — `live-agent-eval.yml` had
+  `contents: read`.
+- **Neither published Go SDK was installable.** Both declared
+  `github.com/beenuar/aisoc/<name>` — wrong case against a case-sensitive VCS
+  path, missing the `packages/` prefix. Every in-repo consumer used a `replace`
+  directive, which is the shape that hides this: the tree builds perfectly and
+  the artifact does not exist.
+- **The Helm chart did not render.** `helm template` fails outright until
+  dependencies are fetched, and no documentation said to fetch them — nor to
+  `helm repo add bitnami` first, which a clean machine also needs.
+- **OpenSearch was recorded as dead code and is not.** The check had been made
+  against `services/api`, which holds no OpenSearch client, and never against
+  `services/threatintel`, which indexes into it in its lifespan with no flag
+  and no `try`. Two real defects were hiding under the wrong verdict: compose
+  set an env var that service discards, so the connection worked by
+  coincidence, and it declared no dependency on OpenSearch so it raced it at
+  boot.
+- **One connectivity check at boot is a coin toss.** The graph writer verified
+  Neo4j once and a failure disabled it for the process lifetime; compose
+  cannot express "depend on neo4j only in the `full` profile", so ingest lost
+  a race it had no way to wait for. The integration gate caught it
+  intermittently — the same branch passed at 21:06 and failed at 21:19.
+- Two stale comments that described working code as broken: the reachability
+  gate's claim that the windowed engine "has three hardcoded rules and no
+  loader", and the windowed exporter's claim to mirror the stateless one
+  "exactly: specs are the source of truth".
+
+### Changed
+
+- **Packaging stops moving the number.** It slipped v8.0 → v8.1 → v8.2 for the
+  same reason each time. The README now states a fact rather than a date —
+  the pipeline builds and packs all eight packages on every tag, and the
+  upload is blocked on registry credentials, which is an account action.
+  `check_published_packages.py` reads actual registry state so that claim
+  cannot go stale in either direction once credentials exist.
+- Vulnerability-match events are opt-in: every stock deployment was
+  downloading the CISA KEV catalogue at boot to publish into a topic with no
+  reader.
+- `aisoc.alerts.raw` is reclassified from dead to external entrypoint. No
+  in-repo producer is what an entrypoint *is*.
+
+### Known
+
+- **Eight of the nine `PARTIAL` claim-to-gate rows remain**, each still naming
+  its own gap. The air-gap row narrowed rather than flipping: the Helm half is
+  built and gated, platform-wide egress-blocked CI is not. Relabelling a row
+  for the half that is done is what that file exists to prevent.
+- Whether migrations 050–056 apply to an *existing* Postgres volume is still
+  untraced. Compose mounts them as `docker-entrypoint-initdb.d`, which runs
+  only on a fresh volume.
+- 133 detection rules remain unreachable. Authoring a `wd-*` rule does not make
+  a `det-*` rule reachable, so `MAX_UNREACHABLE` is unchanged on purpose.
+- The OCI install route is held back. Adding it made CodeQL flag eight
+  `py/path-injection` sites across the plugin-ingest graph; trading "a hardened
+  path with no caller" for "a reachable path with eight unresolved high
+  findings" is the worse position.
+
+## [8.1.1] — 2026-09-23
+
+**The v8.1.0 notes described a platform its own quick start never started.**
+This release contains no new capability. It exists because an adoption audit
+of the repository — installability, architecture comprehension, data
+provenance, pipeline connectivity — found that the single most-followed path
+into AiSOC did not run AiSOC, and that finding accounts for most of the
+recurring feedback on its own.
+
+`./install.sh` handed off to a nine-service compose file with **no ingest
+service, no fusion service, and `AISOC_DISABLE_KAFKA: true`**. Everything
+visible in the resulting console came from `seed_demo.py` writing fifteen
+fabricated incidents straight into Postgres. A reader followed the README, saw
+a populated console, and concluded the platform worked — having never run the
+platform. The installer printed *"AiSOC is up and running"* because the
+compose command exited 0.
+
+The good news the audit also produced: **the core pipeline does work.** It had
+simply never been demonstrated. `make smoke` now pushes one real event through
+ingest, Kafka, fusion and detection and reads the alert back from the API,
+reaching past nothing, and CI fails if any stage does.
+
+### Fixed
+
+- **The documented quick start never ran the product** ([#726](https://github.com/beenuar/AiSOC/pull/726)).
+  `install.sh` now runs `make up` — the same CORE stack the README documents
+  and CI tests — and then runs the golden pipeline, so the installer's success
+  banner reports a verified event traversal rather than a process exit code.
+  `infra/compose/docker-compose.demo.yml` is kept for screenshots and UI work
+  and now says at the top of the file that it cannot answer whether AiSOC
+  works.
+- **`services/ingest` answered `/health` unconditionally** ([#727](https://github.com/beenuar/AiSOC/pull/727)),
+  so *"ingest is healthy"* and *"every event is being dropped"* could both be
+  true at once — precisely the state a broker outage produces. `/readyz` now
+  dials Kafka rather than reading a cached connection flag, because kafka-go
+  reconnects lazily and a cached flag is stale in exactly the situation this
+  is meant to catch. Verified live: 200 with Kafka up, 503 with a reason and a
+  log hint with Kafka stopped.
+- **Three of the eight publishable packages could not be built** ([#725](https://github.com/beenuar/AiSOC/pull/725)).
+  The release pipeline builds and packs every package on each tag precisely so
+  it cannot rot while the upload is credential-gated — and on the v8.1.0 tag
+  it earned that design back. `aisoc` and `@aisoc/mcp` failed with
+  `Could not resolve "@aisoc/report-card"`: that workspace dependency's `main`
+  points at a build artifact and `pnpm --filter <pkg> build` never builds
+  dependencies, so the `...` suffix was missing. `aisoc-cli` could not produce
+  a wheel at all — `pyproject.toml` declared `packages = ["src/aisoc_cli"]`
+  *and* a `force-include` mapping the same templates directory to the same
+  wheel path, so hatchling refused on the duplicate. Neither was visible
+  anywhere but a tag. `test_packaging.py` now builds the wheel and looks
+  inside it, because a test that read the config would have declared both
+  fine.
+- **Alerts were labelled `"crowdstrike crowdstrike"`** — vendor and product
+  joined without deduplication, in two copies of the same helper, so fixing
+  one left the other. There is one shared implementation now
+  (`fusion/app/services/provenance.py::product_label`). In the same pass, an
+  alert's `description` was `str(raw_data)`, so the console showed
+  `{"command_line": "powershell.exe -nop ...` where a sentence belongs,
+  discarding the vendor's own description.
+- **Fusion defaulted its enrichment URL to `localhost:8082` — itself** — and
+  swallowed the resulting failure at `DEBUG`; and fusion declared no
+  `depends_on` for Postgres, so it raced the database on cold boot.
+- **Five surfaces rendered fabricated data outside demo mode**: the MSSP
+  overview and its managed-tenant and cross-tenant-incident lists, the
+  Copilot's reply on API error, the air-gap status endpoint reporting
+  unchecked conditions as satisfied, a hard-coded analyst identity in
+  Settings, and the investigation timeline. All are gated behind demo mode and
+  return honest empties otherwise. `seed_demo.py` refuses to run outside
+  development unless `AISOC_ALLOW_SEED=1`.
+
+### Added
+
+- **`tests/e2e/golden_pipeline/`** — one deterministic end-to-end test that
+  pushes raw telemetry into ingest and asserts each boundary independently, so
+  a break names the stage rather than the suite. Wired into CI as
+  `golden-pipeline.yml`, which also verifies the gate fails when the pipeline
+  is broken.
+- **`scripts/doctor.sh` / `make doctor`** — diagnoses Docker, Compose, disk,
+  ports, configuration, Postgres, Redis, Kafka and every service, and prints
+  the command to run next. It checks disk before Kafka and probes the broker
+  directly, because the Docker VM filling up produced a Kafka that reported
+  `healthy` while refusing every request.
+- **`/livez` and `/readyz` on `services/ingest`**, matching `services/api` and
+  `services/fusion`.
+- **`scripts/project_stats.py --check`** — derives the connector count,
+  executable detection count, compose service count and claim-to-gate totals
+  from the tree and fails CI when the README disagrees.
+- **`docs/audit/REPOSITORY_REALITY.md`** — every major component classified
+  WORKING / PARTIAL / BROKEN / DEMO-ONLY / EXPERIMENTAL / DEAD CODE by tracing
+  the implementation, not the filename. It records that OpenSearch is started
+  by the `full` profile and read by nothing, rather than drawing it into a
+  diagram as though it were part of the design.
+- **`docs/architecture/README.md`** — rewritten around *what happens when
+  AiSOC receives one security event*, with five diagrams whose every box links
+  to the directory that implements it.
+- **`docs/testing/CLEAN_INSTALL.md`** — the clean-machine walkthrough, from a
+  real run.
+- Migration `054_alert_provenance.sql` adds `is_synthetic`,
+  `synthetic_source` and `synthetic_scenario` to `alerts`.
+
+### Changed
+
+- **CORE is the default deployment profile**: ten services, roughly 6 GB, and
+  the smallest deployment that takes a real event and produces a real alert —
+  not a cut-down toy. ClickHouse, Neo4j, Qdrant, OpenSearch, enrichment and
+  connectors moved to `full`. Both heavy dependencies were already
+  environment-gated, so nothing was weakened to do this. `make up-full` sets
+  `AISOC_LAKE_WRITER_ENABLED` and `AISOC_GRAPH_ENABLED`, which the profile
+  needs and did not previously set.
+- **README rewritten for adoption** rather than release history: what AiSOC
+  does, quick start, how to tell demo data from real data, connecting real
+  sources, the data flow, project maturity per capability, and what AiSOC is
+  not.
+- **One command set.** `make install / up / up-full / down / restart / status
+  / doctor / smoke / demo / logs / test / test-unit / test-integration /
+  test-e2e / stats / clean`, consolidating the previous scattered scripts.
+- The integration workflow boots the `full` profile with the lake writer and
+  graph enabled, so it exercises the architecture it claims to.
+
+## [8.1.0] — 2026-09-23
+
+**Wave-2 features, and the gaps behind them.** Every item in the wave-2
+backlog ([#362](https://github.com/beenuar/AiSOC/issues/362)) was audited
+against the tree before any code was written, and the backlog turned out to be
+wrong in both directions: two items were already built, and four had the
+capability present with the path that feeds it broken. That is the same shape
+v8.0 found a dozen times — the mechanism exists, is unit-tested, and has no
+caller on the path that needs it — so auditing first is now the opening step
+of a wave rather than an optional one.
+
+Three of those gaps had security consequences, and one is worth stating
+plainly because it inverts what the feature appeared to do: **a Slack or Teams
+approval authorized nobody.** The bots verified who clicked, recorded them in
+an audit event, and called the actions service with no approver, so the
+permission-tier check and separation of duties were both skipped. An approval
+path that does not authorize is worse than none, because it reads as a
+control.
+
+:::warning Breaking change for ChatOps approvals
+`AISOC_ACTIONS_REQUIRE_APPROVER` defaults to `true`. If you use Slack or Teams
+approvals you **must** populate `AISOC_CHATOPS_APPROVERS` or approvals will be
+refused with a 403. Setup: `apps/docs/docs/operations/action-approvals.md`.
+:::
+
+Also in this release: the Codespaces quickstart can start Docker for the first
+time, service images are published for arm64 so Apple Silicon can run
+`pnpm aisoc:demo` at all, and packaging moves to v8.2 — the blocker is
+registry credentials rather than code, and a release cannot schedule an
+account action by writing a version number.
+
+Claim-to-gate matrix: **108 rows — 99 GATED, 9 PARTIAL, 0 NO GATE**.
+
+### Added
+
+- **Securing the customer's AI estate.** AiSOC could already ingest an
+  organisation's OpenAI and Anthropic *audit logs* — who minted an API key, who
+  was granted owner. That is control-plane governance and says nothing about
+  what the agents did once running. Of 23 capabilities leading AI-SOC products
+  compete on, 22 already existed in this tree; this was the gap, and the five
+  MCP detections already in the repo were sitting in `_quarantine/`,
+  non-executable.
+  - Two webhook templates (`ai-runtime`, `ai-finding`) and matching OCSF
+    profiles, so the push and pull paths produce the same shape. The split
+    between them is the design: routine agent activity is `6003` API Activity,
+    category 6, which the promoter leaves in the lake to be hunted, while a
+    guardrail finding is `2001` Security Finding, category 2, always promoted.
+    All-2001 would flood the queue with an agent's normal operation; all-6003
+    would leave a detected prompt injection silent in the lake. Both
+    directions are tested.
+  - `packages/aisoc-ai-sdk`, a dependency-free span emitter (enforced by CI,
+    because it is imported into a customer's agent process). Prompt and
+    response content is hashed by default and never transmitted unless the
+    caller opts in — but *which secret shapes* were present is reported, so
+    "this prompt contained an AWS key" is detectable while the key never
+    leaves the process. Tool argument names are sent; values are not.
+  - `ai_gateway` connector for LiteLLM / Portkey / Helicone / in-house
+    proxies, covering every app behind a gateway — which matters because the
+    apps most in need of visibility are the ones nobody will retrofit an SDK
+    into. New `ai` connector category. 83 → 84 connectors.
+  - Eight executable detections, authored as Python specs rather than YAML,
+    since the YAML under `detections/` is a generated projection the engine
+    never reads.
+  - AiSOC's own MCP server is the first monitored AI asset. Its README claimed
+    "every tool call lands in the AiSOC audit log with the calling user and the
+    tool name"; it emitted nothing, and the API's audit middleware only records
+    mutating methods with a valid JWT, so the ten read tools produced no audit
+    row at all. It now emits to the same template a customer agent would use.
+- **The agent's abstention rate and groundedness are published.** v8.0 wired
+  groundedness scoring into the triage path and then discarded the score — it
+  survived only inside a findings string. Migration 051 persists it, and
+  `/metrics/funnel` exposes `abstention_rate`, `ungrounded_demotions`,
+  `mean_groundedness` and `scored_verdicts`. A system that never abstains is
+  not calibrated, it is guessing with confidence; publishing the rate inverts
+  the usual incentive to report only an automation percentage.
+- **The windowed detection engine has a loader.** It shipped with three
+  hardcoded rules and its own docstring deferred the rest. That absence is most
+  of why the quarantine has stayed at ~2,000 rules: a large share of
+  quarantined Splunk imports are `| stats count ... by` aggregations, which
+  cannot be expressed in the stateless matcher at all and had nowhere to go.
+  Five rules to start, including the AI agent tool-denial counterpart to the
+  low-severity stateless building block.
+- **UEBA baselines non-human principals.** `service_account`, `ai_agent` and
+  `mcp_server` were excluded by a regex on one HTTP route, while the schema
+  column, the statistics and the Kafka path all accepted anything. These are
+  the entities most in need of baselining: they run continuously with standing
+  credentials. Doing this before v8.0's degenerate-variance fix would have been
+  misleading, since a constant stream collapses the standard deviation and every
+  such principal would have read as permanently normal.
+- **Four capability pillars, on a credibility floor
+  ([#696](https://github.com/beenuar/AiSOC/pull/696),
+  [#697](https://github.com/beenuar/AiSOC/pull/697),
+  [#707](https://github.com/beenuar/AiSOC/pull/707)).** The floor came first,
+  because a published claim that is false costs more than a missing feature.
+  - **Context graph.** Neo4j schema v1.1 adds identity, asset, cloud, business
+    and threat depth — Employee joined to Identity, Vulnerability, Application
+    criticality and data classification, CloudAccount and Secret, and the
+    IOC → Malware → Campaign → ThreatActor → Technique chain. One
+    tenant-scoped traversal resolves an alert into all five behind
+    `GET /api/v1/graph/incident-context/{alert_id}`, feeding the agent's
+    context bundle, with `POST /graph/context/import` for directory and CMDB
+    data. Neo4j had no migration mechanism at all, so any schema change
+    landed only on fresh installs; real runners now exist for all three
+    non-Postgres stores (`services/api/app/db/{graph,lake,vector}_migrations.py`)
+    and the gate checks the half that matters — that each is *called* from a
+    startup path. Qdrant's vector dimension is immutable, so an
+    embedding-model change is a re-embed, surfaced by `pending_rebuilds()`
+    rather than silently mixing incompatible vectors.
+  - **Recursive investigation.** `run_with_tools` shipped working, guarded and
+    instrumented, with zero production callers. It now drives
+    `services/agents/app/investigator/deep_investigation.py` over ten
+    strategies, with seven typed lake-backed pivots in
+    `services/api/app/services/investigation_tools.py` behind
+    `POST /investigate/query` — the model picks a tool and passes typed
+    arguments, it never writes SQL. `scripts/check_investigation_depth.py`
+    asserts the loop still has a caller, because a narrative reads equally
+    plausible whether the agent pivoted five times or once.
+  - **Action contract.** Risk, reversibility, verification and approval are
+    declared per *capability* rather than per vendor, since the contract
+    belongs to the verb. `approval_matrix.py` implements confidence × impact
+    and `scripts/check_action_contract.py` enforces it.
+  - **SOC-agent benchmark.** `packages/aisoc-benchmark` ships an adapter
+    protocol plus an HTTP adapter, so a third party's agent can be graded
+    against the same corpus, with hallucination rate and real-vs-synthetic
+    provenance labels on every row.
+- **A model matrix, so an accuracy number names its backend
+  ([#715](https://github.com/beenuar/AiSOC/pull/715)).** The weekly eval runs
+  one model, so its numbers describe the agent *on whatever the pins resolved
+  to* and cannot separate a property of the agent from a property of the
+  backend. `scripts/run_model_matrix.py` grades the same corpus across several
+  models, one variable at a time. It is deliberately a thin wrapper that sets
+  the pins and re-invokes `run_evals.py` rather than a second evaluator — two
+  definitions of accuracy drift apart, which is the defect the alert-reduction
+  suite already demonstrated — and a test asserts it defines no scoring of its
+  own. With no funded key every row reads **not measured**, never `0.000`: a
+  zero is a measurement, and "we did not run this" is not.
+- **Dead letters can be read back
+  ([#713](https://github.com/beenuar/AiSOC/pull/713)).** Three DLQ
+  implementations existed — a log line, a Kafka topic with no consumer, and one
+  that forgets on restart — and the worker defaulted to the first. An invisible
+  drop is indistinguishable from an event that never arrived, and only one of
+  those is an incident. `PostgresDLQ` plus migration `053_dead_letters.sql`
+  persists them and `GET /api/v1/health/dead-letters` reads them back with a
+  breakdown by reason. `/health/fleet` reports connector staleness alongside.
+- **SLO alerts are generated from the objectives
+  ([#713](https://github.com/beenuar/AiSOC/pull/713)).** `slos.yaml` declared
+  targets for 17 services while the alert rules used thresholds corresponding
+  to no objective in the file. `scripts/generate_slo_alerts.py` derives
+  burn-rate alerts from it, covering the five services that actually expose
+  `/metrics` and naming the twelve that do not, so no alert can be permanently
+  dead.
+- **The last two fidelity corpora are obtainable
+  ([#717](https://github.com/beenuar/AiSOC/pull/717)).** Four datasets have
+  loaders; only two shipped a downloader. `ait_lds_loader.py` and
+  `mitre_engenuity_loader.py` could parse their full corpora from the day they
+  landed with no way to fetch either, so their only numbers came from a
+  ten-line micro fixture — which proves the loader parses and says nothing
+  about the classifier at scale. The asymmetry was invisible because each half
+  looked complete alone and nothing compared the two sets;
+  `scripts/check_fidelity_datasets.py` does, and also enforces licence
+  acceptance and citation across all four. New `*_full` floors are marked
+  `measured: false`, lead with UNMEASURED, and are set at the micro-fixture
+  level rather than guessed higher, because a floor invented above an
+  unmeasured result is a gate that gets lowered rather than investigated.
+- **Operator tooling for the paths that only matter under failure
+  ([#696](https://github.com/beenuar/AiSOC/pull/696),
+  [#697](https://github.com/beenuar/AiSOC/pull/697)).** AES-256-GCM backup
+  encryption in `scripts/backup_crypt.py` (chunk-framed with a per-chunk nonce
+  and AAD binding the chunk index, so a truncated or reordered archive fails to
+  decrypt rather than restoring a smaller database, plus a SHA-256 manifest);
+  scheduled Neo4j, Qdrant and Redis backups via a Helm CronJob;
+  `scripts/support_bundle.py`; a per-investigation cost budget; and per-tenant
+  ingest token buckets in `internal/inbox/ratelimit.go` (per-replica, and
+  documented as such) on the one endpoint deliberately open to the internet.
+
+### Fixed
+
+- **The sandbox determinism test compared a timer.** Its `VOLATILE` list named
+  four fields the CLI does not emit — the real one is `elapsed_ms` — so the
+  comparison included a wall-clock value and failed whenever two runs
+  straddled a millisecond boundary, reporting "Something in the reasoner
+  depends on salted hashing again" and sending a reader after a `hash()` call
+  that was not there. Volatile fields are matched by suffix now, because names
+  are the thing that drifts and the `_ms` convention is not.
+- **The devcontainer cold-start gate could only ever validate the previous
+  image.** It probed the published `:latest` even on a pull request, by design
+  — so a Dockerfile change was unverifiable until after it shipped, which is
+  how a devcontainer whose non-root user was not in the `docker` group reached
+  `main`. A PR touching `.devcontainer/**` now builds from its own source and
+  probes that, and the trigger includes `.devcontainer/**` at all (it fired
+  only on changes to the workflow file).
+- **The Codespaces quickstart could never start Docker
+  ([#716](https://github.com/beenuar/AiSOC/issues/716)).** The README
+  advertises Codespaces as "the zero-install way to drive the real stack in a
+  browser"; it failed at step 1 of `pnpm aisoc:demo` and was not recoverable
+  from inside the codespace. The `docker-in-docker` feature does two things,
+  and only the first has a Dockerfile equivalent: it installs the binaries
+  (replicated), and it supplies container *runtime* options (`--privileged`,
+  `--init`, a volume at `/var/lib/docker`) plus an entrypoint that launches
+  `dockerd`. Capabilities are granted at container creation and cannot be
+  self-granted from an image, so baking the binaries and stopping there
+  produced a container with `CapEff: 0` and `CAP_SYS_ADMIN` outside the
+  bounding set — `sudo` could not help, because the capability was not in the
+  set to grant. `devcontainer.json` passes the runtime half now and
+  `.devcontainer/start-docker.sh` is the missing entrypoint, running from
+  `postStartCommand` so a stop-and-resume comes back with a working daemon.
+  `apt install docker.io` also creates the `docker` group and puts nobody in
+  it, so `node` could not reach the socket its own daemon creates and every
+  command failed with a permission error that reads like a missing daemon.
+  The cold-start gate is why this survived: it asserted the docker *CLI* was
+  installed, which it is with no daemon anywhere. A third phase now starts a
+  real daemon under the same flags and runs a container as the non-root user.
+- **Service images were published amd64-only.** Apple Silicon is the majority
+  of contributor laptops, and `pnpm aisoc:demo` — the README's headline
+  "Docker + pnpm" path — could not pull a single service image there.
+  Compose reported `no matching manifest for linux/arm64/v8` for every one,
+  fell back to building four services from source, and the quickstart became
+  a long silent build instead of a demo. The devcontainer image has been
+  multi-arch all along, so the pattern existed and was simply never applied
+  to the service images. This roughly doubles image-build time, which is the
+  correct trade: a first run that cannot start is worse than a slower
+  release.
+- **The OSS screencast recorder defaulted to a commercial host.**
+  `screencast.yml` recorded `https://tryaisoc.com` unless told otherwise and
+  the shot list named that host in three shots, so a self-hoster running the
+  workflow would record somebody else's deployment — and that hostname would
+  then travel into the README caption. Both default to the local demo stack
+  now, and the outro carries no URL at all, because a hostname there dates
+  the cut and points viewers at an instance rather than at the project.
+- **`beenuar/aisoc-action` does not exist as a repository.** Every
+  `uses: beenuar/aisoc-action@v1` example in the README and the integration
+  doc 404s. The reference that resolves is the monorepo subdirectory form,
+  `beenuar/AiSOC/packages/aisoc-action@v8.1.0`, which is what both show now;
+  `docs/operations/publishing.md` records what the short alias would actually
+  require, since a Marketplace listing resolves to a repository root.
+- **Config snapshots could never run, and reported themselves enabled.** The
+  Go config-snapshotter called `GET {base}/v1/connectors/{id}/resource-config`;
+  the connectors service serves `POST /api/v1/connectors/{id}/resource_config`.
+  Four mismatches at once — method, prefix, separator, payload — and the last
+  is not a typo: that endpoint requires decrypted `auth_config` in the body and
+  the ingest service has no vault, so it could never have called that route at
+  all. Renaming the URL would have turned a silent 404 into a silent 422.
+  Silent either way, because a 404 maps to `ErrNotImplemented`, which the
+  snapshotter treats as a soft skip — so an operator saw "T1.2 config snapshots
+  enabled" on boot and zero `Configuration` nodes in the graph, with nothing
+  connecting the two. Fixed with an instance-scoped route on the connectors
+  service that resolves the saved instance and decrypts credentials the way
+  `ConnectorScheduler` does at poll time, so the ingest service needs no
+  secrets. Query values are escaped: an ARN containing `&` or `#` would
+  otherwise truncate the URL or inject a parameter.
+- **The documented "latest configuration" graph query matched zero edges.**
+  `is_current`, `valid_from` and `valid_to` are declared in
+  `schemas/graph-schema.yaml` and the published schema doc advertised an O(1)
+  lookup via `:CONFIGURED_AS {is_current: true}`. Nothing wrote any of the
+  three. The drift gate could not catch it, because it validates properties
+  only on edges declared `event_edge: true` and this one is structural. All
+  three are written now, with the limitation stated rather than implied:
+  closing the previous interval needs a read-modify-write the ingest hot path
+  deliberately does not do, so `valid_to` is **absent** while the interval is
+  open — an open interval is not one that closed at the epoch — and the doc
+  now shows the `ORDER BY valid_from DESC` query that actually works.
+- **Four effective-permissions resolvers were documented as scaffolds long
+  after they were implemented.** The endpoint docstring described Azure, GCP,
+  Okta and GWS as returning HTTP 501, and the `NotImplementedError` branch had
+  been unreachable for as long. All five resolvers report `coverage: "full"`.
+  What is still limited is the *snapshot*, not the resolver: only Okta's is
+  assembled from a live connector, because the other four expect a connector
+  to answer the `__posture_snapshot__` sentinel and **no connector implements
+  it**, so with live mode on they return 412 rather than a fabricated
+  snapshot. That was honest but unrecorded, so `coverage: full` was the only
+  figure a reader saw. A new gate pins the real shape of the gap in both
+  directions — a resolver registered without a snapshot source fails, and so
+  does a stale entry on the allow-list once its connector starts answering the
+  sentinel. The gap is allowed to exist; it is not allowed to be invisible.
+- **A fabricated investigation rendered whenever no run was selected.**
+  `InvestigationTimeline.tsx` called `makeDemoTimeline()` — a named analyst, a
+  routable source IP, "Session suspended; email dispatched" — with no demo
+  gate. `check_mock_data_gated.py` missed it because it matches `MOCK_*` /
+  `DEMO_*` constant *names* and this is a function call, which is the other of
+  the two ways to render invented state. Gated, and the gate now also catches
+  a `set*(makeDemo*())` factory. Verified by reverting the component: the
+  widened gate names the exact line.
+- **A ChatOps approval authorized nobody.** The Slack and Teams bots verified
+  who clicked — Slack signs every interaction payload, Teams payloads carry an
+  HMAC — recorded that person in an audit event, and then called
+  `approve_action(action_id)` with no body. The actions service ran
+  `authorize_approver` against `None`, so the permission-tier check *and*
+  separation of duties were both skipped; the clicking user appeared in the
+  audit trail and was never bound to the authorization decision. An approval
+  path that does not authorize is worse than none, because it reads as a
+  control.
+  A bot cannot supply permissions — it knows a Slack user id and has no idea
+  what that person may do in AiSOC, and a bot permitted to assert its own
+  permissions could grant itself anything. It now asserts identity only, and
+  the actions service maps it through `AISOC_CHATOPS_APPROVERS`: operator
+  configuration rather than a directory lookup, because the actions service
+  owns no user table and an approval should not depend on a second service
+  being reachable. Fails closed — `AISOC_ACTIONS_REQUIRE_APPROVER` defaults
+  true, an unmapped user is refused rather than admitted with an empty
+  permission set, and a malformed map raises rather than resolving to "no
+  approvers", which looks identical to correctly having none. **Operators
+  using Slack or Teams approvals must populate the map or approvals will be
+  refused**; that is the intended failure.
+  Approve and reject are deliberately asymmetric: a rejection causes no vendor
+  effect and a timeout-driven one has no human by definition, so requiring an
+  identity there would strand expired requests in `awaiting_approval` forever.
+  An identity supplied on a rejection is still authorized, and the decider is
+  now recorded — it never was.
+  Separately, the signed email-approval link pointed at
+  `/v1/actions/email-decide`, a path served by no router, so every approve and
+  deny button in a rendered approval email linked to a **404** — the documented
+  fallback for "Slack is unreachable" failed at the moment it was needed. The
+  route exists, and the recipient is signed into the token, because a bare
+  signed link is a bearer credential that approves as nobody. Docs:
+  `apps/docs/docs/operations/action-approvals.md`, which states the three
+  remaining limitations rather than implying they are closed.
+- **One `not` rule silently discarded a tenant's entire business-context rule
+  set.** Rules are parsed twice by two implementations. The console requires
+  `not` to be a mapping; the triage worker iterated every aggregator as a
+  list, and iterating a mapping yields its string keys — so
+  `_parse_condition("field")` called `.get()` on a `str`, raised
+  `AttributeError`, and the caller's catch turned that into `rules = []`. A
+  single console-accepted rule therefore stopped every *other* rule that
+  tenant had written, suppressions included: a rule written to suppress
+  known-benign noise quietly stopped suppressing, with nothing on the console
+  to say so and one `warning` in the worker log. Fixed in two places, because
+  the parser bug and its blast radius are separate problems — `not` takes a
+  mapping now, and a rule that fails to parse is skipped while the rest
+  survive. Also closed two smaller divergences: the worker accepted any
+  `route_to` string while the console validated against a fixed set, and the
+  two copies of that set had nothing pinning them together.
+- **The API service had no LLM input contract at all.** `services/agents` has
+  had a fail-closed one since T2.3 landed there; the module this repo's own
+  notes described as living at `services/api/app/services/llm_safety.py` was
+  absent from the tree. Seven endpoints POSTed untrusted input straight to a
+  chat-completions provider — `phishing` (a submitted email body,
+  attacker-authored by definition), `translation`, `knowledge_base`, `hunts`,
+  `nl_detection`, `detection_loop`, and `alert_explain` (a JSON dump of the
+  alert). All validate before the request now, because a check that runs after
+  it is a log line rather than a control.
+  The rules are shared rather than reimplemented: they sat in `contract.py`
+  next to LangChain, the cost-telemetry recorder and the response cache, none
+  of which ship in the API image — which is precisely why the API could not
+  run them. They now live in `contract_rules.py` with stdlib imports only,
+  vendored byte-identically and gated by
+  `scripts/sync_vendored_llm_contract.py --check`. Two heuristics disagreeing
+  about what counts as a raw log would be worse than one.
+  Two more holes closed alongside: `services/agents/app/api/explain.py`
+  reached a model with raw `httpx` and never touched the contract, invisible
+  to a gate that walked the AST for `.ainvoke`/`.astream` only — it proved the
+  LangChain path clean and said nothing about the other way to reach a model,
+  so a second gate now flags any file that both names a completions endpoint
+  and issues its own POST. And the NL-query translator, one file vendored into
+  both services, imported `app.llm.contract` and `app.llm.factory` — neither of
+  which exists in the API process. The `ImportError` was swallowed, so
+  `/nl-query` always returned the deterministic translation and **never
+  reached a model**: safe by accident, and invisible.
+- **The detection truth table was a gate that could certify a no-op.** It
+  classified rules by file path and by the key names inside `detection:`, never
+  consulting the engine — so it published **947 executable** while the engine
+  loaded **825**, counted 77 imported Sigma rules that have no evaluator
+  anywhere in the repo, and counted 44 native rules with no compiled spec. The
+  danger was worse than a wrong number: because it keyed off `_quarantine/`
+  membership, a bulk un-quarantine would have raised the published figure
+  without changing what fires. Executable now means "the engine loads this id".
+- **663 of 825 loaded rules matched on fields that were not visible.**
+  `raw_data` carries the connector's normalized dict and connectors put the
+  vendor payload one level down under `raw_event`, while the matcher does a
+  flat `event.get(field)`. Fixture replay could not catch any of them, because
+  fixtures are synthesized from the rule they test. The workaround in the tree
+  was per-field hoisting inside individual connectors. Both engines now merge
+  the payload once, with connector keys winning on collision.
+  `scripts/check_detection_fields.py` ratchets the 138 rules that depend on
+  fields nothing computes.
+- **26 connectors were mis-attributed and mostly unpromotable.** 31 envelope
+  dicts emitted `raw` instead of `raw_event`, missing the normalizer's
+  `isCanonicalEnvelope` check and falling through to a fallback that borrowed
+  the `splunk_enterprise` profile. That profile stamps vendor "Splunk" — so
+  Okta, QRadar, Carbon Black, Netskope and 22 others reported alerts as coming
+  from Splunk — and is `class_uid` 4001 with an *empty* severity map, so
+  category 4 with severity 0 satisfied neither branch of `should_promote()` and
+  their events could never become alerts. Replaced with a vendor-neutral
+  `genericProfile`.
+- **The dependency audit silently skipped a service** (#650). A failed `poetry
+  export` was a warning, so `services/slack-bot` fell out of the scan while the
+  job passed. A gate that quietly skips is worse than one that fails, because
+  it reads as coverage that is not there. Coverage gaps now fail the job, and
+  regenerating the lock surfaced eleven advisories across `idna`,
+  `pydantic-settings`, `anyio`, `aiohttp` and `starlette` — nine of which were
+  only visible once the scan actually ran.
+- The MCP README's audit-trail claim, the quarantine README's translation
+  instructions (which documented the no-op YAML path that produced the 44
+  orphans), and the orphaned `detections/splunk-imports/_migrated/` directory
+  of 16 files that no script, workflow or doc referenced.
+- **Four documented security controls did not exist
+  ([#696](https://github.com/beenuar/AiSOC/pull/696)).** AES-256-GCM backup
+  encryption — the script gzipped and uploaded. Envelope encryption as the
+  control mitigating a database dump — `EnvelopeCipher` had zero callers. One
+  unbroken distributed trace — neither end of the Kafka spine emitted
+  OpenTelemetry. Per-tenant retention marked GATED by a test asserting the
+  purge SQL *parses* while nothing called it. Four more docs told operators to
+  run `alembic downgrade` against a service with no Alembic, so the documented
+  recovery path failed at the one moment it was needed. Each was corrected in
+  the docs **and then implemented**, so the claim could return honestly:
+  envelope encryption now carries `vault:v2:` tokens with `vault:v1:` read
+  compatibility and fail-closed behaviour in both directions (the three
+  vendored read-path copies *refuse* a `vault:v2:` token rather than returning
+  ciphertext as plaintext); retention actually deletes; and tenant offboarding
+  covers all five stores, with the Postgres table list discovered from
+  `information_schema` rather than hardcoded — 14 of 72 tenant-scoped tables
+  had no cascade, so deleting a tenant orphaned institutional memory and
+  compliance evidence.
+- **The prompt-injection guard missed every action-trigger payload
+  ([#697](https://github.com/beenuar/AiSOC/pull/697)).** Adversarial recall was
+  **0.22**, and the payloads that got through were the ones that produce a real
+  isolate or disable — which turns the SOC into a denial-of-service aimed at
+  its own estate. Eight new patterns take recall to **0.85** with zero false
+  positives.
+- **Nine capabilities declared a verification probe and three had one
+  ([#697](https://github.com/beenuar/AiSOC/pull/697),
+  [#698](https://github.com/beenuar/AiSOC/pull/698)).** Two probes were added
+  and four declarations corrected to `false` with stated reasons, and
+  "unverifiable means not autonomous" is now enforced: probes are required
+  unconditionally for AUTOMATIC and for HIGH/SEVERE impact regardless of
+  approval tier, and waived below MODERATE where the API response *is* the
+  confirmation. `suspend_session` and `force_mfa` were demoted AUTOMATIC →
+  ANALYST accordingly. Building the gate surfaced **eleven capabilities with a
+  contract and no executor at all, including `unisolate_host`** — the rollback
+  for the most disruptive action in the product resolved to nothing — fixed
+  with a `KNOWN_ORPHANS` ratchet plus 17 new executors wired to client methods
+  that already existed. Separately, `AzureEntraClient.get_user_enabled` called
+  `_ensure_token()` with no argument and used the return value as a bearer
+  token; the method takes a client and returns `None`, so every live call would
+  have raised `TypeError` — invisible in simulation, which never constructs the
+  client, and that method backs the `disable_user` probe, so a containment
+  would have reported UNVERIFIED for an unrelated reason.
+- **The sandbox's "deterministic" baseline moved every run
+  ([#696](https://github.com/beenuar/AiSOC/pull/696)).** Risk scores used
+  `abs(hash(str))`, with three comments calling it deterministic. CPython salts
+  string hashing per process. The test runs the CLI under different
+  `PYTHONHASHSEED` values, which is the only way to catch it.
+- **The Helm chart could not be installed at all
+  ([#696](https://github.com/beenuar/AiSOC/pull/696)).** Three templates
+  referenced values absent from `values.yaml` — the UEBA deployment read
+  `.Values.ueba.replicaCount` and there was no `ueba` key — so rendering
+  failed before any cluster saw it.
+- **Three shell and DR traps that only appear under failure
+  ([#696](https://github.com/beenuar/AiSOC/pull/696)).** `pg_dump` stderr sent
+  to `/dev/null` under `pipefail` handed an operator exit 1 with zero
+  diagnostic; `fail() { ((ERRORS++)); … }` returns the *pre-increment* value,
+  so under `set -e` the first failure killed the script before it printed why;
+  and `grep -oP` made `restore --latest` impossible on macOS. `openssl enc`
+  also refuses AEAD ciphers outright, which is why the AES-256-GCM path is a
+  Python script on `cryptography` rather than a one-liner.
+- **The one-directional gates
+  ([#696](https://github.com/beenuar/AiSOC/pull/696),
+  [#707](https://github.com/beenuar/AiSOC/pull/707)).** The graph-schema drift
+  check compared the YAML vocabulary against Go and never the reverse, so it
+  reported the schema consistent while Go declared 28 labels against the YAML's
+  17; it now parses the declared Go type (`NodeLabel` vs `RelType`) instead of
+  classifying by string casing, which had misread `IOC`. In the same family:
+  `neq` was never a matcher operator despite eleven rules using it, so
+  `approver_role_neq: "codeowner"` was read as a field literally named
+  `approver_role_neq`; every one of those rules' fixtures encoded the clause
+  key verbatim because `build_positive()` synthesizes fixtures *from the rule*,
+  so the durable fix is in the generator rather than the 22 files that
+  regenerate from it; and `test_positive_fixtures_fire_and_negatives_do_not`
+  only ever replayed the positives, leaving 100+ negative fixtures unrun under
+  a test whose name says otherwise. Derived fields (`is_business_hours`,
+  `<a>_eq_<b>` / `<a>_neq_<b>`) took the unreachable-rule ratchet from 138 to
+  **133**, now reported by family — needs windowed engine, identity enrichment,
+  allowlists, invented operands — so the number is actionable rather than bare.
+- **A vendor's help text broke the entire docs deploy
+  ([#708](https://github.com/beenuar/AiSOC/pull/708)).** Lacework's field help
+  contains `https://<account>.lacework.net`, and Docusaurus parses `.md` under
+  MDX, so `<account>` is an unclosed JSX element — one of which fails the whole
+  build. The generator escapes angle brackets now, skipping code spans, with a
+  gate over every connector page, because nothing about "MDX compilation
+  failed" points at a vendor help string.
+- **Six duplicate connector pages, with the gate reporting 100% coverage
+  throughout ([#712](https://github.com/beenuar/AiSOC/pull/712)).** `_slug()`
+  assumed hyphenated filenames; six pages predate that convention and use
+  underscores, so the coverage check saw nothing at the hyphenated path and
+  generated a thinner second page beside each hand-written original. The
+  sidebar is generated from the same slug, so it listed only the thin copy and
+  dropped the better half of each pair out of navigation. An existing page now
+  wins over the convention, and a guard fails the gate when two pages differ
+  only by separator.
+- **Eight dead links survived in the published docs with a link checker running
+  on every PR ([#709](https://github.com/beenuar/AiSOC/pull/709),
+  [#718](https://github.com/beenuar/AiSOC/pull/718),
+  [#719](https://github.com/beenuar/AiSOC/pull/719)).** A full QA pass over
+  `https://beenuar.github.io/AiSOC/` — 167 sitemap pages, 170 internal and 405
+  external link targets — took the health score from 81 to 99. Seven of the
+  dead links pointed at three GitHub organisations that do not exist, and the
+  wrong org was baked into the *generator* `scripts/curate_detections.py`, so
+  fixing the page alone would have regenerated the 404. The link job could not
+  catch this class: it runs lychee with `fail: false` and
+  `--accept …403,429`, and GitHub rate-limits unauthenticated crawls hard, so a
+  403 from rate limiting is indistinguishable from the page existing.
+  `scripts/check_repo_self_links.py` is the deterministic offline replacement.
+  Two links into `docs/` (which the site does not serve) also took the whole
+  deploy down, since Docusaurus treats a broken relative link as a build
+  failure. Stale counts were re-read from the tree — 84 connectors, not 47;
+  833 executable rules, not "800 fixture-tested".
+- **A hydration mismatch from adjacent JSX children
+  ([#718](https://github.com/beenuar/AiSOC/pull/718)).** An SVG `<title>` built
+  from several adjacent children gets `<!-- -->` separators injected during
+  SSR that the client does not reproduce (React error #418). Build the whole
+  string as one template literal so there is exactly one text node.
+- **Sixty-six Dependabot alerts down to seven**
+  ([#686](https://github.com/beenuar/AiSOC/pull/686),
+  [#691](https://github.com/beenuar/AiSOC/pull/691),
+  [#694](https://github.com/beenuar/AiSOC/pull/694),
+  [#701](https://github.com/beenuar/AiSOC/pull/701),
+  [#703](https://github.com/beenuar/AiSOC/pull/703),
+  [#705](https://github.com/beenuar/AiSOC/pull/705),
+  [#706](https://github.com/beenuar/AiSOC/pull/706),
+  [#710](https://github.com/beenuar/AiSOC/pull/710), plus routine bumps in
+  [#687](https://github.com/beenuar/AiSOC/pull/687)–[#714](https://github.com/beenuar/AiSOC/pull/714)).
+  The three remaining highs are unpatchable (`ecdsa`, `image-size`). Two
+  recurring shapes are worth remembering. A **caret pin that excludes the fix
+  makes a security update unsolvable rather than pending**: the pytest advisory
+  covers `< 9.0.3` and `^7.4.0` cannot reach it, so Dependabot had no version
+  to propose and the failure surfaced as a red workflow rather than an open
+  alert — ten services carried four different constraints for no reason, now
+  uniformly `>=9.0.3,<10.0`. And **a range that permits the fix is not a lock
+  that takes it**: the agents lock held langchain 1.0.2 against a 1.3.9 fix,
+  all inside the existing caps. Transitive advisories need an override with a
+  major ceiling, because without `<5` `@vitest/mocker` resolved to 5.0.1 —
+  taking a major version of the test runner's mocking layer as a side effect of
+  a security patch is how unrelated breakage gets blamed on security work.
+  `dompurify` is the one worth naming: it is the sanitiser behind rendered
+  report HTML, so a version below the fix was a live XSS surface in a product
+  whose job is being trusted with hostile input.
+- **The Fly demo outage finally has a stated cause
+  ([#698](https://github.com/beenuar/AiSOC/pull/698)).** The self-provisioning
+  deploy ran on merge and Fly answered: *"Your account has overdue invoices."*
+  Both apps were reclaimed for non-payment, and the workflow's old silent
+  `exit 0` when the app was missing hid that behind weeks of green runs. The
+  error message used to guess at causes and got them wrong; it now prints
+  Fly's own message verbatim. This is a billing action only the account owner
+  can take, not a code fix.
+- **Three CodeQL findings, at the root rather than around them
+  ([#700](https://github.com/beenuar/AiSOC/pull/700),
+  [#708](https://github.com/beenuar/AiSOC/pull/708)).** A previous attempt
+  parenthesised an implicit concatenation without removing it, and added a
+  top-level import alongside an existing from-import — turning one
+  `py/import-and-import-from` alert into two. Fixed properly: setup prose built
+  as named strings before the list, one import style per module, and four
+  `py/unnecessary-lambda` findings cleared. Generated pages verified
+  byte-identical.
+
+### Changed
+
+- Eleven new claim-to-gate matrix rows, one per capability. 84 rows: 73 GATED,
+  11 PARTIAL, 0 NO GATE. The field gate is recorded as `GATED (ratchet)` with
+  its closing condition rather than as clean, because 138 rules still depend on
+  computed fields and claiming otherwise would be the overstatement the matrix
+  exists to prevent.
+- The claim-to-gate matrix ends the wave at **102 rows: 93 GATED, 9 PARTIAL, 0
+  NO GATE**, one row per capability added above, each backed by a test that
+  fails against the old behaviour. The ratchet (`MAX_NO_GATE = 0`) still
+  forbids a regression, and no `PARTIAL` row was relabelled without building
+  the gate it names — relabelling would make the file a liability instead of a
+  control.
+- Of the twelve hardening phases, **Phase 4 is now the only one unchecked, and
+  deliberately so**: what remains is a funded provider key for the live-agent
+  eval, not code. Marking it done would be the exact failure the program exists
+  to prevent.
+- The wave-2 work adds six more rows, closing at **108 rows: 99 GATED, 9
+  PARTIAL, 0 NO GATE** — one per capability whose gate this release built:
+  authorized approvals, the signed email link, the LLM input contract across
+  both services, rule-id agreement between engine and catalogue, which identity
+  providers can resolve permissions live, and config snapshots reaching the
+  graph. Four carry a named caveat rather than a clean claim, because the
+  limitation is real: approvals are still an in-process dict, the contract is
+  a leak control rather than an injection sanitizer, four of five posture
+  snapshots cannot be collected, and `is_current` is set on write and never
+  cleared.
+- **The wave-2 backlog in [#362](https://github.com/beenuar/AiSOC/issues/362)
+  was wrong in both directions.** Two items (business-context rules,
+  effective-permissions resolvers) were already built, and four had the
+  capability present with the path that feeds it broken — which is the same
+  shape v8.0 found a dozen times. Auditing each item against the tree before
+  writing code is now the first step of any wave, not an optional one.
+
+- **A rule id named one rule in the engine and a different one in the
+  catalogue.** #697 made ids position-independent by pinning
+  `(category, slug) → rule_id` in `detections/rule-ids.lock.json`, but nothing
+  reconciled the lock against the YAML already on disk and the `--check` mode
+  was never written, so the committed pack fell **45 network rule ids** behind
+  the generator. Because the id is the join key between an alert and its
+  catalogue entry, the effect was not a stale file: `det-network-037` fired as
+  "DNS TXT Response Over 250 Bytes From Non-Resolver Host" and published — in
+  the YAML, `marketplace/index.json` and the curated coverage manifest — as
+  "DNS Tunnel Indicator: Long Hex Subdomain Sequence". An analyst taking a rule
+  id off an alert and looking it up read a different rule's description,
+  false-positive notes and playbook. Precisely the harm the lock's own
+  docstring warns about.
+  Three things were wrong at once, and each hid the next:
+  - `export_detection_ruleset.py` still computed ids **positionally**
+    (`seen[category] += 1`) under a comment saying it mirrored
+    `generate_detections.py` — true when written, false once the generator
+    moved to the lock. Two generators with two numbering schemes. It reads the
+    lock now, so there is one source of id truth, and inserting a spec no
+    longer moves an id the alert table already references.
+  - `generate_detections.py` had no `--check`, so nobody could see the drift.
+    It has one, it reports moved ids separately from other changes because a
+    moved id is the serious case, and it runs in
+    `validate-detections.yml`.
+  - `tests/test_detection_id_stability.py` compared `assign_ids()` output
+    against the lock — and `assign_ids()` reads the lock, so for the property
+    that matters the comparison was circular. Six tests passed throughout,
+    under a docstring describing this exact failure. Four new tests compare the
+    published surfaces against **each other** in both directions: YAML against
+    the lock, the engine against the lock, and — stating the user-visible
+    property directly — that an id names the same rule in the engine and in the
+    catalogue. The reordering test had to *reorder* specs rather than assert a
+    re-export is a no-op, because the lock was seeded from the current spec
+    order, so the two schemes agree until the day someone inserts a rule; it
+    moves 81 engine ids against the old exporter.
+
+## [8.0.0] — 2026-09-22
+
+**Close the loop.** v8.0 was reserved for the package-publish milestone. That
+turned out to be the wrong thing to name a major release after, because a
+competitive read of the AI-SOC market says buyers are not choosing on
+distribution — they are choosing on whether the platform can prove it did
+what it said. So v8.0 is the release that connects capabilities the codebase
+already contained but never wired together, and the npm/PyPI publish moves to
+v8.1 where it belongs.
+
+The pattern across almost every item below is the same, and it is worth
+stating plainly: the mechanism existed, was tested in isolation, and had no
+caller on the path that needed it. A passing unit test on an uncalled function
+is indistinguishable from a working feature until someone traces the call
+graph.
+
+### Added
+
+- **Response actions are verified against the vendor.** Outcome verification is
+  the line the market draws between a tool that recommends and one that
+  responds. `AutonomyDecision.requires_verification` was computed for every
+  auto-executed action at MEDIUM blast radius and above, and the dispatcher
+  dropped it; `PostActionVerifier` had no caller outside its own test. The
+  dispatcher now re-queries after a real, successful execution and records the
+  outcome. A vendor that accepts the call while the effect is absent downgrades
+  the action to FAILED instead of leaving it reported as succeeded — that gap
+  is how a SOC comes to believe a host is contained when it is not.
+  `unverified` stays `unverified` and is never upgraded to a confirmation.
+- **The isolation probe reads real containment state.** It previously returned
+  `bool(device_id)`, true for every host in the fleet, so it would certify an
+  uncontained host as verified. Adds `get_containment_status` to the
+  CrowdStrike client; `containment_pending` deliberately does not count. A new
+  probe covers `block_ip` by re-reading the enforcing security-group rules.
+- **Autonomy is governed by the tenant's own policy.** The console has written
+  a per-tenant L0–L4 tier, per-action overrides and a HIGH-blast whitelist to
+  Postgres since v7.6; the dispatcher read none of it and resolved autonomy
+  from one deployment-wide `AISOC_MATURITY_TIER`. Every tenant in a
+  multi-tenant install shared a posture, and a tenant who selected L2 in the UI
+  got whatever the operator had exported. `maturity.evaluate_gate` — the
+  function that does understand per-tenant policy — had no callers anywhere.
+  The `whitelisted` flag is now passed to `decide()`; it had been left at its
+  default of False, which made the L4 break-glass path unreachable.
+- **Analysts can hunt the events AiSOC itself ingested.** Every connector's
+  events are archived to ClickHouse `aisoc.raw_events`, and nothing could query
+  them: `/nl-query/execute` only ever executed against Elasticsearch, so a
+  tenant whose data lives in the platform's own lake got "ES_URL not
+  configured" and could not query anything they had ingested. The translator's
+  structured IR now compiles to parameterised ClickHouse SQL, with the tenant
+  predicate generated as part of the WHERE clause rather than rewritten in
+  afterwards, and no analyst text reaching the SQL string.
+- **Auto-escalated alerts get the context manual ones get.** The manual
+  investigator has built a `ContextBundle` — graph neighbourhood, blast radius,
+  historical verdicts for the same entities, UEBA baselines — since v7.5. The
+  escalation path never did, so the high-volume automatic route investigated a
+  true positive knowing nothing about how identical alerts had resolved before.
+
+### Fixed
+
+- **Repeat-alert suppression could never fire.** v7.7 shipped the compounding
+  loop as "a repeat alert matching a trusted benign prior is auto-resolved
+  without re-triage", measured as `repeat_alerts_suppressed` on
+  `/metrics/funnel`. The signature was `evidence_fingerprint(tenant,
+  raw_alert)`, and `raw_alert` carries the alert row id, the source event ids
+  and the raw event payload — all unique per alert. Every alert hashed to a
+  unique fingerprint, so each outcome prior was written under a key nothing
+  would look up again and the metric could only ever report zero. Two features
+  were dead, not one: every repeat also paid for a fresh LLM triage the dedup
+  cache should have served for nothing. `test_outcome_memory.py` missed it
+  because it calls `record_outcome` and `lookup_prior` with the same literal
+  signature string, which holds for any key scheme including a broken one.
+- **Three services were fully unauthenticated.** `purple-team`, `honeytokens`
+  and `ueba` each mounted their entire API with no authentication, so anyone
+  who could reach the port could launch attack simulations, mint or read
+  honeytokens, and read per-user behavioural risk scores. Auth is applied at
+  the router level so a route added later is protected by default.
+- **The live-action router had no authentication.** `/api/v1/live-actions`
+  reaches `dispatch()`, which isolates hosts, disables accounts and blocks IPs
+  against live vendors, while the legacy actions router mounted beside it had
+  required a service token on every mutating route since it was written.
+- **Two cross-tenant leaks in the entity graph.** `get_entity_neighbors`
+  accepted a `tenant_id` and never used it — no predicate in the Cypher, and
+  the parameter was not even passed to the driver — so naming any node id
+  returned another tenant's host, user or IOC plus every neighbour with full
+  properties. `get_blast_radius` filtered only the traversal's start node and
+  accepted `tenant_id IS NULL`, so an APOC expansion could leave the tenant's
+  estate through a shared entity and enumerate another tenant's hosts and
+  users. Every node of every path is now scoped, through one shared predicate.
+- **Business-context rules never reached triage.** The API stored them in a
+  module-level dict inside whichever process served the write, and the
+  auto-triage worker loaded rules only from a YAML file whose path nothing
+  sets. A tenant could author "this host is a domain controller, escalate
+  anything touching it", see it saved, preview it against their last 50
+  alerts, and have it apply to no triage decision ever. Migration 050 adds
+  `aisoc_business_context_rule_sets` and the worker resolves per tenant from it.
+- **Verdicts could auto-close on reasoning the evidence contradicts.**
+  `score_groundedness` measures what fraction of the indicators an output
+  asserts actually appear in the evidence, and had no caller in the service. A
+  confident `false_positive` citing an IP that appeared nowhere in the alert
+  was persisted, written back as a prior that would suppress future alerts, and
+  closed. Auto-closing verdicts below the floor are now demoted to
+  `needs_review` with the unsupported indicators named in the findings.
+- **The tool-calling loop bypassed the LLM input contract.** `run_with_tools`
+  feeds tool output straight back into the prompt, and tool output is
+  untrusted: a SIEM row or threat-intel record can carry text that reads as an
+  instruction. Calling `bound.ainvoke` directly skipped injection validation on
+  the highest-risk content in the system and lost cost telemetry for every turn.
+- **QRadar could never be federated to.** `to_aql` is written, exported and
+  tested, and the QRadar connector implements `federated_search` with it. The
+  type was missing from the API's `FEDERATED_CAPABLE_TYPES`, so a tenant with
+  an enabled QRadar connector was silently excluded from every federated search.
+- **The API-keys panel issued keys that authenticated nothing.** It generated
+  an `aisoc_live_…` secret in the browser with `crypto.getRandomValues`, told
+  the user to save it because it would not be shown again, and never sent it
+  anywhere. Someone would paste it into a CI pipeline or a forwarder and get
+  silent 401s while believing they held a working credential. Revoking filtered
+  a row out of local state. The real CRUD backend existed all along.
+- **Fabricated security data rendered as tenant state across 24 components.**
+  Alerts, cases, connectors, playbooks, detections, hunt, attack graph, threat
+  intel, SLA, audit, RBAC, purple team, identity permissions, EASM and shift
+  handoff each served a `MOCK_*` / `DEMO_*` array when the API call failed,
+  none of it gated on demo mode. A fabricated alert is indistinguishable from a
+  real one, and the worst of them invented things a customer makes decisions
+  from: MITRE coverage claiming which techniques they can detect, SLA
+  percentages, an external attack surface with a risk score. It also persisted
+  — SWR v2 disables `revalidateOnMount` whenever `fallbackData` is supplied, so
+  most of these were not first-paint placeholders but what the view showed.
+- **Executor rollbacks did not call the vendor.** `isolate_host`,
+  `disable_user` and `suspend_session` logged an intent and returned True, so
+  an operator who rolled back a lockout was told the account was restored while
+  it stayed disabled. The real reverse calls existed in `app.services.rollback`
+  with no caller outside their own test.
+- **Three unreachable routes.** `GET /assets/vulnerabilities` and the agents'
+  `/hunts/runs` and `/hunts/findings` were registered after a parameterised
+  `/{id}` route that shadowed them.
+- **The osquery playbook step crashed on import.** It imported client modules
+  from `app.clients.*`, which does not exist in `services/agents`, so every
+  such step died with an unhandled `ModuleNotFoundError` — and the NL playbook
+  drafter actively offers this step type.
+- **A saved hunt's "run" button ran nothing.** It re-translated the question,
+  stamped `last_run_at` and returned, so the console showed "last run just now"
+  for a hunt that had queried nothing.
+- **Generated content was presented as real findings.** A fabricated APT
+  attribution in the alert detail view, synthetic hunt hits, and
+  template-fallback copilot replies now declare their provenance.
+
+### Changed
+
+- **The v8.0 milestone is the close-the-loop release; package publishing moves
+  to v8.1.** `@aisoc/mcp`, `@aisoc/sdk`, `aisoc-cli`, `aisoc-sdk`,
+  `aisoc-plugin-sdk` and `aisoc-sandbox` remain unpublished and the README
+  points at monorepo-local invocations. `publish-cli.yml` is OIDC-provenance
+  ready and no-ops with a clear notice rather than faking a publish; it needs
+  an `NPM_TOKEN` secret and a PyPI trusted publisher, which are account-level
+  settings rather than code.
+- **Nine new rows in the claim-to-gate matrix**, one per capability above, each
+  naming the test that fails if the wiring regresses. 73 rows: 62 GATED, 11
+  PARTIAL, 0 NO GATE.
+- **New CI gate `check_mock_data_gated.py`** fails the build on a
+  `fallbackData` receiving sample data un-wrapped, or sample data assigned to
+  state with no demo-mode check.
+
+### Fixed (carried from the unreleased section)
+
+- **UEBA can no longer read an unscoreable baseline as normal behaviour.** A
+  feature that had never been observed, had too few samples, or had zero
+  variance produced a `0.0` z-score — the same value an observation sitting
+  exactly on its own mean produces. Since the composite is a root-sum-of-
+  squares, that zero contributed nothing and the entity read as all-clear;
+  service accounts, batch jobs and automation users converge on a constant
+  stream, so they could not raise an anomaly at all. `compute_z_score` now
+  returns `None` for these cases and callers exclude it. Per-feature composites
+  are unchanged (`0.0 ** 2` already contributed nothing), but a peer group
+  whose features are all degenerate now yields no peer signal instead of a
+  `0.0` that halved the caller's personal composite — a `critical` score was
+  being reported as `medium`. Affected feature names are logged at `info`.
+  A new `MIN_BASELINE_SAMPLES` setting (default 30) gates the sample count.
+
+- **Agent investigations are now persisted to the ledger (issue #601).** The
+  demo seed renames the canonical seed tenant's slug from `default` to `demo`,
+  so the agents service's `tenant_ref="default"` fallback matched no tenant and
+  every investigation was silently skipped (`ledger.skip_run
+  reason=unknown_tenant` at `debug`) after already spending compute. Two fixes:
+  the API now forwards the authenticated `tenant_id` to the agents service on
+  `/cases/{id}/investigate` (the run is attributed to the real tenant), and the
+  ledger resolver maps the `"default"` placeholder to the canonical seed tenant
+  (stable UUID, regardless of its current slug) or the sole tenant in a
+  single-tenant install. A genuinely unresolvable tenant now logs at `warning`
+  with the run/case id, not `debug`.
+
 ## [7.7.0] — 2026-08-04
 
 ### Added
@@ -362,7 +8879,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-
 - **Hosted demo API 500s from stale Postgres pool + broken waitlist funnel (QA 2026-07-19).**
   Live `/health` showed `demo_bootstrap.last_error_type=create_seed:ConnectionDoesNotExistError`
   after 22 attempts — Fly Postgres autostop closed pooled sockets and every
@@ -382,7 +8898,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   INC-RT-* cases already exist, `_seed_in_flight_investigation` returned early
   and never created `published_replays`. Now that path still ensures the
   canonical replay; bootstrap only marks `done` after verifying the slug.
-
 
 - **Out-of-the-box 500 from schema drift on migration-bootstrapped installs (#492).**
   `docker-compose.yml` mounts `services/api/migrations` into
@@ -3240,7 +11755,14 @@ demo profile. Details below.
 - Helm chart for Kubernetes deployment (`infra/helm/aisoc/`)
 - MIT License
 
-[Unreleased]: https://github.com/beenuar/AiSOC/compare/v5.2.0...HEAD
+[Unreleased]: https://github.com/beenuar/AiSOC/compare/v11.1.0...HEAD
+[11.1.0]: https://github.com/beenuar/AiSOC/compare/v11.0.0...v11.1.0
+[11.0.0]: https://github.com/beenuar/AiSOC/compare/v10.0.0...v11.0.0
+[10.0.0]: https://github.com/beenuar/AiSOC/compare/v9.0.0...v10.0.0
+[9.0.0]: https://github.com/beenuar/AiSOC/compare/v8.1.1...v9.0.0
+[8.1.1]: https://github.com/beenuar/AiSOC/compare/v8.1.0...v8.1.1
+[8.1.0]: https://github.com/beenuar/AiSOC/compare/v8.0.0...v8.1.0
+[8.0.0]: https://github.com/beenuar/AiSOC/compare/v7.7.0...v8.0.0
 [5.2.0]: https://github.com/beenuar/AiSOC/compare/v5.1.0...v5.2.0
 [5.1.0]: https://github.com/beenuar/AiSOC/compare/v5.0.0...v5.1.0
 [5.0.0]: https://github.com/beenuar/AiSOC/compare/v4.1.0...v5.0.0

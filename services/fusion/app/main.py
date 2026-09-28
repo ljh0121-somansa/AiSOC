@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 import redis.asyncio as aioredis
 from fastapi import FastAPI
 
-from app._health import install_health_routes
+from app._health import install_health_routes, register_subscription
 from app.api.router import router, set_worker
 from app.core.config import settings
 from app.core.logging import configure_logging, logger
@@ -17,12 +17,30 @@ from app.services.confidence import ConfidenceScorer
 from app.services.correlator import Correlator
 from app.services.deduplicator import Deduplicator
 from app.services.detection_engine import DetectionEngine
+from app.services.dlq_sink import PostgresDLQ
 from app.services.entity_risk import EntityRiskEngine
 from app.services.fusion_engine import FusionEngine
 from app.services.lake_writer import LakeWriter
 from app.services.ueba_signal import UebaSignalCache
 from app.services.windowed_detection import WindowedDetectionEngine
 from app.workers.consumer import FusionWorker
+
+
+def _log_worker_exit(task: asyncio.Task) -> None:
+    """Say why the consume loop stopped, whatever the reason.
+
+    A worker that ends cleanly is as much of a problem as one that raises:
+    either way nothing is consuming ``raw_events`` any more, and both used to
+    be silent.
+    """
+    if task.cancelled():
+        logger.info("fusion.worker_cancelled")
+        return
+    exc = task.exception()
+    if exc is None:
+        logger.error("fusion.worker_exited", detail="consume loop returned; the subscription is gone")
+        return
+    logger.error("fusion.worker_died", error=str(exc), error_type=type(exc).__name__, exc_info=exc)
 
 
 @asynccontextmanager
@@ -92,9 +110,20 @@ async def lifespan(app: FastAPI):
     detector = DetectionEngine() if settings.detection_engine_enabled else None
     # Wave 2 — windowed detections share the fusion Redis for sliding-window state.
     windowed_detector = WindowedDetectionEngine(redis_client) if settings.windowed_detection_enabled else None
+    # Dead letters go to Postgres so they can be read back. Until now the
+    # worker defaulted to LoggingDLQ, so a dropped event produced a log
+    # line and nothing else — and an invisible drop is indistinguishable
+    # from an event that never arrived.
+    #
+    # The pool is passed as a callable because `sink.start()` opens it
+    # during `worker.start()`, after this point; capturing it eagerly would
+    # capture None and drop every dead letter.
+    dlq = PostgresDLQ(lambda: sink._pool) if sink is not None else None
+
     worker = FusionWorker(
         engine,
         sink=sink,
+        dlq=dlq,
         lake=lake,
         detector=detector,
         windowed_detector=windowed_detector,
@@ -102,8 +131,16 @@ async def lifespan(app: FastAPI):
     )
     set_worker(worker)
 
-    # Start Kafka worker as a background task
+    # Start Kafka worker as a background task.
+    #
+    # The done-callback is what makes a dead worker findable. The task is held
+    # on app.state, so it is never garbage-collected and asyncio never emits
+    # its "Task exception was never retrieved" warning — without this, a
+    # consume loop that died took the reason with it. The matching readiness
+    # probe below is what stops /readyz answering 200 afterwards.
     worker_task = asyncio.create_task(worker.start())
+    worker_task.add_done_callback(_log_worker_exit)
+    register_subscription(app, "alerts+raw_events", lambda: worker.attached)
     app.state.worker_task = worker_task
     app.state.redis = redis_client
 

@@ -3,7 +3,7 @@
 // T1.2 (v8.0) extends the T1.1 ingest-side graph writer: every event that
 // names a resource gets the resource's *configuration at event-time*
 // attached as a versioned :Configuration node connected via
-// ``:CONFIGURED_AS {ts}``. The whole point is "what did this S3 bucket /
+// :CONFIGURED_AS {ts}. The whole point is "what did this S3 bucket /
 // IAM policy / GitHub repo look like the moment the alert fired", which is
 // the difference between "the bucket is public NOW" (boring) and "the bucket
 // was made public 90 seconds before the data exfil" (incident-defining).
@@ -24,11 +24,11 @@
 //
 // Two pluggable seams:
 //
-//   - ``Provider``: how the snapshotter actually fetches the config.
+//   - Provider: how the snapshotter actually fetches the config.
 //     Production wires an HTTP provider that calls the connectors service.
-//     Tests wire ``StaticProvider`` with a fixture map.
+//     Tests wire StaticProvider with a fixture map.
 //
-//   - ``Cache``: how snapshots are remembered between events. See cache.go.
+//   - Cache: how snapshots are remembered between events. See cache.go.
 //
 // Failure isolation: a Provider error is logged + the snapshot is skipped.
 // The graph writer still upserts the underlying :Resource node, so the
@@ -46,7 +46,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	urlpkg "net/url"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -56,13 +58,13 @@ import (
 
 // ErrNotImplemented is the sentinel returned by Provider implementations
 // that don't (yet) support a given connector. Mirrors the Python
-// ``BaseConnector.get_resource_config`` default. The snapshotter treats
+// BaseConnector.get_resource_config default. The snapshotter treats
 // this as a soft skip — no error counter, no log spam.
 var ErrNotImplemented = errors.New("snapshot: get_resource_config not implemented")
 
 // Provider fetches a resource's configuration at event time.
 //
-// Implementations MUST honor ``ctx`` deadlines aggressively: the
+// Implementations MUST honor ctx deadlines aggressively: the
 // snapshotter sits on the graph flush path and a slow provider would push
 // back on the writer queue.
 type Provider interface {
@@ -75,17 +77,17 @@ type Provider interface {
 }
 
 // StaticProvider is the test-friendly Provider. Configs are keyed by
-// ``connectorID + resourceID``; entries can be time-ordered to model
+// connectorID + resourceID; entries can be time-ordered to model
 // configuration history (the AWS Config-style fixture).
 type StaticProvider struct {
 	// Configs is the per-connector resource config history. The history
-	// MUST be sorted by Recorded ascending; ``GetResourceConfig`` returns
+	// MUST be sorted by Recorded ascending; GetResourceConfig returns
 	// the most recent entry whose Recorded <= ts.
 	Configs map[string]map[string][]ConfigSnapshot
 }
 
-// ConfigSnapshot is one point-in-time configuration. ``Recorded`` is when
-// the config took effect; ``Data`` is the connector-specific payload.
+// ConfigSnapshot is one point-in-time configuration. Recorded is when
+// the config took effect; Data is the connector-specific payload.
 type ConfigSnapshot struct {
 	Recorded time.Time
 	Data     map[string]interface{}
@@ -134,18 +136,33 @@ func (p *StaticProvider) GetResourceConfig(_ context.Context, connectorID, resou
 //
 // Endpoint contract:
 //
-//	GET {BaseURL}/v1/connectors/{connector_id}/resource-config?
+//	GET {BaseURL}/api/v1/connectors/instances/{instance_id}/resource-config?
 //	      resource_id={resource_id}&ts={rfc3339}
 //
-// 200 JSON body                → return as map
+// 200 JSON body                 → return as map
 // 404 / 501 / "not_implemented" → ErrNotImplemented (soft skip)
 // other non-2xx                 → error (snapshotter logs + skips)
+//
+// This previously pointed at `/v1/connectors/{id}/resource-config`, which no
+// router served: the real route was a POST at
+// `/api/v1/connectors/{id}/resource_config` taking decrypted credentials in
+// the body. Four mismatches at once — method, prefix, separator, payload —
+// and the last one is not a typo. This service has no vault, so it cannot
+// supply `auth_config` at all; renaming the URL would have turned a silent
+// 404 into a silent 422. The instance-scoped route above resolves the
+// credentials itself, the same way the connector scheduler does at poll time.
+//
+// Both failures were invisible because a 404 maps to ErrNotImplemented, which
+// the snapshotter treats as a soft skip — so an operator saw
+// "T1.2 config snapshots enabled" and zero Configuration nodes, with nothing
+// in the log. `snapshotsSkippedTotal` is now reported so a permanent skip is
+// distinguishable from a connector that genuinely cannot time-travel.
 type HTTPProvider struct {
 	BaseURL string
 	Client  *http.Client
 }
 
-// NewHTTPProvider constructs the production provider. ``timeout`` caps each
+// NewHTTPProvider constructs the production provider. timeout caps each
 // round-trip — defaults to 1.5s if non-positive (matches
 // AISOC_SNAPSHOT_PROVIDER_TIMEOUT_MS).
 func NewHTTPProvider(baseURL string, timeout time.Duration) *HTTPProvider {
@@ -162,9 +179,17 @@ func (p *HTTPProvider) GetResourceConfig(ctx context.Context, connectorID, resou
 	if p.BaseURL == "" {
 		return nil, ErrNotImplemented
 	}
+	// Query values are escaped: a resource id is vendor-supplied (an ARN, an
+	// Okta app id) and can contain `&`, `/` and `#`, which would otherwise
+	// truncate the URL or inject a parameter.
 	url := fmt.Sprintf(
-		"%s/v1/connectors/%s/resource-config?resource_id=%s&ts=%s",
-		p.BaseURL, connectorID, resourceID, ts.UTC().Format(time.RFC3339),
+		"%s/api/v1/connectors/instances/%s/resource-config?%s",
+		strings.TrimRight(p.BaseURL, "/"),
+		urlpkg.PathEscape(connectorID),
+		urlpkg.Values{
+			"resource_id": {resourceID},
+			"ts":          {ts.UTC().Format(time.RFC3339)},
+		}.Encode(),
 	)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -203,11 +228,11 @@ type Snapshotter struct {
 
 	// metrics — atomic counters surfaced for tests and the Prometheus
 	// collector.
-	hits        atomic.Uint64
-	misses      atomic.Uint64
-	errors      atomic.Uint64
-	skipped     atomic.Uint64
-	attached    atomic.Uint64
+	hits     atomic.Uint64
+	misses   atomic.Uint64
+	errors   atomic.Uint64
+	skipped  atomic.Uint64
+	attached atomic.Uint64
 }
 
 // Config wires the snapshotter at construction time.
@@ -323,13 +348,32 @@ func (s *Snapshotter) Apply(ctx context.Context, ev *graph.Event) {
 			TenantID:   ev.TenantID,
 			Properties: props,
 		})
+		// `valid_from` / `valid_to` / `is_current` are declared in
+		// schemas/graph-schema.yaml and the published graph-schema doc
+		// advertises an O(1) "latest configuration" lookup via
+		// `:CONFIGURED_AS {is_current: true}`. Nothing wrote any of the three,
+		// so that documented query matched zero edges. The drift gate could
+		// not catch it because it only validates properties on edges declared
+		// `event_edge: true`, and this one is structural.
+		//
+		// `valid_to` is left nil rather than zero: an open interval is not the
+		// same as one that closed at the epoch, and a reader filtering
+		// `valid_to < now` would otherwise exclude the current configuration.
+		// Closing the previous interval needs a read-modify-write against the
+		// graph, which the ingest hot path deliberately does not do — so
+		// `is_current` is true on write and a traversal takes the newest
+		// `valid_from`, with the caveat recorded in the schema doc.
+		validFrom := ev.TS.UTC().Format(time.RFC3339Nano)
 		ev.Edges = append(ev.Edges, graph.Edge{
 			Type:      graph.RelConfiguredAs,
 			FromLabel: graph.NodeResource, FromKey: ref.NaturalKey,
 			ToLabel: graph.NodeConfiguration, ToKey: configKey,
 			Properties: map[string]interface{}{
-				"ts":           ev.TS.UTC().Format(time.RFC3339Nano),
+				"ts":           validFrom,
 				"connector_id": connectorID,
+				"snapshot_id":  configKey,
+				"valid_from":   validFrom,
+				"is_current":   true,
 			},
 		})
 		digestParts = append(digestParts, configKey)
@@ -414,7 +458,7 @@ func resourceRefsFromEvent(ev *graph.Event, connectorID string) []resourceRef {
 }
 
 // connectorIDForEvent looks at any :Resource / :Repo / :SaaSApp / :User
-// node and returns the ``provider`` property the extractor stamps. That's
+// node and returns the provider property the extractor stamps. That's
 // the connector_id the snapshotter dispatches on.
 //
 // Falls back to the first :Resource's connector hint, or "" if no node

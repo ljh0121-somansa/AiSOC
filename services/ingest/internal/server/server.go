@@ -18,6 +18,7 @@ import (
 	"github.com/go-chi/cors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog/log"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 // resolveCORSOrigins mirrors the shared Python helper in services/api/app/core/cors.py:
@@ -46,8 +47,6 @@ func resolveCORSOrigins() []string {
 		"http://localhost:3001",
 		"http://127.0.0.1:3000",
 		"http://127.0.0.1:3001",
-		"https://tryaisoc.com",
-		"https://www.tryaisoc.com",
 	}
 }
 
@@ -74,14 +73,31 @@ func New(cfg *config.Config, h *handler.Handler, inboxHandler *inbox.Handler, gr
 	// Middleware
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
+	// Continues a trace started upstream rather than beginning a new one:
+	// the propagator reads W3C traceparent, so an API request that reaches
+	// ingest stays one trace instead of becoming two disconnected ones.
+	// No-op when tracing is disabled, since the global provider is a
+	// no-op provider in that case.
+	r.Use(func(next http.Handler) http.Handler {
+		return otelhttp.NewHandler(next, "ingest")
+	})
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(30 * time.Second))
 	// Allow-list is resolved from AISOC_CORS_ORIGINS (canonical) / CORS_ORIGINS
-	// (legacy) with a safe default for local dev + the tryaisoc.com console.
-	// AllowCredentials stays false here — /v1/ingest is token-authenticated
-	// per request, not session-cookie-authenticated, so we don't need the
-	// browser to attach cookies cross-origin and we keep the spec-mandated
-	// rejection of "*"+credentials safely impossible.
+	// (legacy) with a safe default that covers local dev only; deployed
+	// origins are expected to set the env var.
+	// AllowCredentials stays false here. Every route on this service is
+	// authenticated by a credential the caller presents per request — a
+	// minted push token or a service token on /v1/ingest, an inbox token
+	// on /v1/inbox/*, the shared secret on /v1/ingest/k8s-audit — and
+	// never by a session cookie, so the browser has no reason to attach
+	// one cross-origin and the spec-mandated rejection of
+	// "*"+credentials stays safely impossible.
+	//
+	// This comment previously asserted that /v1/ingest was
+	// token-authenticated per request. It was not: the handler read a
+	// caller-supplied X-Tenant-ID header and checked nothing. The claim
+	// is true as of the credential check in internal/ingestauth.
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   resolveCORSOrigins(),
 		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
@@ -91,7 +107,13 @@ func New(cfg *config.Config, h *handler.Handler, inboxHandler *inbox.Handler, gr
 	}))
 
 	// Routes
+	// Liveness and readiness are separate questions, and this service only
+	// answered the first one. /health returned 200 whether or not Kafka was
+	// reachable — so "ingest is healthy" and "every event is being dropped"
+	// could both be true at once. /readyz probes the broker.
 	r.Get("/health", h.Health)
+	r.Get("/livez", h.Livez)
+	r.Get("/readyz", h.Readyz)
 	r.Get("/metrics", promhttp.Handler().ServeHTTP)
 
 	r.Route("/v1", func(r chi.Router) {

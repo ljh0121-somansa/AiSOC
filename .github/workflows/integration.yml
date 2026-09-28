@@ -17,9 +17,9 @@ name: Integration
 #                      fresh Postgres 16, is idempotent on re-run (strict
 #                      mode), and the UEBA alembic chain round-trips
 #                      upgrade → downgrade → upgrade.
-#   backup-restore   — scripts/backup.sh + restore.sh against Postgres 16 +
-#                      MinIO: seed → backup → destroy → restore → assert
-#                      full data integrity. Publishes measured RTO. An
+#   backup-restore   — scripts/backup.sh + restore.sh against Postgres 16 and
+#                      a real S3 endpoint: seed → backup → destroy → restore →
+#                      assert full data integrity. Publishes measured RTO. An
 #                      untested backup is not a backup.
 #   upgrade          — install a prior release's migration set, seed data,
 #                      then upgrade to HEAD and migrate: assert the seeded
@@ -31,34 +31,23 @@ name: Integration
 # `:main` — those surfaces are gated by compose-smoke.yml with its own
 # rebuild-on-change detection.
 
+# Deliberately NOT path-filtered at the workflow level.
+#
+# It was, and that is what kept `Backup → destroy → restore` from being a
+# required check: a workflow that does not trigger reports nothing, and a
+# required check that never reports blocks the pull request forever. That gate
+# is the only thing proving the documented disaster-recovery path works, and
+# `docs/audit/CLAIM_TO_GATE_MATRIX.md` already cites it as the GATED evidence
+# for backup encryption — a row marked GATED whose gate is neither required
+# nor guaranteed to run makes that file a liability rather than a control.
+#
+# The condition moved into the jobs. `changes` computes it once; the three
+# expensive jobs skip on it, and `backup-restore` always runs and reports a
+# verdict under the same name whether or not it had work to do.
 on:
   pull_request:
-    paths:
-      - 'services/ingest/**'
-      - 'services/fusion/**'
-      - 'services/realtime/**'
-      - 'services/api/migrations/**'
-      - 'services/api/app/scripts/run_migrations.py'
-      - 'services/ueba/alembic/**'
-      - 'docker-compose.yml'
-      - 'scripts/integration/**'
-      - 'scripts/backup.sh'
-      - 'scripts/restore.sh'
-      - '.github/workflows/integration.yml'
   push:
     branches: [main]
-    paths:
-      - 'services/ingest/**'
-      - 'services/fusion/**'
-      - 'services/realtime/**'
-      - 'services/api/migrations/**'
-      - 'services/api/app/scripts/run_migrations.py'
-      - 'services/ueba/alembic/**'
-      - 'docker-compose.yml'
-      - 'scripts/integration/**'
-      - 'scripts/backup.sh'
-      - 'scripts/restore.sh'
-      - '.github/workflows/integration.yml'
   workflow_dispatch:
 
 concurrency:
@@ -69,32 +58,148 @@ permissions:
   contents: read
 
 jobs:
+  # ── What this pull request touches ─────────────────────────────────────────
+  # One diff, read by every job below, so the four of them cannot disagree
+  # about what changed. Fail-open throughout: with no base to diff against,
+  # every area reads as touched, because a gate that quietly declines to run
+  # is indistinguishable from one that passed.
+  changes:
+    name: What this change touches
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      spine: ${{ steps.areas.outputs.spine }}
+      migrations: ${{ steps.areas.outputs.migrations }}
+      backup: ${{ steps.areas.outputs.backup }}
+      upgrade: ${{ steps.areas.outputs.upgrade }}
+      replay: ${{ steps.areas.outputs.replay }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve the areas touched
+        id: areas
+        run: |
+          set -euo pipefail
+
+          spine_paths='services/ingest/ services/fusion/ services/realtime/ docker-compose.yml scripts/integration/ .github/workflows/integration.yml'
+          migration_paths='services/api/migrations/ services/api/app/scripts/run_migrations.py services/ueba/alembic/ services/api/tests/test_mssp_portfolio_isolation.py tests/isolation/test_postgres_rls.py scripts/check_runtime_db_role.py .github/workflows/integration.yml'
+          # backup_crypt.py was missing from the old filter, and it is where
+          # every byte of the AES-256-GCM implementation lives — so a change
+          # to the encryption itself did not run the gate that proves the
+          # encryption works.
+          backup_paths='scripts/backup.sh scripts/restore.sh scripts/backup_crypt.py .github/workflows/integration.yml'
+          upgrade_paths='services/api/migrations/ services/api/app/scripts/run_migrations.py .github/workflows/integration.yml'
+          # Replay evaluation spans four services, the CLI and the scorer, and
+          # the only thing that proves the whole chain is the end-to-end run.
+          # Every tree it crosses is listed, because a change to any one of
+          # them can break a link none of the unit suites can see.
+          replay_paths='services/api/app/services/replay_evaluation/ services/api/app/api/v1/endpoints/evaluations.py services/api/app/_vendor/aisoc_benchmark/ services/agents/app/replay/ services/agents/app/api/replay_router.py services/actions/app/api/replay_history_router.py services/actions/app/services/alert_history.py services/connectors/app/api/router.py packages/aisoc-benchmark/ packages/aisoc-cli/ tests/e2e/test_replay_cli_end_to_end.py .github/workflows/integration.yml'
+
+          base_ref=""
+          if [ -n "${{ github.base_ref }}" ]; then
+            git fetch --no-tags --depth=50 origin "${{ github.base_ref }}" || true
+            base_ref="origin/${{ github.base_ref }}"
+          elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            base_ref="${{ github.event.before }}"
+          fi
+
+          emit_all_true() {
+            for area in spine migrations backup upgrade replay; do
+              echo "${area}=true" >> "$GITHUB_OUTPUT"
+            done
+          }
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "manual dispatch: running every area"
+            emit_all_true
+            exit 0
+          fi
+          if [ -z "${base_ref}" ]; then
+            echo "no diff base; running every area"
+            emit_all_true
+            exit 0
+          fi
+
+          diff_status=0
+          changed=$(git diff --name-only "${base_ref}"...HEAD) || diff_status=$?
+          if [ "${diff_status}" -ne 0 ]; then
+            echo "git diff vs ${base_ref} failed (exit ${diff_status}); running every area"
+            emit_all_true
+            exit 0
+          fi
+          echo "${changed}" > /tmp/changed.txt
+          echo "files changed vs ${base_ref}: $(wc -l < /tmp/changed.txt)"
+
+          decide() {
+            local area="$1"; shift
+            local hit=false
+            for prefix in $@; do
+              if grep -q "^${prefix}" /tmp/changed.txt; then hit=true; break; fi
+            done
+            echo "  ${area}: ${hit}"
+            echo "${area}=${hit}" >> "$GITHUB_OUTPUT"
+          }
+          decide spine       "${spine_paths}"
+          decide migrations  "${migration_paths}"
+          decide backup      "${backup_paths}"
+          decide upgrade     "${upgrade_paths}"
+          decide replay      "${replay_paths}"
+
   # ── The spine, end to end ──────────────────────────────────────────────────
   spine:
     name: Event spine (real containers)
+    # Not a required check, so a job-level skip is fine here: nothing is waiting on it to report.
+    needs: changes
+    if: needs.changes.outputs.spine == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
       AISOC_VERSION: main
       COMPOSE_PROJECT_NAME: aisoc-integration
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: '3.12'
+          python-version: '3.11'
 
       - name: Install test dependencies
         run: pip install --quiet httpx websockets
 
+      # /v1/ingest is authenticated and the tenant is derived from the
+      # credential, so the spine test has to hold one.
+      #
+      # It uses the service-token shape rather than a minted per-tenant
+      # token because this job deliberately runs the published API image
+      # (only fusion and ingest are built from source), so the mint command
+      # may not exist in it. That is not a workaround: the two shapes are
+      # both real, the golden pipeline covers the minted-token path against
+      # an API built from source, and this covers the delegated path that
+      # services/connectors uses — including the tenant check, since the
+      # ingest service validates the declared tenant against the tenants
+      # table before it becomes a scope.
       - name: Seed environment file
         run: |
+          set -euo pipefail
           cp .env.example .env
           if grep -q '^AISOC_VERSION=' .env; then
             sed -i "s|^AISOC_VERSION=.*|AISOC_VERSION=${AISOC_VERSION}|" .env
           else
             printf '\nAISOC_VERSION=%s\n' "${AISOC_VERSION}" >> .env
           fi
+
+          token="$(openssl rand -hex 32)"
+          echo "::add-mask::$token"
+          # Written into .env so compose substitutes it into the ingest and
+          # connectors services; exported so the spine test presents it.
+          sed -i "s|^AISOC_SERVICE_TOKEN=.*|AISOC_SERVICE_TOKEN=${token}|" .env
+          grep -q "^AISOC_SERVICE_TOKEN=${token}$" .env || {
+            echo "::error::AISOC_SERVICE_TOKEN was not written into .env — check that .env.example still declares it"
+            exit 1
+          }
+          echo "AISOC_INGEST_TOKEN=${token}" >> "$GITHUB_ENV"
 
       - name: Pre-pull published images
         run: docker compose pull --ignore-pull-failures --quiet || true
@@ -105,8 +210,52 @@ jobs:
       - name: Build fusion + ingest from source
         run: docker compose build fusion ingest-worker
 
-      - name: Boot stack
-        run: docker compose up -d
+      # This job verifies the FULL architecture — it asserts below that the
+      # ClickHouse event lake is populated — so it must boot the `full`
+      # profile. ClickHouse, Neo4j and the rest moved behind that profile so
+      # a plain `docker compose up` is the 10-service CORE pipeline.
+      #
+      # The two flags travel with the profile: the lake writer and the graph
+      # writer target stores that only exist in `full`, and in CORE they
+      # default off rather than retrying against a host that is not there.
+      - name: Boot stack (full profile — this job asserts on the lake)
+        env:
+          AISOC_LAKE_WRITER_ENABLED: "true"
+          AISOC_GRAPH_ENABLED: "true"
+        run: docker compose --profile full up -d
+
+      # The credential must be refused when it is absent, or the spine test
+      # passing tells us only that a push works — not that an unauthenticated
+      # one is stopped. Cheap, and it runs against the live service.
+      - name: An unauthenticated push is refused
+        run: |
+          set -uo pipefail
+          # The stack was started asynchronously, so wait for ingest to
+          # answer before concluding anything about what it answers. Without
+          # this the probe raced the boot and curl exited 56 (connection
+          # closed) — which is neither a refusal nor an acceptance.
+          for _ in $(seq 1 60); do
+            [ "$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://localhost:8081/health || echo 000)" = "200" ] && break
+            sleep 5
+          done
+          if [ "$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://localhost:8081/health || echo 000)" != "200" ]; then
+            echo "::error::ingest never became reachable, so the refusal could not be checked"
+            docker compose logs --tail=60 --no-color ingest-worker || true
+            exit 1
+          fi
+
+          code="$(curl -s -o /tmp/unauth.json -m 20 -w '%{http_code}' \
+            -X POST http://localhost:8081/v1/ingest/batch \
+            -H 'Content-Type: application/json' \
+            -H 'X-Tenant-ID: 00000000-0000-0000-0000-000000000001' \
+            -d '{"connector_id":"unauth","connector_type":"crowdstrike_falcon","source_format":"json","events":[{"severity":"critical","title":"unauthenticated probe"}]}' \
+            || echo 000)"
+          if [ "$code" != "401" ] && [ "$code" != "403" ]; then
+            echo "::error::an unauthenticated push to /v1/ingest returned $code, expected 401/403"
+            cat /tmp/unauth.json || true
+            exit 1
+          fi
+          echo "confirmed: /v1/ingest refused an unauthenticated push with $code"
 
       - name: Run spine test
         run: python3 scripts/integration/spine_test.py
@@ -157,8 +306,32 @@ jobs:
           [ "${running}" = "true" ] || { echo "::error::connectors container is not running"; docker compose logs --tail=60 --no-color connectors || true; exit 1; }
 
           echo "── ingest enabled the graph writer ──"
-          docker compose logs --no-color ingest-worker 2>/dev/null | grep -q "graph: ingest-side writer enabled" \
-            || { echo "::error::graph-at-ingest was not enabled by default"; docker compose logs --tail=60 --no-color ingest-worker || true; exit 1; }
+          # Capture first, then grep the capture. This step runs under
+          # `set -euo pipefail`, and the previous shape
+          #
+          #   docker compose logs … 2>/dev/null | grep -q "<early match>"
+          #
+          # fails intermittently *when the match succeeds*. `grep -q` exits
+          # the instant it matches — and this string is line 4 of the
+          # service's output — which closes the pipe while `docker compose`
+          # is still writing. Compose exits 255 on the broken pipe, and
+          # `pipefail` promotes that over grep's 0, so the pipeline reports
+          # failure over a line that is present. Reproduced deterministically:
+          # with a large log the pipeline returns 255 every time, with a small
+          # one that fits the pipe buffer it returns 0 every time, and the
+          # match is in both. That size dependence is why it read as a flake.
+          #
+          # `2>/dev/null` made it worse by discarding the only message that
+          # would have distinguished "compose failed" from "the line is
+          # absent", so the run reported the wrong cause. Compose's stderr is
+          # now kept and its exit status checked on its own.
+          if ! docker compose logs --no-color ingest-worker > /tmp/ingest-worker.log 2>/tmp/ingest-worker.err; then
+            echo "::error::could not read ingest-worker logs — this is not the same as the graph writer being off"
+            cat /tmp/ingest-worker.err || true
+            exit 1
+          fi
+          grep -q "graph: ingest-side writer enabled" /tmp/ingest-worker.log \
+            || { echo "::error::graph-at-ingest was not enabled by default"; tail -60 /tmp/ingest-worker.log || true; exit 1; }
 
           echo "── graph has nodes after the spine flowed ──"
           ok=""
@@ -246,9 +419,111 @@ jobs:
         if: always()
         run: docker compose down -v --remove-orphans
 
+  # ── Replay evaluation, end to end ──────────────────────────────────────────
+  # Phase 1's acceptance bar: the CLI, run against a mocked Splunk ES holding
+  # 200 recorded closed notables, produces a report that reproduces byte for
+  # byte on a second run with the deterministic model path.
+  #
+  # It cannot be a unit test in any service's suite. The chain crosses
+  # `services/actions` (the SIEM credentials and the closed-finding readers),
+  # `services/connectors` (the production `normalize()`), `services/agents`
+  # (triage) and `services/api` (the orchestration, the vault and the tenant
+  # session), and all four package their code as a top-level `app`, so one
+  # process can hold exactly one of them. The harness starts each from the
+  # working tree rather than from a published image, so this proves the code
+  # in the diff.
+  #
+  # The end-to-end run is also what found the defect that made this necessary:
+  # `POST /connectors/{id}/normalize` shipped with no caller and its client
+  # built a URL missing the prefix the connectors service mounts under, so
+  # every request would have 404'd. Three green unit suites could not see it.
+  #
+  # AISOC_REPLAY_E2E_REQUIRED turns an unreachable database into a failure
+  # rather than a skip, for the same reason as the jobs below: a gate that
+  # quietly declines to run looks identical to one that passed.
+  replay-e2e:
+    name: Replay evaluation (CLI to API to report, four services)
+    needs: changes
+    if: needs.changes.outputs.replay == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: aisoc
+          POSTGRES_PASSWORD: aisoc_ci_secret
+          POSTGRES_DB: aisoc
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aisoc"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # The two roles the default deployment ships. The services connect as
+      # aisoc_app, which is DML-only and which the RLS policies apply to;
+      # aisoc is the owner and runs DDL and nothing else. Wiring this job as a
+      # single superuser would measure a role nothing runs as, which is what
+      # `check_runtime_db_role.py` refuses.
+      AISOC_E2E_DATABASE_URL: postgresql+asyncpg://aisoc_app:aisoc_app_ci_secret@localhost:5432/aisoc
+      AISOC_E2E_DATABASE_MIGRATION_URL: postgresql+asyncpg://aisoc:aisoc_ci_secret@localhost:5432/aisoc
+      AISOC_APP_DB_PASSWORD: aisoc_app_ci_secret
+      AISOC_REPLAY_E2E_REQUIRED: '1'
+      ENVIRONMENT: development
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      # The union of what the four services import on this path. Same version
+      # bounds as ci.yml's per-service jobs, because a chain that only works
+      # on a different resolution is not the chain that ships.
+      #
+      # `mcp` is here because `app/main.py` imports the replay router, which
+      # reaches `deep_investigation`, which imports `app.mcp.tools` at module
+      # scope. It was added to the agents service and to ci.yml's agents job
+      # and not to this list, and this job only runs when the replay paths
+      # change, so the first pull request to touch them since was the first to
+      # see the agents service fail to boot at all. That is the stale-green
+      # shape: a path-filtered job cannot report a breaker it never ran for.
+      # Pinned exactly, matching `services/agents/pyproject.toml`.
+      - name: Install the four services' shared dependencies
+        run: >-
+          pip install --quiet
+          pytest pytest-asyncio uvicorn
+          "fastapi>=0.117,<0.142" "pydantic[email]" pydantic-settings "sqlalchemy[asyncio]" asyncpg
+          structlog "PyJWT>=2.8,<3" "cryptography>=46,<51" "passlib[bcrypt]" tenacity pyyaml
+          prometheus-client "opentelemetry-sdk" "opentelemetry-api"
+          "opentelemetry-exporter-otlp-proto-grpc"
+          "opentelemetry-instrumentation-fastapi"
+          "opentelemetry-instrumentation-httpx"
+          "strawberry-graphql[fastapi]"
+          neo4j redis celery httpx aiofiles email-validator
+          "sqlglot>=30,<31" aiosqlite "croniter>=2.0,<7.0"
+          aiokafka apscheduler qdrant-client bcrypt
+          langgraph langchain-core langchain-openai
+          click rich jsonschema
+          "mcp==1.30.0"
+
+      # The CLI is driven as an installed console script would be, off its own
+      # source tree, so the command under test is the one the package ships.
+      - name: Replay evaluation, CLI to API to report
+        run: python -m pytest tests/e2e/test_replay_cli_end_to_end.py -v --tb=short
+
+      - name: Service logs on failure
+        if: failure()
+        run: for log in .e2e-*.log; do echo "::group::${log}"; tail -n 200 "${log}"; echo "::endgroup::"; done
+
   # ── Migration correctness ──────────────────────────────────────────────────
   migrations:
     name: Migrations (fresh apply, idempotent re-run, alembic round-trip)
+    needs: changes
+    if: needs.changes.outputs.migrations == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -266,16 +541,24 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      DATABASE_URL: postgresql+asyncpg://aisoc:aisoc_ci_secret@localhost:5432/aisoc
+      # The two roles the default deployment ships, wired the same way here.
+      # DATABASE_URL is what every service connects as: DML only, and the RLS
+      # policies apply to it. DATABASE_MIGRATION_URL is the owner, used for DDL
+      # and nothing else. Wiring this job as a single superuser is what let 92
+      # RLS policies sit inert for months while the replay below went green
+      # against a role invented by the test.
+      DATABASE_URL: postgresql+asyncpg://aisoc_app:aisoc_app_ci_secret@localhost:5432/aisoc
+      DATABASE_MIGRATION_URL: postgresql+asyncpg://aisoc:aisoc_ci_secret@localhost:5432/aisoc
+      AISOC_APP_DB_PASSWORD: aisoc_app_ci_secret
       SECRET_KEY: ci-dummy-secret-key-at-least-32bytes!
       ENVIRONMENT: development
       AISOC_MIGRATIONS_STRICT: '1'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: '3.12'
+          python-version: '3.11'
           cache: pip
 
       # Same importable-subset recipe as ci.yml's API job — run_migrations
@@ -283,14 +566,14 @@ jobs:
       - name: Install API dependencies
         run: >-
           pip install --quiet
-          fastapi "pydantic[email]" pydantic-settings "sqlalchemy[asyncio]" asyncpg
-          structlog "python-jose[cryptography]" "passlib[bcrypt]" tenacity pyyaml
+          "fastapi>=0.117,<0.142" "pydantic[email]" pydantic-settings "sqlalchemy[asyncio]" asyncpg
+          structlog "PyJWT>=2.8,<3" "cryptography>=46,<51" "passlib[bcrypt]" tenacity pyyaml
           prometheus-client "opentelemetry-sdk" "opentelemetry-api"
           "opentelemetry-exporter-otlp-proto-grpc"
           "opentelemetry-instrumentation-fastapi"
           "strawberry-graphql[fastapi]"
-          neo4j redis celery httpx aiofiles email-validator PyJWT
-          "sqlglot>=23,<27" aiosqlite "croniter>=2.0,<7.0"
+          neo4j redis celery httpx aiofiles email-validator "PyJWT>=2.8,<3"
+          "sqlglot>=30,<31" aiosqlite "croniter>=2.0,<7.0"
 
       - name: Apply full migration chain on fresh Postgres (strict)
         working-directory: services/api
@@ -314,30 +597,177 @@ jobs:
           [ "${FILES}" = "${ROWS}" ] \
             || { echo "::error::tracked migrations (${ROWS}) != migration files (${FILES})"; exit 1; }
 
-      # The UEBA package layout (app/ dir) isn't wheel-buildable; alembic's
-      # env.py only needs `app.models.ueba` importable, so run in-place with
+      # The MSSP portfolio surface reads across tenants on purpose, so
+      # "does it stay inside its portfolio" cannot be answered by a mocked
+      # session. This is the only job with a real database and the full
+      # migration chain already applied, which makes it the honest home for
+      # the replay: it seeds two organisations plus an unmanaged tenant and
+      # asserts an aggregate as one operator never returns the others.
+      #
+      # MSSP_ISOLATION_REQUIRED turns an unreachable database into a failure
+      # rather than a skip. A gate that quietly declines to run looks
+      # identical to one that passed, which is how the public scoreboard sat
+      # ten weeks stale; here it would mean shipping a cross-tenant surface
+      # with nobody having checked it stays inside its portfolio.
+      - name: Cross-tenant MSSP portfolio isolation (live Postgres)
+        working-directory: services/api
+        env:
+          MSSP_ISOLATION_REQUIRED: '1'
+        run: pip install --quiet pytest pytest-asyncio && python -m pytest tests/test_mssp_portfolio_isolation.py -v --tb=short
+
+      # 060_rls_coverage.sql takes RLS from 31 of 95 tenant-scoped tables to
+      # every one of them bar a documented exclusion. A migration that adds 49
+      # policies is worth what the evidence that they filter is worth, so the
+      # replay runs here — the only job with a real database and the full
+      # chain already applied.
+      #
+      # It reads as `DATABASE_URL`, which is the role the default deployment
+      # ships. It used to construct its own NOSUPERUSER NOBYPASSRLS role
+      # because the shipped one was a superuser that sailed past every policy;
+      # a green tick then proved a property of a role nothing ran as.
+      # 061_runtime_app_role.sql made the shipped role the one the policies are
+      # written for, so the replay now covers what ships.
+      #
+      # POSTGRES_RLS_ISOLATION_REQUIRED turns an unreachable database into a
+      # failure rather than a skip, for the same reason as the job above.
+      - name: Postgres row-level security isolation (live, two tenants, as the shipped role)
+        env:
+          POSTGRES_RLS_ISOLATION_REQUIRED: '1'
+        run: python -m pytest tests/isolation/test_postgres_rls.py -v --tb=short
+
+      # Gap-closure Phase 2.3's "Done when", run rather than reasoned about: a
+      # test tenant with 20 shadow decisions cannot enable auto-close, can
+      # once the thresholds are met, and is demoted when injected
+      # disagreements cross the drift threshold.
+      #
+      # It belongs here and nowhere else. The unit suites prove the arithmetic
+      # and prove the statements are built correctly, and between them they
+      # would still miss the failure that matters most: an aggregate that
+      # counts something slightly different from what the evaluator expects.
+      # The SQL and the evaluator agree by convention, and a convention is
+      # what drifts. Only a real Postgres executing the real statement over
+      # real rows closes that. It is also the only place the hash chain over
+      # the transitions can be verified, since it is computed on insert from
+      # the previous row for the same tenant.
+      #
+      # AUTONOMY_PROMOTION_LIVE_REQUIRED turns an unreachable database into a
+      # failure rather than a skip, for the same reason as the two jobs above.
+      - name: Evidence-gated autonomy, end to end (live Postgres)
+        working-directory: services/api
+        env:
+          AUTONOMY_PROMOTION_LIVE_REQUIRED: '1'
+        run: python -m pytest ../../tests/isolation/test_autonomy_promotion_live.py -v --tb=short
+
+      # Gap-closure Phase 6.3. A replay freezes the knowledge base with a
+      # predicate in SQL rather than with a captured set, so every offline
+      # test of that freeze proves the reader *asks* for a cutoff and none of
+      # them proves the store applies one. The statement is PostgreSQL —
+      # to_tsvector, ts_rank, FILTER, LATERAL — so it does not parse in the
+      # API's SQLite suite at all.
+      #
+      # It runs the route's own `triage_retrieval_sql`. The first version of
+      # this test formatted the template with its own copy of the cutoff
+      # clause and kept passing after the clause was deleted from the route,
+      # which is why the builder is a function with two callers.
+      #
+      # KB_CUTOFF_LIVE_REQUIRED turns an unreachable database into a failure
+      # rather than a skip, for the same reason as the jobs above.
+      - name: Knowledge-base retrieval cutoff filters and reports what it refused (live Postgres)
+        env:
+          KB_CUTOFF_LIVE_REQUIRED: '1'
+        run: python -m pytest tests/isolation/test_kb_retrieval_cutoff_live.py -v --tb=short
+
+      # The static half of this gate runs on every PR in security.yml. This is
+      # the half that can only be answered by a database: the role the
+      # deployment actually connects as, inspected in pg_roles and pg_class.
+      - name: Runtime DB role cannot bypass RLS (live)
+        run: python scripts/check_runtime_db_role.py --dsn "$DATABASE_URL" --owner-dsn "$DATABASE_MIGRATION_URL"
+
+      # These four service layouts (app/ dir) aren't wheel-buildable; each
+      # env.py only needs its own `app.*` importable, so run in-place with
       # PYTHONPATH instead of pip-installing the service.
       - name: Install alembic
-        run: pip install --quiet alembic
+        run: pip install --quiet alembic "sqlalchemy[asyncio]" asyncpg pydantic pydantic-settings
 
-      - name: UEBA alembic round-trip (upgrade → downgrade → upgrade)
-        working-directory: services/ueba
+      # Four chains, each in its own database, and each applied with **only**
+      # its migration variable in the environment — no DATABASE_URL at all.
+      #
+      # That is deliberate and is the behavioural half of a static check.
+      # `scripts/check_runtime_db_role.py` can read which variables an env.py
+      # *names*; it cannot run the file, so an env.py naming a migration
+      # credential it never reads would pass there. Here it cannot: with no
+      # runtime variable set, a chain that ignores its migration variable
+      # falls back to the hard-coded localhost default and fails to connect.
+      - name: Alembic round-trips as the owner only (upgrade → downgrade → upgrade)
         env:
-          PYTHONPATH: .
-          # Dedicated database so the SQL-runner schema above is untouched.
-          DATABASE_URL: postgresql+asyncpg://aisoc:aisoc_ci_secret@localhost:5432/ueba_ci
+          PGPASSWORD: aisoc_ci_secret
         run: |
           set -euo pipefail
-          PGPASSWORD=aisoc_ci_secret psql -h localhost -U aisoc -d aisoc -c "CREATE DATABASE ueba_ci"
-          alembic upgrade head
-          alembic downgrade base
-          alembic upgrade head
-          echo "alembic round-trip clean"
+          for db in ueba_ci honeytokens_ci purple_team_ci osquery_tls_ci; do
+            psql -h localhost -U aisoc -d aisoc -c "CREATE DATABASE $db"
+          done
+          # aisoc-db-role: owner — alembic applies DDL; these are the owner's, and no runtime DSN is set here
+          owner=postgresql+asyncpg://aisoc:aisoc_ci_secret@localhost:5432
+          round_trip () {
+            echo "── $1 ($2)"
+            ( cd "services/$1" \
+              && env -u DATABASE_URL PYTHONPATH=. "$2=$owner/$3" sh -euc \
+                   'alembic upgrade head && alembic downgrade base && alembic upgrade head' )
+          }
+          round_trip ueba         UEBA_DATABASE_MIGRATION_URL             ueba_ci
+          round_trip honeytokens  HONEYTOKEN_DATABASE_MIGRATION_URL       honeytokens_ci
+          round_trip purple-team  PURPLE_TEAM_DATABASE_MIGRATION_URL      purple_team_ci
+          round_trip osquery-tls  AISOC_OSQUERY_TLS_DATABASE_MIGRATION_URL osquery_tls_ci
+          echo "alembic round-trips clean"
+
+      # The four chains share one database in the default deployment, and used
+      # to share one `alembic_version` table with it — so the second chain to
+      # run believed it was already at head. Measured before the fix: after
+      # ueba reached 0002, honeytokens ran zero migrations and purple-team
+      # failed applying RLS to tables that were never created, leaving two
+      # services with no tenant policies and nothing saying so.
+      #
+      # The assertion is on the tables, not on the exit status: every chain
+      # "succeeded" while that was true.
+      - name: Four chains, one database (per-chain version tables)
+        env:
+          PGPASSWORD: aisoc_ci_secret
+        run: |
+          set -euo pipefail
+          psql -h localhost -U aisoc -d aisoc -c "CREATE DATABASE shared_ci"
+          # aisoc-db-role: owner — the four chains apply DDL here; no runtime DSN is set
+          shared=postgresql+asyncpg://aisoc:aisoc_ci_secret@localhost:5432/shared_ci
+          for pair in "ueba:UEBA_DATABASE_MIGRATION_URL" \
+                      "honeytokens:HONEYTOKEN_DATABASE_MIGRATION_URL" \
+                      "purple-team:PURPLE_TEAM_DATABASE_MIGRATION_URL" \
+                      "osquery-tls:AISOC_OSQUERY_TLS_DATABASE_MIGRATION_URL"; do
+            ( cd "services/${pair%%:*}" && env -u DATABASE_URL PYTHONPATH=. "${pair##*:}=$shared" alembic upgrade head )
+          done
+          missing=0
+          for t in ueba_anomalies honeytokens honeytoken_triggers \
+                   purple_team_executions purple_team_detection_drift_snapshots \
+                   osquery_node fim_event; do
+            if [ "$(psql -h localhost -U aisoc -d shared_ci -tAc "SELECT to_regclass('public.$t') IS NOT NULL")" != "t" ]; then
+              echo "::error::$t was not created — a chain believed itself at head over a sibling's version row"
+              missing=$((missing + 1))
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          echo "all four chains applied to one database"
 
   # ── Disaster recovery: an untested backup is not a backup ─────────────────
+  #
+  # Unlike the three jobs above, this one has no job-level `if`. It runs on
+  # every pull request and reports under the same check name whether or not it
+  # had work to do, because it is meant to be a *required* check and a
+  # required check that never reports blocks the pull request forever. The
+  # condition is on the steps instead, so the expensive half — a Postgres, an
+  # S3 endpoint, a full dump-and-restore — is skipped when the diff touches
+  # none of it, and the verdict still arrives.
   backup-restore:
-    name: Backup → destroy → restore (Postgres via MinIO)
+    name: Backup → destroy → restore (Postgres via S3)
     runs-on: ubuntu-latest
+    needs: changes
     timeout-minutes: 15
     services:
       postgres:
@@ -354,6 +784,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
+      # aisoc-db-role: owner — pg_dump/pg_restore read and rewrite every table, including ones the runtime role cannot
       POSTGRES_URL: postgresql://aisoc:aisoc_ci_secret@localhost:5432/aisoc
       BACKUP_S3_BUCKET: s3://aisoc-dr-test
       BACKUP_S3_PREFIX: ci-dr
@@ -361,29 +792,104 @@ jobs:
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_ENDPOINT_URL: http://localhost:9000
       AWS_DEFAULT_REGION: us-east-1
+      # Backups are encrypted by default, so this job needs a key. Declared
+      # empty here and generated per run by the step below: the key only has
+      # to survive one backup → restore cycle against an ephemeral MinIO
+      # bucket holding a single probe table, so nothing needs it to be
+      # stable, and a committed 64-hex constant is a secret-shaped literal
+      # that the blocking secret scan has to carry a line-keyed exemption
+      # for. That exemption broke twice in one pull request as unrelated
+      # edits shifted the line. Generating it removes the finding instead of
+      # allow-listing a moving target.
+      BACKUP_ENCRYPTION_KEY: ""
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Generate this run's backup encryption key
+        run: |
+          set -euo pipefail
+          key="$(openssl rand -hex 32)"
+          echo "::add-mask::$key"
+          echo "BACKUP_ENCRYPTION_KEY=$key" >> "$GITHUB_ENV"
+      - name: Nothing under the disaster-recovery path changed
+        if: needs.changes.outputs.backup != 'true'
+        run: |
+          {
+            echo "## Disaster-recovery gate — not exercised"
+            echo ""
+            echo "This pull request changes none of \`scripts/backup.sh\`,"
+            echo "\`scripts/restore.sh\`, \`scripts/backup_crypt.py\` or this workflow,"
+            echo "so the seed → backup → destroy → restore cycle was not run."
+            echo ""
+            echo "The job still reports, under the same check name, because a"
+            echo "required check that never reports blocks the pull request forever."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Install tooling (awscli + postgres client)
+        if: needs.changes.outputs.backup == 'true'
         run: |
-          pip install --quiet awscli
+          pip install --quiet awscli "cryptography>=46,<51"
           sudo apt-get update -q && sudo apt-get install -y -q postgresql-client
 
-      # MinIO needs a `server /data` command, which the GitHub `services:`
-      # block cannot pass — run it as a plain container instead.
-      - name: Start MinIO
+      # The S3 endpoint is a fixture: what this job tests is backup.sh and
+      # restore.sh, not the object store. It still has to be a real S3 server,
+      # because the scripts drive it through the aws CLI (s3 cp/ls/rm and
+      # s3api head-object) and a stub would not exercise that path.
+      #
+      # This step has now lost MinIO twice to hosting decisions, not to bugs:
+      # `minio/minio` on Docker Hub was withdrawn (the whole repository 404s),
+      # and the quay.io mirror it was moved to — pinned by digest — now answers
+      # 401 UNAUTHORIZED for every tag and for that digest. A third MinIO
+      # coordinate would be the same bet a third time.
+      #
+      # versitygw is Versity's Apache-2.0 S3 gateway, published to GHCR. GHCR
+      # is the registry this workflow's own images live in and is operated by
+      # the platform the job already runs on, so it cannot be withdrawn
+      # independently of CI itself, and it is not subject to Docker Hub's
+      # anonymous pull limits. Pinned to the v1.8.0 multi-arch index digest.
+      - name: Start the S3 endpoint (versitygw)
+        if: needs.changes.outputs.backup == 'true'
         run: |
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:RELEASE.2024-12-18T13-15-44Z server /data
+          set -euo pipefail
+          # The posix backend chdirs into its root, so the directory has to
+          # exist before the server starts; a named volume creates it.
+          docker volume create aisoc-dr-s3 >/dev/null
+          docker run -d --name s3 -p 9000:7070 -v aisoc-dr-s3:/data \
+            -e ROOT_ACCESS_KEY="${AWS_ACCESS_KEY_ID}" \
+            -e ROOT_SECRET_KEY="${AWS_SECRET_ACCESS_KEY}" \
+            ghcr.io/versity/versitygw@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499 \
+            --port 0.0.0.0:7070 posix /data
+
+      # `docker run -d` succeeding only means the container was created. If the
+      # server exits (bad flag, missing data dir) the bucket loop below would
+      # burn its retries and fail with a connection error that says nothing
+      # about why. Fail here instead, with the container's own logs.
+      - name: Wait for the S3 endpoint
+        if: needs.changes.outputs.backup == 'true'
+        run: |
+          set -uo pipefail
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null "${AWS_ENDPOINT_URL}" 2>/dev/null \
+               || [ "$(curl -s -o /dev/null -w '%{http_code}' "${AWS_ENDPOINT_URL}")" != "000" ]; then
+              echo "S3 endpoint ready after ${i}s"
+              exit 0
+            fi
+            if [ -z "$(docker ps -q -f name=s3 -f status=running)" ]; then
+              echo "::error::the S3 endpoint container exited before becoming ready"
+              docker logs s3 2>&1 | tail -30
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "::error::the S3 endpoint did not become ready within 30s"
+          docker logs s3 2>&1 | tail -30
+          exit 1
 
       - name: Create bucket
-        run: |
-          for i in $(seq 1 12); do
-            aws s3 mb "${BACKUP_S3_BUCKET}" && break || sleep 5
-          done
+        if: needs.changes.outputs.backup == 'true'
+        run: aws s3 mb "${BACKUP_S3_BUCKET}"
 
       - name: Seed data
+        if: needs.changes.outputs.backup == 'true'
         run: |
           PGPASSWORD=aisoc_ci_secret psql -h localhost -U aisoc -d aisoc <<'SQL'
           CREATE TABLE dr_probe (id SERIAL PRIMARY KEY, payload TEXT NOT NULL);
@@ -395,9 +901,60 @@ jobs:
           [ "${COUNT}" = "500" ]
 
       - name: Backup (scripts/backup.sh)
+        if: needs.changes.outputs.backup == 'true'
         run: ./scripts/backup.sh --component postgres
 
+      # The restore assertion below proves the dump round-trips. It cannot
+      # prove the object in the bucket is unreadable to whoever can list the
+      # bucket, which is the property the encryption exists for — and which
+      # architecture.md claimed for months while backup.sh shipped plaintext.
+      - name: Assert the uploaded artifact is encrypted and manifested
+        if: needs.changes.outputs.backup == 'true'
+        run: |
+          set -euo pipefail
+          KEY=$(aws s3 ls "${BACKUP_S3_BUCKET}/${BACKUP_S3_PREFIX}/postgres/" \
+            | awk '{print $4}' | tail -1)
+          echo "uploaded object: ${KEY}"
+          case "$KEY" in
+            *.enc) ;;
+            *) echo "::error::backup uploaded without the .enc suffix: ${KEY}"; exit 1 ;;
+          esac
+
+          aws s3 cp "${BACKUP_S3_BUCKET}/${BACKUP_S3_PREFIX}/postgres/${KEY}" /tmp/artifact.enc
+
+          # gzip magic would mean the dump went up in the clear.
+          if head -c 2 /tmp/artifact.enc | od -An -tx1 | grep -q '1f 8b'; then
+            echo "::error::artifact begins with gzip magic; it is not encrypted"
+            exit 1
+          fi
+          head -c 8 /tmp/artifact.enc | grep -q 'AISOCBK1' || {
+            echo "::error::artifact is missing the AiSOC backup header"; exit 1; }
+
+          # And the table name must not be readable in the ciphertext.
+          if grep -aq 'dr_probe' /tmp/artifact.enc; then
+            echo "::error::plaintext schema leaked into the encrypted artifact"
+            exit 1
+          fi
+
+          MANIFEST=$(aws s3 ls "${BACKUP_S3_BUCKET}/${BACKUP_S3_PREFIX}/manifests/" \
+            | awk '{print $4}' | tail -1)
+          [ -n "$MANIFEST" ] || { echo "::error::no manifest uploaded"; exit 1; }
+          aws s3 cp "${BACKUP_S3_BUCKET}/${BACKUP_S3_PREFIX}/manifests/${MANIFEST}" /tmp/manifest.json
+          python3 -c "
+          import json, sys
+          doc = json.load(open('/tmp/manifest.json'))
+          assert doc['encryption'] == 'aes-256-gcm', doc
+          arts = doc['artifacts']
+          assert arts, 'manifest lists no artifacts'
+          for a in arts:
+              assert a['encrypted'] is True, a
+              assert len(a['sha256_plaintext']) == 64, a
+              assert len(a['sha256_ciphertext']) == 64, a
+          print(f'manifest ok: {len(arts)} artifact(s), aes-256-gcm')
+          "
+
       - name: Destroy all data
+        if: needs.changes.outputs.backup == 'true'
         run: |
           PGPASSWORD=aisoc_ci_secret psql -h localhost -U aisoc -d aisoc \
             -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
@@ -407,6 +964,7 @@ jobs:
           [ "${COUNT}" = "0" ]
 
       - name: Restore (scripts/restore.sh) and measure RTO
+        if: needs.changes.outputs.backup == 'true'
         run: |
           set -euo pipefail
           START=$(date +%s)
@@ -416,12 +974,41 @@ jobs:
           echo "measured restore time: ${RTO}s"
 
       - name: Assert full data integrity
+        if: needs.changes.outputs.backup == 'true'
         run: |
           COUNT=$(PGPASSWORD=aisoc_ci_secret psql -h localhost -U aisoc -d aisoc -tAc "SELECT count(*) FROM dr_probe")
           echo "rows after restore: ${COUNT}"
           [ "${COUNT}" = "500" ] || { echo "::error::data loss after restore (${COUNT}/500 rows)"; exit 1; }
 
+      # A backup that restores is necessary but not sufficient: a corrupted
+      # backup must refuse to restore rather than produce a partial database,
+      # which is the failure that gets discovered during an incident.
+      - name: Assert a tampered backup is refused
+        if: needs.changes.outputs.backup == 'true'
+        run: |
+          set -uo pipefail
+          KEY=$(aws s3 ls "${BACKUP_S3_BUCKET}/${BACKUP_S3_PREFIX}/postgres/" \
+            | awk '{print $4}' | tail -1)
+          aws s3 cp "${BACKUP_S3_BUCKET}/${BACKUP_S3_PREFIX}/postgres/${KEY}" /tmp/tamper.enc
+
+          # Flip one bit deep inside the ciphertext.
+          python3 -c "
+          import pathlib
+          p = pathlib.Path('/tmp/tamper.enc')
+          b = bytearray(p.read_bytes())
+          b[len(b) // 2] ^= 0x01
+          p.write_bytes(bytes(b))
+          "
+          aws s3 cp /tmp/tamper.enc "${BACKUP_S3_BUCKET}/${BACKUP_S3_PREFIX}/postgres/${KEY}"
+
+          if ./scripts/restore.sh --latest --component postgres < /dev/null; then
+            echo "::error::restore accepted a tampered backup"
+            exit 1
+          fi
+          echo "tampered backup correctly refused"
+
       - name: Publish DR summary
+        if: needs.changes.outputs.backup == 'true'
         run: |
           {
             echo "## Disaster-recovery gate"
@@ -431,6 +1018,8 @@ jobs:
             echo "| rows seeded | 500 |"
             echo "| rows after restore | 500 |"
             echo "| measured RTO | ${RTO_SECONDS}s |"
+            echo "| artifact encryption | AES-256-GCM (asserted unreadable in the bucket) |"
+            echo "| integrity | SHA-256 manifest; tampered artifact refused |"
             echo "| RPO | last completed backup (event-loss window = backup cadence) |"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -447,6 +1036,8 @@ jobs:
   #     on a pre-existing, populated schema (not a fresh apply in disguise).
   upgrade:
     name: Upgrade (${{ matrix.from_ref }} → HEAD, data survives)
+    needs: changes
+    if: needs.changes.outputs.upgrade == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -468,13 +1059,14 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
+      # aisoc-db-role: owner — this job replays released migration chains, which is DDL from end to end
       DATABASE_URL: postgresql+asyncpg://aisoc:aisoc_ci_secret@localhost:5432/aisoc
       SECRET_KEY: ci-dummy-secret-key-at-least-32bytes!
       ENVIRONMENT: development
       AISOC_MIGRATIONS_STRICT: '1'
       PGPASSWORD: aisoc_ci_secret
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # Full history + tags so we can check out the released migration set.
           fetch-depth: 0
@@ -482,7 +1074,7 @@ jobs:
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: '3.12'
+          python-version: '3.11'
           cache: pip
 
       # Same importable-subset recipe as the migrations job — run_migrations
@@ -490,14 +1082,14 @@ jobs:
       - name: Install API dependencies
         run: >-
           pip install --quiet
-          fastapi "pydantic[email]" pydantic-settings "sqlalchemy[asyncio]" asyncpg
-          structlog "python-jose[cryptography]" "passlib[bcrypt]" tenacity pyyaml
+          "fastapi>=0.117,<0.142" "pydantic[email]" pydantic-settings "sqlalchemy[asyncio]" asyncpg
+          structlog "PyJWT>=2.8,<3" "cryptography>=46,<51" "passlib[bcrypt]" tenacity pyyaml
           prometheus-client "opentelemetry-sdk" "opentelemetry-api"
           "opentelemetry-exporter-otlp-proto-grpc"
           "opentelemetry-instrumentation-fastapi"
           "strawberry-graphql[fastapi]"
-          neo4j redis celery httpx aiofiles email-validator PyJWT
-          "sqlglot>=23,<27" aiosqlite "croniter>=2.0,<7.0"
+          neo4j redis celery httpx aiofiles email-validator "PyJWT>=2.8,<3"
+          "sqlglot>=30,<31" aiosqlite "croniter>=2.0,<7.0"
 
       - name: Record HEAD sha
         id: head

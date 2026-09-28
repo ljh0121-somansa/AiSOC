@@ -27,6 +27,8 @@ Everything is fail-soft: a missing/invalid rules file or a bad rule degrades to
 from __future__ import annotations
 
 import os
+import time
+import uuid
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from pathlib import Path
@@ -38,6 +40,25 @@ import yaml
 logger = structlog.get_logger()
 
 _ALLOWED_SEVERITIES = {"info", "low", "medium", "high", "critical"}
+#: Must match ``ALLOWED_ROUTES`` in
+#: ``services/api/app/services/business_context/models.py``. Duplicated rather
+#: than imported because the two services ship separate images, and kept in
+#: lockstep by ``tests/test_business_context_not_clause.py``. The worker used
+#: to accept any string here while the console validated against this set, so
+#: the two halves of the same grammar disagreed.
+_ALLOWED_ROUTES = frozenset(
+    {
+        "tier1",
+        "tier2",
+        "tier3",
+        "ic",
+        "cloud",
+        "identity",
+        "appsec",
+        "soc-night",
+        "soc-emea",
+    }
+)
 _ENABLED_ENV = "AISOC_BUSINESS_CONTEXT_ENABLED"
 _RULES_FILE_ENV = "AISOC_BUSINESS_CONTEXT_RULES_FILE"
 
@@ -134,16 +155,49 @@ def evaluate_condition(cond: RuleCondition, alert: dict[str, Any]) -> bool:
     return False
 
 
-def _parse_condition(node: dict[str, Any]) -> RuleCondition:
-    for logical in ("all", "any", "not"):
+def _parse_condition(node: Any) -> RuleCondition:
+    """Parse one condition node.
+
+    ``not`` takes a **mapping** — a single negated condition — which is what
+    the console's authoring grammar accepts and validates
+    (``services/api/app/services/business_context/models.py``). This parser
+    used to iterate every aggregator as a list, and iterating a mapping yields
+    its string keys, so ``_parse_condition("field")`` called ``.get()`` on a
+    ``str`` and raised ``AttributeError``. That propagated into the caller's
+    catch, which set ``rules = []`` — so one console-accepted ``not`` rule
+    silently discarded the tenant's entire rule set at triage, suppressions
+    included, logged at ``warning``.
+
+    A list is still accepted for ``not`` and treated as "none of these", which
+    is what the old evaluator already did with the children it never managed
+    to build.
+    """
+    if not isinstance(node, dict):
+        raise ValueError(f"condition must be a mapping, got {type(node).__name__}")
+
+    for logical in ("all", "any"):
         if logical in node:
             kids = node[logical] or []
+            if not isinstance(kids, list):
+                raise ValueError(f"'{logical}' must be a list of conditions, got {type(kids).__name__}")
             return RuleCondition(logical=logical, children=tuple(_parse_condition(k) for k in kids))
+
+    if "not" in node:
+        negated = node["not"] or {}
+        kids = negated if isinstance(negated, list) else [negated]
+        return RuleCondition(logical="not", children=tuple(_parse_condition(k) for k in kids))
+
     return RuleCondition(field=node.get("field"), op=node.get("op"), value=node.get("value"))
 
 
 def load_rules_from_yaml(source: str) -> list[BusinessContextRule]:
-    """Parse rules YAML (single mapping or top-level ``rules:`` list)."""
+    """Parse rules YAML (single mapping or top-level ``rules:`` list).
+
+    A rule that fails to parse is skipped and the rest are kept. It used to
+    raise, and the caller's catch turned that into ``rules = []`` — so one
+    malformed rule disabled every other rule the tenant had written,
+    suppressions included. The blast radius of a bad rule should be that rule.
+    """
     if not source or not source.strip():
         return []
     doc = yaml.safe_load(source)
@@ -165,13 +219,25 @@ def load_rules_from_yaml(source: str) -> list[BusinessContextRule]:
         sev = action.get("set_severity")
         if sev is not None and sev not in _ALLOWED_SEVERITIES:
             sev = None
+        route = action.get("route_to")
+        if route is not None and route not in _ALLOWED_ROUTES:
+            # The console validates this; the worker did not, so a route the
+            # authoring grammar would have rejected could reach the hot path
+            # if the row was written by anything else.
+            logger.warning("business_context.rule_route_rejected", rule_id=rid, route_to=route)
+            route = None
+        try:
+            when = _parse_condition(entry.get("when") or {})
+        except (ValueError, AttributeError, TypeError) as exc:
+            logger.warning("business_context.rule_skipped", rule_id=rid, error=str(exc))
+            continue
         rules.append(
             BusinessContextRule(
                 id=rid,
-                when=_parse_condition(entry.get("when") or {}),
+                when=when,
                 then=RuleAction(
                     set_severity=sev,
-                    route_to=action.get("route_to"),
+                    route_to=route,
                     tag=action.get("tag"),
                     suppress=bool(action.get("suppress", False)),
                 ),
@@ -224,14 +290,105 @@ def apply_rules(alert: dict[str, Any], rules: list[BusinessContextRule]) -> Busi
     return BusinessContextResult(out, matched, False, severity_before, out.get("severity"))
 
 
+#: How long a tenant's rules are cached before re-reading Postgres. Business
+#: context changes rarely and this sits on the hot path for every fused alert.
+_TENANT_CACHE_TTL_SECONDS = 30.0
+
+
 class BusinessContextApplier:
-    """Loads rules from a YAML file (mtime-reloaded) and applies them."""
+    """Applies business-context rules from Postgres, and from a YAML file.
+
+    Rules authored in the console are stored per tenant in
+    `aisoc_business_context_rule_sets`. This class only ever read a YAML file
+    whose path comes from `AISOC_BUSINESS_CONTEXT_RULES_FILE` — which nothing
+    sets — so a tenant could author a rule ("this host is a domain controller,
+    escalate anything touching it"), see it saved, preview it against their
+    last 50 alerts, and have it apply to no triage decision ever. The console
+    and the worker were looking at two different places.
+
+    The file path is kept as an operator-level override: an air-gapped install
+    that ships rules on disk should keep working, and its rules apply to every
+    tenant. Tenant rules are evaluated first, because a tenant's own statement
+    about their estate is more specific than a deployment-wide default.
+    """
 
     def __init__(self, rules_file: str | None = None) -> None:
         self._path = rules_file or os.environ.get(_RULES_FILE_ENV, "")
         self._rules: list[BusinessContextRule] = []
         self._mtime: float | None = None
+        self._tenant_rules: dict[str, tuple[float, list[BusinessContextRule]]] = {}
         self._load()
+
+    # ── tenant rules (Postgres) ───────────────────────────────────────────
+
+    async def _load_tenant_rules(self, tenant_id: str) -> list[BusinessContextRule]:
+        """Read and cache the tenant's authored rules. Never raises."""
+        cached = self._tenant_rules.get(tenant_id)
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < _TENANT_CACHE_TTL_SECONDS:
+            return cached[1]
+
+        dsn = os.environ.get("DATABASE_DSN") or os.environ.get("DATABASE_URL") or ""
+        dsn = dsn.strip().replace("postgresql+asyncpg://", "postgresql://")
+        if not dsn:
+            return []
+
+        try:
+            import asyncpg  # noqa: PLC0415 — optional at import time
+
+            conn = await asyncpg.connect(dsn, timeout=5.0)
+            try:
+                row = await conn.fetchrow(
+                    """
+                    SELECT yaml_text, enabled
+                    FROM aisoc_business_context_rule_sets
+                    WHERE tenant_id = $1
+                    """,
+                    uuid.UUID(tenant_id),
+                )
+            finally:
+                await conn.close()
+        except Exception as exc:  # noqa: BLE001 — fail-soft: no tenant rules applied
+            logger.warning(
+                "business_context.tenant_load_failed",
+                tenant_id=tenant_id,
+                error=str(exc),
+            )
+            # Serve the last known rules rather than silently dropping a
+            # tenant's suppressions during a brief outage.
+            return cached[1] if cached else []
+
+        rules: list[BusinessContextRule] = []
+        if row is not None and row["enabled"] and row["yaml_text"]:
+            try:
+                rules = load_rules_from_yaml(row["yaml_text"])
+            except Exception as exc:  # noqa: BLE001 — a bad rule set applies none
+                logger.warning(
+                    "business_context.tenant_parse_failed",
+                    tenant_id=tenant_id,
+                    error=str(exc),
+                )
+                rules = []
+
+        self._tenant_rules[tenant_id] = (now, rules)
+        return rules
+
+    async def apply_for_tenant(self, tenant_id: str | None, alert: dict[str, Any]) -> BusinessContextResult:
+        """Apply this tenant's authored rules, then any deployment-wide ones."""
+        self._load()  # cheap mtime check on the file-based rules
+        tenant_rules = await self._load_tenant_rules(str(tenant_id)) if tenant_id else []
+        rules = [*tenant_rules, *self._rules]
+        if not rules:
+            return BusinessContextResult(dict(alert), [], False, alert.get("severity"), alert.get("severity"))
+        try:
+            return apply_rules(alert, rules)
+        except Exception as exc:  # noqa: BLE001 — never break triage
+            logger.warning("business_context.apply_failed", error=str(exc))
+            return BusinessContextResult(dict(alert), [], False, alert.get("severity"), alert.get("severity"))
+
+    def clear_tenant_cache(self) -> None:
+        """Drop cached tenant rules. Used by tests."""
+        self._tenant_rules.clear()
 
     def _load(self) -> None:
         if not self._path:

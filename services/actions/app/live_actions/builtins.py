@@ -39,8 +39,11 @@ from uuid import uuid4
 
 import structlog
 
+from app.executors import siem
 from app.executors.base import BaseExecutor
+from app.executors.chatops import ChatOpsVerifyExecutor
 from app.executors.endpoint import (
+    CaptureForensicsExecutor,
     IsolateHostExecutor,
     KillProcessExecutor,
     QuarantineFileExecutor,
@@ -63,17 +66,37 @@ from app.executors.notification import (
     NotifySlackExecutor,
 )
 from app.executors.siem import (
+    AckAlertExecutor,
     BlockIOCExecutor,
     CreateNotableEventExecutor,
     SearchSIEMExecutor,
+    SuppressAlertExecutor,
     SyncDetectionRuleExecutor,
+    UpdateAlertDispositionExecutor,
     UpdateWatcherExecutor,
 )
 from app.models.action import ActionRequest, ActionStatus, ActionType
 
 from . import registry
+from .capability_contracts import apply_contract
 from .executor import LiveActionExecutor
+from .investigation_reads import (
+    AWSLookupCloudAudit,
+    CrowdStrikeGetDetections,
+    CrowdStrikeGetHost,
+    CrowdStrikeUnisolateHost,
+    DefenderGetDetections,
+    DefenderGetHost,
+    DefenderLookupEndpointTelemetry,
+    DefenderUnisolateHost,
+    EntraGetUserActivity,
+    GoogleWorkspaceGetUserActivity,
+    OktaGetUserActivity,
+    SentinelOneGetDetections,
+    SentinelOneGetHost,
+)
 from .models import LiveActionRequest, LiveActionResult, LiveActionStatus
+from .vendor_breadth import VENDOR_BREADTH_EXECUTORS
 
 logger = structlog.get_logger(__name__)
 
@@ -95,15 +118,24 @@ def _to_live_status(legacy_status: ActionStatus, output: dict[str, Any]) -> Live
     """Translate a legacy ``ActionStatus`` into a :class:`LiveActionStatus`.
 
     Legacy status has more states (PENDING, AWAITING_APPROVAL, ...) but
-    only three are reachable from a synchronous executor call: COMPLETED,
-    FAILED, and (rarely) ROLLED_BACK. We collapse ROLLED_BACK into
+    only four are reachable from an executor call: COMPLETED, FAILED,
+    RUNNING, and (rarely) ROLLED_BACK. We collapse ROLLED_BACK into
     SUCCEEDED because rollback is out-of-scope for the live-action layer
     — see :class:`LiveActionExecutor` docstring for the rationale.
+
+    RUNNING is **not** collapsed. Two executors return it to mean "the work
+    started and the outcome is not known yet": the ChatOps prompt nobody has
+    answered, and the forensic package MDE has not finished collecting. This
+    function used to fold both into SUCCEEDED, which is why registering either
+    one would have reported an unanswered question and an absent evidence
+    package as completed actions — and why they had no adapter at all.
     """
     if legacy_status == ActionStatus.FAILED:
         return LiveActionStatus.FAILED
     if _detect_simulation(output):
         return LiveActionStatus.SIMULATED
+    if legacy_status == ActionStatus.RUNNING:
+        return LiveActionStatus.AWAITING_COMPLETION
     return LiveActionStatus.SUCCEEDED
 
 
@@ -188,6 +220,10 @@ class _LegacyExecutorAdapter(LiveActionExecutor):
             return f"Simulated {verb} {target}".strip()
         if status == LiveActionStatus.FAILED:
             return f"Failed to {verb} {target}".strip()
+        if status == LiveActionStatus.AWAITING_COMPLETION:
+            # Past tense here would say the work is done. It is not — that is
+            # the whole reason this status exists.
+            return f"Started {verb} {target}; not finished".strip()
         return f"{verb.capitalize()} {target}".strip()
 
 
@@ -200,8 +236,16 @@ class _LegacyExecutorAdapter(LiveActionExecutor):
 # is present. Each adapter declares the credential keys it cares about so
 # the discovery API can surface "credentials missing" accurately and so
 # ``dry_run`` strips the right keys.
+#
+# The Defender arms borrow the SIEM module's tuple rather than repeating the
+# three key names, because ``_mde_client`` and the SIEM module read the same
+# set and ``tests/test_dry_run_credential_strip.py`` grades *every* adapter
+# whose vendor is ``defender`` against it. A hand-copied list here is the
+# shape that let a "dry run" reach production Splunk.
+_MDE_KEYS = siem.DEFENDER_CLIENT_PARAM_KEYS
 
 
+@apply_contract
 class CrowdStrikeIsolateHost(_LegacyExecutorAdapter):
     vendor_id = "crowdstrike"
     capability = "isolate_host"
@@ -212,6 +256,7 @@ class CrowdStrikeIsolateHost(_LegacyExecutorAdapter):
     _credential_keys = ("cs_client_id", "cs_client_secret", "cs_base_url")
 
 
+@apply_contract
 class DefenderIsolateHost(_LegacyExecutorAdapter):
     vendor_id = "defender"
     capability = "isolate_host"
@@ -219,9 +264,10 @@ class DefenderIsolateHost(_LegacyExecutorAdapter):
     requires_credentials = True
     _legacy_executor = IsolateHostExecutor()
     _legacy_action_type = ActionType.ISOLATE_HOST
-    _credential_keys = ("mde_tenant_id", "mde_client_id", "mde_client_secret")
+    _credential_keys = _MDE_KEYS
 
 
+@apply_contract
 class CrowdStrikeQuarantineFile(_LegacyExecutorAdapter):
     vendor_id = "crowdstrike"
     capability = "quarantine_file"
@@ -232,6 +278,7 @@ class CrowdStrikeQuarantineFile(_LegacyExecutorAdapter):
     _credential_keys = ("cs_client_id", "cs_client_secret", "cs_base_url")
 
 
+@apply_contract
 class CrowdStrikeKillProcess(_LegacyExecutorAdapter):
     vendor_id = "crowdstrike"
     capability = "kill_process"
@@ -242,6 +289,7 @@ class CrowdStrikeKillProcess(_LegacyExecutorAdapter):
     _credential_keys = ("cs_client_id", "cs_client_secret", "cs_base_url")
 
 
+@apply_contract
 class CrowdStrikeRunScript(_LegacyExecutorAdapter):
     vendor_id = "crowdstrike"
     capability = "run_script"
@@ -252,6 +300,7 @@ class CrowdStrikeRunScript(_LegacyExecutorAdapter):
     _credential_keys = ("cs_client_id", "cs_client_secret", "cs_base_url")
 
 
+@apply_contract
 class DefenderRunAVScan(_LegacyExecutorAdapter):
     vendor_id = "defender"
     capability = "run_av_scan"
@@ -259,7 +308,38 @@ class DefenderRunAVScan(_LegacyExecutorAdapter):
     requires_credentials = True
     _legacy_executor = RunAVScanExecutor()
     _legacy_action_type = ActionType.RUN_AV_SCAN
-    _credential_keys = ("mde_tenant_id", "mde_client_id", "mde_client_secret")
+    _credential_keys = _MDE_KEYS
+
+
+@apply_contract
+class DefenderCaptureForensics(_LegacyExecutorAdapter):
+    """Evidence acquisition, which had no executor at all until now.
+
+    Only Defender: MDE's investigation package is a whole-host artefact
+    bundle whose completion and download URI are both readable. CrowdStrike
+    RTR's ``get`` fetches one named path, which is a different verb — see
+    :class:`app.executors.endpoint.CaptureForensicsExecutor`.
+    """
+
+    vendor_id = "defender"
+    capability = "capture_forensics"
+    description = "Collect a Microsoft Defender investigation package from a host."
+    requires_credentials = True
+    _legacy_executor = CaptureForensicsExecutor()
+    _legacy_action_type = ActionType.CAPTURE_FORENSICS
+    _credential_keys = _MDE_KEYS
+
+    def _summarise(self, output: dict[str, Any], status: LiveActionStatus) -> str:
+        host = output.get("hostname") or ""
+        action_id = output.get("mde_action_id") or ""
+        if status == LiveActionStatus.FAILED:
+            return f"Failed to start forensic acquisition on {host}".strip()
+        if status == LiveActionStatus.SIMULATED:
+            return f"Simulated forensic acquisition on {host}".strip()
+        # The only other state this executor produces is AWAITING_COMPLETION.
+        # Naming the machine action matters: it is what a later verification
+        # pass reads, and without it the analyst has nothing to follow up.
+        return f"Forensic acquisition queued on {host} (machine action {action_id}); package not yet available".strip()
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +350,7 @@ class DefenderRunAVScan(_LegacyExecutorAdapter):
 _OKTA_KEYS = ("okta_domain", "okta_api_token")
 
 
+@apply_contract
 class OktaDisableUser(_LegacyExecutorAdapter):
     vendor_id = "okta"
     capability = "disable_user"
@@ -280,6 +361,7 @@ class OktaDisableUser(_LegacyExecutorAdapter):
     _credential_keys = _OKTA_KEYS
 
 
+@apply_contract
 class OktaResetPassword(_LegacyExecutorAdapter):
     vendor_id = "okta"
     capability = "reset_password"
@@ -290,6 +372,7 @@ class OktaResetPassword(_LegacyExecutorAdapter):
     _credential_keys = _OKTA_KEYS
 
 
+@apply_contract
 class OktaSuspendSession(_LegacyExecutorAdapter):
     vendor_id = "okta"
     capability = "suspend_session"
@@ -300,6 +383,7 @@ class OktaSuspendSession(_LegacyExecutorAdapter):
     _credential_keys = _OKTA_KEYS
 
 
+@apply_contract
 class OktaForceMFA(_LegacyExecutorAdapter):
     vendor_id = "okta"
     capability = "force_mfa"
@@ -323,6 +407,7 @@ _AWS_SG_KEYS = (
 )
 
 
+@apply_contract
 class AwsSecurityGroupBlockIP(_LegacyExecutorAdapter):
     vendor_id = "aws_security_groups"
     capability = "block_ip"
@@ -333,6 +418,7 @@ class AwsSecurityGroupBlockIP(_LegacyExecutorAdapter):
     _credential_keys = _AWS_SG_KEYS
 
 
+@apply_contract
 class AwsSecurityGroupAllowIP(_LegacyExecutorAdapter):
     vendor_id = "aws_security_groups"
     capability = "allow_ip"
@@ -343,6 +429,7 @@ class AwsSecurityGroupAllowIP(_LegacyExecutorAdapter):
     _credential_keys = _AWS_SG_KEYS
 
 
+@apply_contract
 class GenericBlockDomain(_LegacyExecutorAdapter):
     vendor_id = "generic"
     capability = "block_domain"
@@ -363,11 +450,26 @@ class GenericBlockDomain(_LegacyExecutorAdapter):
 # vendor-specific credential keys so dry-run + discovery work correctly.
 
 
-_SPLUNK_KEYS = ("splunk_host", "splunk_token", "splunk_index")
-_ELASTIC_KEYS = ("elastic_host", "elastic_api_key", "elastic_index")
-_DEFENDER_IOC_KEYS = ("mde_tenant_id", "mde_client_id", "mde_client_secret")
+# The strip list MUST be the client factory's read set, not a hand-written
+# approximation of it. These used to be `("splunk_host", "splunk_token",
+# "splunk_index")` while `executors.siem._splunk_client` reads `splunk_url`
+# first and also accepts basic auth — so a dry run against a
+# connector-configured tenant stripped three keys the factory did not need,
+# left the ones it did, built a real client and called the customer's
+# production Splunk. Elastic was identical (`elastic_host` vs `elastic_url`).
+#
+# Importing the factories' own key tuples makes the two impossible to
+# disagree; `tests/test_dry_run_credential_strip.py` additionally re-derives
+# each read set from the factory source, so a factory that grows a key fails
+# the build rather than widening the dry-run hole.
+_SPLUNK_KEYS = siem.SPLUNK_CLIENT_PARAM_KEYS
+_ELASTIC_KEYS = siem.ELASTIC_CLIENT_PARAM_KEYS
+_SENTINEL_KEYS = siem.SENTINEL_CLIENT_PARAM_KEYS
+_QRADAR_KEYS = siem.QRADAR_CLIENT_PARAM_KEYS
+_DEFENDER_IOC_KEYS = _MDE_KEYS
 
 
+@apply_contract
 class SplunkSearchSIEM(_LegacyExecutorAdapter):
     vendor_id = "splunk"
     capability = "search_siem"
@@ -378,6 +480,7 @@ class SplunkSearchSIEM(_LegacyExecutorAdapter):
     _credential_keys = _SPLUNK_KEYS
 
 
+@apply_contract
 class ElasticSearchSIEM(_LegacyExecutorAdapter):
     vendor_id = "elastic"
     capability = "search_siem"
@@ -388,6 +491,7 @@ class ElasticSearchSIEM(_LegacyExecutorAdapter):
     _credential_keys = _ELASTIC_KEYS
 
 
+@apply_contract
 class SplunkCreateNotable(_LegacyExecutorAdapter):
     vendor_id = "splunk"
     capability = "create_notable_event"
@@ -398,6 +502,7 @@ class SplunkCreateNotable(_LegacyExecutorAdapter):
     _credential_keys = _SPLUNK_KEYS
 
 
+@apply_contract
 class SplunkSyncDetectionRule(_LegacyExecutorAdapter):
     vendor_id = "splunk"
     capability = "sync_detection_rule"
@@ -408,6 +513,7 @@ class SplunkSyncDetectionRule(_LegacyExecutorAdapter):
     _credential_keys = _SPLUNK_KEYS
 
 
+@apply_contract
 class ElasticUpdateWatcher(_LegacyExecutorAdapter):
     vendor_id = "elastic"
     capability = "update_watcher"
@@ -418,6 +524,7 @@ class ElasticUpdateWatcher(_LegacyExecutorAdapter):
     _credential_keys = _ELASTIC_KEYS
 
 
+@apply_contract
 class DefenderBlockIOC(_LegacyExecutorAdapter):
     vendor_id = "defender"
     capability = "block_ioc"
@@ -425,6 +532,194 @@ class DefenderBlockIOC(_LegacyExecutorAdapter):
     requires_credentials = True
     _legacy_executor = BlockIOCExecutor()
     _legacy_action_type = ActionType.BLOCK_IOC
+    _credential_keys = _DEFENDER_IOC_KEYS
+
+
+# ---------------------------------------------------------------------------
+# Two-way SIEM loop — AiSOC's verdict back onto the source finding
+# ---------------------------------------------------------------------------
+#
+# One executor, four vendor arms, because what the verb *means* is identical
+# everywhere: a finding AiSOC dismissed should not be re-triaged by a human,
+# and one AiSOC confirmed should already be assigned. Registering a vendor per
+# arm is what lets the planner answer "can I write back to this tenant's SIEM"
+# without constructing a client to find out.
+#
+# Each adapter pins `alert_vendor` so a tenant with two SIEMs configured does
+# not have the vendor chosen by credential ordering — but the pin is checked
+# against the credentials before it is honoured (see `siem._ack_vendor`), so
+# pinning a vendor the tenant has not configured simulates rather than
+# pretending an arm ran.
+
+
+class _DispositionWriteback(_LegacyExecutorAdapter):
+    """Shared body for the disposition-writeback vendor arms.
+
+    Deliberately declares no ``capability``: an intermediate class that named
+    one without a ``vendor_id`` would be graded by the action-contract gate as
+    a half-declared executor. Each concrete arm below declares both.
+    """
+
+    requires_credentials = True
+    _legacy_executor = UpdateAlertDispositionExecutor()
+    _legacy_action_type = ActionType.UPDATE_ALERT_DISPOSITION
+
+    async def execute(self, request: LiveActionRequest) -> LiveActionResult:
+        pinned = {**request.params, "alert_vendor": self.vendor_id}
+        return await super().execute(request.model_copy(update={"params": pinned}))
+
+    def _summarise(self, output: dict[str, Any], status: LiveActionStatus) -> str:
+        finding = output.get("finding_id") or ""
+        disposition = output.get("disposition") or "unknown"
+        verb = output.get("writeback_action") or "refuse"
+        if status == LiveActionStatus.FAILED:
+            return f"Failed to write {disposition} back to {self.vendor_id} finding {finding}".strip()
+        if not output.get("written"):
+            # Covers both the refusal and the no-credentials simulation. Saying
+            # "updated" for either is the exact dishonesty this verb must not
+            # commit: an unexecuted writeback reported as executed means an
+            # analyst trusts a queue that was never touched.
+            return f"No change to {self.vendor_id} finding {finding}: {output.get('reason') or 'not written'}".strip()
+        return f"Wrote {disposition} ({verb}) to {self.vendor_id} finding {finding}".strip()
+
+
+@apply_contract
+class SplunkUpdateAlertDisposition(_DispositionWriteback):
+    capability = "update_alert_disposition"
+    vendor_id = "splunk"
+    description = "Write an AiSOC verdict onto the Splunk ES notable that raised the alert."
+    _credential_keys = _SPLUNK_KEYS
+
+
+@apply_contract
+class ElasticUpdateAlertDisposition(_DispositionWriteback):
+    capability = "update_alert_disposition"
+    vendor_id = "elastic"
+    description = "Write an AiSOC verdict onto the Elastic Security signal that raised the alert."
+    _credential_keys = _ELASTIC_KEYS
+
+
+@apply_contract
+class SentinelUpdateAlertDisposition(_DispositionWriteback):
+    capability = "update_alert_disposition"
+    vendor_id = "sentinel"
+    description = "Write an AiSOC verdict onto the Microsoft Sentinel incident that raised the alert."
+    _credential_keys = _SENTINEL_KEYS
+
+
+@apply_contract
+class QRadarUpdateAlertDisposition(_DispositionWriteback):
+    capability = "update_alert_disposition"
+    vendor_id = "qradar"
+    description = "Write an AiSOC verdict onto the IBM QRadar offense that raised the alert."
+    _credential_keys = _QRADAR_KEYS
+
+
+@apply_contract
+class DefenderUpdateAlertDisposition(_DispositionWriteback):
+    capability = "update_alert_disposition"
+    vendor_id = "defender"
+    description = "Write an AiSOC verdict onto the Microsoft Defender alert that raised it."
+    _credential_keys = _DEFENDER_IOC_KEYS
+
+
+# ---------------------------------------------------------------------------
+# Alert lifecycle — acknowledge and suppress
+# ---------------------------------------------------------------------------
+#
+# Both executors have had Splunk, Elastic and Defender arms since Phase 3.3,
+# sat in EXECUTOR_REGISTRY the whole time, and had no adapter here — so
+# governed dispatch answered executor_not_found for working code, and the only
+# route to it was the ActionType REST endpoint, which has no capability
+# contract, no approval matrix and no autonomy policy in front of it.
+#
+# `alert_vendor` is pinned per arm for the same reason the writeback pins it:
+# a tenant with two SIEMs configured would otherwise have the target chosen by
+# whichever credential block `_ack_vendor` happens to check first. The pin is
+# still verified against the credentials inside `siem._ack_vendor`, so pinning
+# a vendor the tenant has not configured simulates rather than claiming an arm
+# that could not have run.
+
+
+class _AlertLifecycleAdapter(_LegacyExecutorAdapter):
+    """Shared body for the ack / suppress vendor arms.
+
+    Declares no ``capability`` and no ``vendor_id``: an intermediate class
+    naming one without the other is graded by the action-contract gate as a
+    half-declared executor. Each concrete arm below declares both.
+    """
+
+    requires_credentials = True
+
+    async def execute(self, request: LiveActionRequest) -> LiveActionResult:
+        pinned = {**request.params, "alert_vendor": self.vendor_id}
+        return await super().execute(request.model_copy(update={"params": pinned}))
+
+    def _summarise(self, output: dict[str, Any], status: LiveActionStatus) -> str:
+        alert_id = output.get("alert_id") or ""
+        verb = self.capability.replace("_", " ")
+        if status == LiveActionStatus.FAILED:
+            return f"Failed to {verb} {self.vendor_id} finding {alert_id}".strip()
+        if status == LiveActionStatus.SIMULATED:
+            return f"Simulated {verb} on {self.vendor_id} finding {alert_id}".strip()
+        return f"{verb.capitalize()} on {self.vendor_id} finding {alert_id}".strip()
+
+
+class _AckAlert(_AlertLifecycleAdapter):
+    _legacy_executor = AckAlertExecutor()
+    _legacy_action_type = ActionType.ACK_ALERT
+
+
+class _SuppressAlert(_AlertLifecycleAdapter):
+    _legacy_executor = SuppressAlertExecutor()
+    _legacy_action_type = ActionType.SUPPRESS_ALERT
+
+
+@apply_contract
+class SplunkAckAlert(_AckAlert):
+    capability = "ack_alert"
+    vendor_id = "splunk"
+    description = "Acknowledge a Splunk ES notable and assign it to AiSOC."
+    _credential_keys = _SPLUNK_KEYS
+
+
+@apply_contract
+class ElasticAckAlert(_AckAlert):
+    capability = "ack_alert"
+    vendor_id = "elastic"
+    description = "Acknowledge an Elastic Security signal."
+    _credential_keys = _ELASTIC_KEYS
+
+
+@apply_contract
+class DefenderAckAlert(_AckAlert):
+    capability = "ack_alert"
+    vendor_id = "defender"
+    description = "Acknowledge a Microsoft Defender alert and assign it."
+    _credential_keys = _DEFENDER_IOC_KEYS
+
+
+@apply_contract
+class SplunkSuppressAlert(_SuppressAlert):
+    capability = "suppress_alert"
+    vendor_id = "splunk"
+    description = "Close a Splunk ES notable event."
+    _credential_keys = _SPLUNK_KEYS
+
+
+@apply_contract
+class ElasticSuppressAlert(_SuppressAlert):
+    capability = "suppress_alert"
+    vendor_id = "elastic"
+    description = "Close an Elastic Security signal."
+    _credential_keys = _ELASTIC_KEYS
+
+
+@apply_contract
+class DefenderSuppressAlert(_SuppressAlert):
+    capability = "suppress_alert"
+    vendor_id = "defender"
+    description = "Resolve a Microsoft Defender alert with a classification."
     _credential_keys = _DEFENDER_IOC_KEYS
 
 
@@ -442,6 +737,7 @@ class DefenderBlockIOC(_LegacyExecutorAdapter):
 # ---------------------------------------------------------------------------
 
 
+@apply_contract
 class SentinelOneIsolateHost(_LegacyExecutorAdapter):
     vendor_id = "sentinelone"
     capability = "isolate_host"
@@ -452,6 +748,7 @@ class SentinelOneIsolateHost(_LegacyExecutorAdapter):
     _credential_keys = ("s1_console_url", "s1_api_token")
 
 
+@apply_contract
 class EntraDisableUser(_LegacyExecutorAdapter):
     vendor_id = "azure_entra"
     capability = "disable_user"
@@ -462,6 +759,7 @@ class EntraDisableUser(_LegacyExecutorAdapter):
     _credential_keys = ("azure_tenant_id", "azure_client_id", "azure_client_secret")
 
 
+@apply_contract
 class GoogleWorkspaceDisableUser(_LegacyExecutorAdapter):
     vendor_id = "google_workspace"
     capability = "disable_user"
@@ -472,6 +770,7 @@ class GoogleWorkspaceDisableUser(_LegacyExecutorAdapter):
     _credential_keys = ("gws_service_account_key", "gws_subject_email")
 
 
+@apply_contract
 class PanOsBlockIP(_LegacyExecutorAdapter):
     vendor_id = "panos"
     capability = "block_ip"
@@ -482,6 +781,7 @@ class PanOsBlockIP(_LegacyExecutorAdapter):
     _credential_keys = ("panos_host", "panos_api_key", "panos_tag")
 
 
+@apply_contract
 class FortiGateBlockIP(_LegacyExecutorAdapter):
     vendor_id = "fortigate"
     capability = "block_ip"
@@ -492,6 +792,7 @@ class FortiGateBlockIP(_LegacyExecutorAdapter):
     _credential_keys = ("fgt_host", "fgt_api_token", "fgt_address_group")
 
 
+@apply_contract
 class CloudflareBlockIP(_LegacyExecutorAdapter):
     vendor_id = "cloudflare"
     capability = "block_ip"
@@ -502,6 +803,7 @@ class CloudflareBlockIP(_LegacyExecutorAdapter):
     _credential_keys = ("cf_api_token", "cf_zone_id")
 
 
+@apply_contract
 class JiraCreateTicket(_LegacyExecutorAdapter):
     vendor_id = "jira"
     capability = "create_ticket"
@@ -512,6 +814,7 @@ class JiraCreateTicket(_LegacyExecutorAdapter):
     _credential_keys = ("jira_base_url", "jira_email", "jira_api_token")
 
 
+@apply_contract
 class ServiceNowCreateTicket(_LegacyExecutorAdapter):
     vendor_id = "servicenow"
     capability = "create_ticket"
@@ -522,6 +825,7 @@ class ServiceNowCreateTicket(_LegacyExecutorAdapter):
     _credential_keys = ("snow_instance_url", "snow_username", "snow_password")
 
 
+@apply_contract
 class PagerDutyCreateTicket(_LegacyExecutorAdapter):
     vendor_id = "pagerduty"
     capability = "create_ticket"
@@ -532,6 +836,7 @@ class PagerDutyCreateTicket(_LegacyExecutorAdapter):
     _credential_keys = ("pd_routing_key",)
 
 
+@apply_contract
 class SlackNotify(_LegacyExecutorAdapter):
     vendor_id = "slack"
     capability = "notify"
@@ -543,11 +848,122 @@ class SlackNotify(_LegacyExecutorAdapter):
 
 
 # ---------------------------------------------------------------------------
+# Human-in-the-loop — ask the affected user, route the signed answer back
+# ---------------------------------------------------------------------------
+#
+# ``ChatOpsVerifyExecutor`` worked and sat in ``EXECUTOR_REGISTRY`` with no
+# adapter, because the only honest thing it can say — "the prompt went out and
+# nobody has answered" — had no ``LiveActionStatus`` to land in, and
+# ``_to_live_status`` folded it into SUCCEEDED. Registering it before
+# AWAITING_COMPLETION existed would have reported an unanswered question as a
+# completed action, which is worse than leaving it unreachable.
+#
+# ``transport`` is pinned per arm for the reason the SIEM arms pin
+# ``alert_vendor``: otherwise the channel a prompt goes out on is decided by a
+# default buried in the executor rather than by the caller's choice of vendor.
+# Unlike those, there is no credential-ordering hazard to guard against — both
+# transports authenticate with the same single ``webhook_url``, so the pin
+# selects a message format, and a missing webhook still fails rather than
+# silently choosing the other transport.
+
+
+class _ChatOpsVerify(_LegacyExecutorAdapter):
+    """Shared body for the ChatOps transports.
+
+    Declares neither ``capability`` nor ``vendor_id``: an intermediate class
+    naming one without the other is graded by the action-contract gate as a
+    half-declared executor.
+    """
+
+    requires_credentials = True
+    _legacy_executor = ChatOpsVerifyExecutor()
+    _legacy_action_type = ActionType.CHATOPS_VERIFY
+    _credential_keys = ("webhook_url", "bot_token")
+    _transport: str = ""
+
+    async def execute(self, request: LiveActionRequest) -> LiveActionResult:
+        # The base class implements dry_run by stripping credentials so the
+        # legacy executor falls into its simulation branch. This executor has
+        # no such branch on purpose — its module docstring is explicit that an
+        # unreachable transport is a hard failure, because an action whose
+        # entire point is asking a person a question must not quietly not ask.
+        # Stripping the webhook here would therefore report a preview as a
+        # failure. Simulate in the adapter instead, before anything mints a
+        # callback token or opens a socket.
+        if request.dry_run:
+            return LiveActionResult(
+                request_id=request.request_id,
+                status=LiveActionStatus.SIMULATED,
+                capability=self.capability,
+                vendor_id=self.vendor_id,
+                summary=f"Simulated {self._transport} verification prompt to {request.target or 'the affected user'}",
+                details={
+                    "action": "chatops_verify",
+                    "transport": self._transport,
+                    "user_ref": request.params.get("user_ref") or request.target,
+                    "note": "Simulation mode — dry run, no prompt was delivered and no callback token was minted.",
+                },
+            )
+        pinned = {**request.params, "transport": self._transport}
+        return await super().execute(request.model_copy(update={"params": pinned}))
+
+    def _summarise(self, output: dict[str, Any], status: LiveActionStatus) -> str:
+        user = output.get("user_ref") or ""
+        if status == LiveActionStatus.FAILED:
+            return f"Failed to send a {self._transport} verification prompt to {user}".strip()
+        if status == LiveActionStatus.SIMULATED:
+            return f"Simulated {self._transport} verification prompt to {user}".strip()
+        ttl = output.get("expires_in_seconds")
+        return f"Asked {user} to confirm on {self._transport}; awaiting their reply (expires in {ttl}s)".strip()
+
+
+@apply_contract
+class SlackChatOpsVerify(_ChatOpsVerify):
+    capability = "chatops_verify"
+    vendor_id = "slack"
+    description = "Ask the affected user to confirm or deny activity via an interactive Slack prompt."
+    _transport = "slack"
+
+
+@apply_contract
+class TeamsChatOpsVerify(_ChatOpsVerify):
+    capability = "chatops_verify"
+    vendor_id = "teams"
+    description = "Ask the affected user to confirm or deny activity via a Microsoft Teams card."
+    _transport = "teams"
+
+
+# ---------------------------------------------------------------------------
 # Registration entry point
 # ---------------------------------------------------------------------------
 
 
 _BUILTIN_ADAPTERS: tuple[type[LiveActionExecutor], ...] = (
+    # Read-only investigation verbs. Registered first because they are
+    # the ones an agent should reach for before anything below them.
+    CrowdStrikeGetHost,
+    CrowdStrikeGetDetections,
+    DefenderGetHost,
+    OktaGetUserActivity,
+    # Gap-closure Phase 4.2. Three read verbs with one vendor arm each is a
+    # CrowdStrike-and-Okta surface, not a vendor-read surface: a tenant on
+    # SentinelOne and Entra ID had the same investigation reach as a tenant
+    # with no EDR at all, because dispatch answered executor_not_found, which
+    # reads as a broken deployment rather than as a capability nobody wrote.
+    SentinelOneGetHost,
+    SentinelOneGetDetections,
+    DefenderGetDetections,
+    EntraGetUserActivity,
+    GoogleWorkspaceGetUserActivity,
+    AWSLookupCloudAudit,
+    DefenderLookupEndpointTelemetry,
+    # Rollback for the most disruptive action, which had no executor.
+    CrowdStrikeUnisolateHost,
+    DefenderUnisolateHost,
+    # Vendor breadth: capabilities the clients already implemented and
+    # the registry could not reach. SentinelOne exposed seven
+    # operations and one was wired; Entra six and one.
+    *VENDOR_BREADTH_EXECUTORS,
     # Endpoint
     CrowdStrikeIsolateHost,
     DefenderIsolateHost,
@@ -555,6 +971,9 @@ _BUILTIN_ADAPTERS: tuple[type[LiveActionExecutor], ...] = (
     CrowdStrikeKillProcess,
     CrowdStrikeRunScript,
     DefenderRunAVScan,
+    # Evidence acquisition: an ActionType the agent proposes on the C2 /
+    # exfiltration path, which had no executor anywhere.
+    DefenderCaptureForensics,
     # Identity (Okta)
     OktaDisableUser,
     OktaResetPassword,
@@ -571,6 +990,20 @@ _BUILTIN_ADAPTERS: tuple[type[LiveActionExecutor], ...] = (
     SplunkSyncDetectionRule,
     ElasticUpdateWatcher,
     DefenderBlockIOC,
+    # Two-way SIEM loop
+    SplunkUpdateAlertDisposition,
+    ElasticUpdateAlertDisposition,
+    SentinelUpdateAlertDisposition,
+    QRadarUpdateAlertDisposition,
+    DefenderUpdateAlertDisposition,
+    # Alert lifecycle: executors that existed with three vendor arms each and
+    # were unreachable through governed dispatch.
+    SplunkAckAlert,
+    ElasticAckAlert,
+    DefenderAckAlert,
+    SplunkSuppressAlert,
+    ElasticSuppressAlert,
+    DefenderSuppressAlert,
     # Phase B2 — previously-unregistered vendors
     SentinelOneIsolateHost,
     EntraDisableUser,
@@ -582,6 +1015,10 @@ _BUILTIN_ADAPTERS: tuple[type[LiveActionExecutor], ...] = (
     ServiceNowCreateTicket,
     PagerDutyCreateTicket,
     SlackNotify,
+    # Human-in-the-loop: a working executor whose honest "not answered yet"
+    # had no status to land in until AWAITING_COMPLETION existed.
+    SlackChatOpsVerify,
+    TeamsChatOpsVerify,
 )
 
 

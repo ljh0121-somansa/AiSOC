@@ -12,7 +12,11 @@ import pytest
 from app.connectors import CONNECTOR_REGISTRY, list_connector_schemas
 from app.connectors.base import BaseConnector, ConnectorSchema, Field
 
-ALLOWED_CATEGORIES = {"siem", "edr", "cloud", "iam", "saas", "audit", "vcs", "ndr", "network"}
+# `ai` is the customer's own AI estate: agents, LLM gateways, MCP servers.
+# Deliberately its own category rather than folded into `saas`. A `saas`
+# connector pulls a vendor's audit log; these pull runtime activity from
+# software the customer operates, and the console groups by category.
+ALLOWED_CATEGORIES = {"siem", "edr", "cloud", "iam", "saas", "audit", "vcs", "ndr", "network", "ai"}
 ALLOWED_FIELD_TYPES = {"string", "secret", "select", "textarea", "boolean", "number"}
 
 
@@ -38,9 +42,9 @@ def test_every_connector_returns_a_schema(registry):
     for connector_id, cls in registry.items():
         schema = cls.schema()
         assert isinstance(schema, ConnectorSchema), f"{cls.__name__}.schema() must return ConnectorSchema, got {type(schema).__name__}"
-        assert (
-            schema.connector_id == connector_id
-        ), f"{cls.__name__}.schema().connector_id ({schema.connector_id!r}) does not match registry key ({connector_id!r})"
+        assert schema.connector_id == connector_id, (
+            f"{cls.__name__}.schema().connector_id ({schema.connector_id!r}) does not match registry key ({connector_id!r})"
+        )
 
 
 def test_schema_metadata_is_well_formed(registry):
@@ -93,6 +97,6 @@ def test_secret_fields_are_marked_secret(registry):
     for cls in registry.values():
         for field in cls.schema().fields:
             if any(s in field.name.lower() for s in suspicious):
-                assert (
-                    field.type == "secret"
-                ), f"{cls.__name__}.{field.name}: looks like a credential but type is {field.type!r}, expected 'secret'"
+                assert field.type == "secret", (
+                    f"{cls.__name__}.{field.name}: looks like a credential but type is {field.type!r}, expected 'secret'"
+                )

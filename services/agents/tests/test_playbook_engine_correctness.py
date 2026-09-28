@@ -18,6 +18,7 @@ fires.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -283,7 +284,13 @@ def patch_handlers():
 
     def _install(mapping: dict) -> None:
         for k, v in mapping.items():
-            saved[k] = engine_mod._HANDLERS.get(k)
+            # `setdefault`, not assignment: a second install of the same key
+            # inside one test would otherwise record the *first injected*
+            # handler as the original, and teardown would write that test
+            # double permanently into the process-wide `_HANDLERS`. Nothing
+            # installs twice today; the registry is shared by every test in
+            # the process, so it should not depend on nobody starting.
+            saved.setdefault(k, engine_mod._HANDLERS.get(k))
             engine_mod._HANDLERS[k] = v
 
     yield _install
@@ -403,3 +410,147 @@ class TestEngineConditionGate:
 
         assert called["hit"] is True
         assert run.step_results[0]["status"] == StepStatus.SUCCESS
+
+
+# ---------------------------------------------------------------------------
+# PlaybookEngine.run — step types the engine cannot run must not report success
+# ---------------------------------------------------------------------------
+#
+# Twelve of the twenty-two StepType members had no entry in ``_HANDLERS``.
+# The run loop answered those with ``{"skipped": True}`` and left
+# ``step_status`` at its SUCCESS default, so a playbook containing them ran to
+# RunStatus.COMPLETED having done nothing that it said it did.
+#
+# ``approval`` is the one that matters most: it is a human decision point, it
+# appears in 14 steps across the shipped packs, and it passed on its own —
+# the run continued straight into the action an analyst was meant to
+# authorise. "Unverifiable means not autonomous" applies to a gate that
+# cannot be evaluated as much as to an action that cannot be verified.
+
+
+class TestUnimplementedStepTypesFailClosed:
+    @pytest.mark.asyncio
+    async def test_an_approval_gate_the_engine_cannot_honour_halts_the_run(self) -> None:
+        """Fails against the pre-change tree, which reported SUCCESS/COMPLETED."""
+        pb = _make_playbook(
+            [
+                PlaybookStep(id="gate", name="Analyst approves isolation", type=StepType.APPROVAL),
+                PlaybookStep(id="act", name="Isolate the host", type=StepType.ISOLATE_HOST),
+            ]
+        )
+
+        run = await PlaybookEngine().run(pb, trigger_context={})
+
+        assert run.step_results[0]["status"] == StepStatus.FAILED
+        assert run.step_results[0]["result"]["unimplemented"] is True
+        assert "approval" in run.step_results[0]["result"]["error"]
+        assert run.status == RunStatus.FAILED
+        # The whole point: the step behind the gate must not have run.
+        assert len(run.step_results) == 1, "execution continued past a gate that was never granted"
+
+    @pytest.mark.asyncio
+    async def test_no_step_type_reports_success_without_a_handler(self) -> None:
+        """Every StepType with no handler, not just the one that hurt most."""
+        unimplemented = [st for st in StepType if st not in engine_mod._HANDLERS and st != StepType.CONDITION]
+        assert unimplemented, "fixture assumption broken: expected some StepType to lack a handler"
+
+        for step_type in unimplemented:
+            pb = _make_playbook([PlaybookStep(id="s1", name=f"step {step_type.value}", type=step_type)])
+            run = await PlaybookEngine().run(pb, trigger_context={})
+
+            result = run.step_results[0]
+            assert result["status"] == StepStatus.FAILED, f"{step_type.value} reported {result['status']} with no handler"
+            assert result["result"].get("unimplemented") is True
+            assert run.status == RunStatus.FAILED
+
+    @pytest.mark.asyncio
+    async def test_a_missing_handler_is_not_retried(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A handler that does not exist will not exist next attempt either;
+        retrying just delays the failure by up to 2**retry_max seconds.
+
+        This test used to name ``RUN_AV_SCAN`` as its missing handler. That
+        stopped being true the moment the response verbs were wired into
+        ``_HANDLERS`` through ``RESPONSE_STEP_TYPES``, so the step it built
+        went down the *retry* branch and was attempted four times over
+        fourteen seconds — the exact behaviour the docstring forbids — while
+        the test reported green. It could not notice, because its only
+        behavioural assertion was ``_elapsed_ms == 0``: ``t0`` is reset at the
+        top of every attempt, so that field is the duration of the final
+        attempt alone and never of the step, and it reads 0 both when the
+        engine skips the retry loop (which writes a literal 0) and when a
+        handler simply fails in under half a millisecond. The two cases the
+        test exists to tell apart were indistinguishable to it, which left a
+        rounded wall-clock reading as the only thing standing between the
+        suite and a regression.
+
+        So: take the step type from the registry rather than naming one, and
+        assert the property directly by recording the backoff sleeps.
+        """
+        unimplemented = [st for st in StepType if st not in engine_mod._HANDLERS and st != StepType.CONDITION]
+        assert unimplemented, "fixture assumption broken: expected some StepType to lack a handler"
+        step_type = unimplemented[0]
+
+        # Delegate to a zero-delay sleep so a regression fails in
+        # milliseconds instead of sitting in 2+4+8s of real backoff.
+        slept: list[float] = []
+        real_sleep = asyncio.sleep
+
+        async def _recording_sleep(delay: float, *args: Any, **kwargs: Any) -> Any:
+            slept.append(delay)
+            return await real_sleep(0, *args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "sleep", _recording_sleep)
+
+        pb = _make_playbook([PlaybookStep(id="s1", name="scan", type=step_type, retry_max=3)])
+
+        run = await PlaybookEngine().run(pb, trigger_context={})
+
+        result = run.step_results[0]["result"]
+        assert run.step_results[0]["status"] == StepStatus.FAILED
+        # `unimplemented` is written only by the branch that skips the retry
+        # loop, so this is what says which path ran — `_elapsed_ms` never did.
+        assert result["unimplemented"] is True
+        assert result["executed"] is False
+        assert not slept, f"a missing handler was retried with {slept} of backoff; retry_max was {3}"
+
+    @pytest.mark.asyncio
+    async def test_on_failure_continue_lets_the_run_proceed_without_calling_it_completed(self) -> None:
+        """``continue`` decides whether the run keeps going, not what it is called.
+
+        346 of the 380 steps in the shipped packs carry ``on_failure:
+        continue``, so treating it as "report this run as completed" would put
+        a green tick over a containment that never happened — which is the
+        same fake success, moved up one level from the step to the run.
+        """
+        pb = _make_playbook(
+            [
+                PlaybookStep(id="s1", name="best-effort scan", type=StepType.RUN_AV_SCAN, on_failure="continue"),
+                PlaybookStep(id="s2", name="second step", type=StepType.RUN_SCRIPT, on_failure="continue"),
+            ]
+        )
+
+        run = await PlaybookEngine().run(pb, trigger_context={})
+
+        assert len(run.step_results) == 2, "the author said continue; both steps must be attempted"
+        assert all(r["status"] == StepStatus.FAILED for r in run.step_results)
+        assert run.status == RunStatus.FAILED
+        assert run.error and "2 of 2 steps failed" in run.error
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_says_which_steps_would_fail(self) -> None:
+        """A dry run exists to tell the author what would happen. Reporting a
+        bare ``dry_run: true`` for a step that cannot execute would imply it
+        is fine."""
+        pb = _make_playbook(
+            [
+                PlaybookStep(id="s1", name="notify", type=StepType.NOTIFY),
+                PlaybookStep(id="s2", name="gate", type=StepType.APPROVAL),
+            ]
+        )
+
+        run = await PlaybookEngine().run(pb, trigger_context={}, dry_run=True)
+
+        assert run.status == RunStatus.COMPLETED
+        assert run.step_results[0]["result"].get("unimplemented") is None
+        assert run.step_results[1]["result"]["unimplemented"] is True
+        assert run.step_results[1]["result"]["would_fail"] is True

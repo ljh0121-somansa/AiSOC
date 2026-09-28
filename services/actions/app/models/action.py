@@ -21,10 +21,40 @@ class ActionType(str, Enum):
     KILL_PROCESS = "kill_process"
     QUARANTINE_FILE = "quarantine_file"
     CAPTURE_FORENSICS = "capture_forensics"
-    ADD_IOC_TO_BLOCKLIST = "add_ioc_to_blocklist"
     NOTIFY_SLACK = "notify_slack"
     CREATE_TICKET = "create_ticket"
-    RUN_PLAYBOOK = "run_playbook"
+    # `add_ioc_to_blocklist` and `run_playbook` were here and had no executor
+    # behind either of them, so the API accepted both and answered "No
+    # executor found for action type" — which reads as a broken deployment
+    # rather than a verb nobody built. Neither was a missing implementation:
+    #
+    #   add_ioc_to_blocklist  a second name for `block_ioc`, which has a
+    #                         Defender arm, a contract, an adapter and a place
+    #                         in the vocabulary. Two names for one verb means
+    #                         half the callers reach the dead one.
+    #   run_playbook          playbook execution lives in services/agents and
+    #                         always has. It is also the wrong shape for this
+    #                         registry: the contract belongs to the verb, and
+    #                         "run an arbitrary bundle of verbs" has no
+    #                         verb-level impact, reversal or probe. Approving
+    #                         it once would execute whatever steps it contains
+    #                         without each one meeting its own contract, which
+    #                         is precisely what the per-capability contract
+    #                         exists to prevent. Playbooks dispatch step by
+    #                         step through this service instead, so every step
+    #                         is graded on the way past — via
+    #                         `services/agents/app/playbook/action_bridge.py`
+    #                         and `POST /api/v1/playbook-steps/dispatch`.
+    #
+    #                         That last sentence was not true when it was
+    #                         written. `_handle_block_ip` and
+    #                         `_handle_isolate_host` returned
+    #                         `{"simulated": True}` from inside the engine and
+    #                         reached no executor, and twelve further step
+    #                         types had no handler at all. The bridge named
+    #                         above is what made it true; the named modules
+    #                         are here so the claim can be checked rather than
+    #                         taken on trust.
     # ChatOps user verification: outbound interactive Slack/Teams prompt
     # asking the affected user to confirm or deny an event ("Was this you?").
     # The response is HMAC-validated and routed back into the case timeline.
@@ -50,6 +80,10 @@ class ActionType(str, Enum):
     # which credentials are present in the request.
     ACK_ALERT = "ack_alert"
     SUPPRESS_ALERT = "suppress_alert"
+    # Two-way SIEM loop: project an AiSOC verdict onto the vendor finding that
+    # raised the alert. Distinct from ack/suppress because the disposition —
+    # not the caller — decides whether the finding is closed or escalated.
+    UPDATE_ALERT_DISPOSITION = "update_alert_disposition"
 
 
 class ActionStatus(str, Enum):
@@ -81,10 +115,8 @@ ACTION_BLAST_RADIUS: dict[ActionType, BlastRadius] = {
     ActionType.KILL_PROCESS: BlastRadius.MEDIUM,
     ActionType.QUARANTINE_FILE: BlastRadius.LOW,
     ActionType.CAPTURE_FORENSICS: BlastRadius.LOW,
-    ActionType.ADD_IOC_TO_BLOCKLIST: BlastRadius.LOW,
     ActionType.NOTIFY_SLACK: BlastRadius.MINIMAL,
     ActionType.CREATE_TICKET: BlastRadius.MINIMAL,
-    ActionType.RUN_PLAYBOOK: BlastRadius.MEDIUM,
     ActionType.CHATOPS_VERIFY: BlastRadius.MINIMAL,
     # WS-E live vendor action blast radii
     ActionType.RUN_SCRIPT: BlastRadius.HIGH,
@@ -103,6 +135,15 @@ ACTION_BLAST_RADIUS: dict[ActionType, BlastRadius] = {
     # because there's a documented unsuppress path in every vendor.
     ActionType.ACK_ALERT: BlastRadius.MINIMAL,
     ActionType.SUPPRESS_ALERT: BlastRadius.LOW,
+    # The one member that had no entry, which meant it had no single blast
+    # radius: four call sites read this table with two different fallbacks,
+    # `blast_radius.py` to MEDIUM and the three tier gates to HIGH. So the
+    # legacy door auto-executed the writeback while the registry door held it
+    # for a whitelist it could never match — the same verb, two grades,
+    # decided by a default nobody chose. LOW is what its own contract asks
+    # for: "classified the same as create_notable_event ... it changes a
+    # queue item, not an estate", and create_notable_event is LOW.
+    ActionType.UPDATE_ALERT_DISPOSITION: BlastRadius.LOW,
 }
 
 # Actions that require explicit human approval
@@ -148,6 +189,21 @@ class ActionPrincipal(BaseModel):
     permissions: list[str] = Field(default_factory=list)
 
 
+class ChatOpsApprover(BaseModel):
+    """A platform identity a bot has already verified (T3.6).
+
+    Carries identity and deliberately **not** permissions. The bot proves who
+    clicked — Slack signs the interaction payload, Teams payloads are
+    HMAC-signed — but it has no knowledge of what that person may do in AiSOC,
+    and a bot permitted to assert its own permissions could grant itself
+    anything. The actions service maps this onto a principal.
+    """
+
+    platform: str
+    platform_user_id: str
+    display_name: str | None = None
+
+
 class ActionRequest(BaseModel):
     """Request to execute an action."""
 
@@ -164,6 +220,13 @@ class ActionRequest(BaseModel):
     rationale: str = ""
     auto_rollback: bool = False
     rollback_after_seconds: int | None = None
+    #: How sure the finding behind this action is, 0.0-1.0.
+    #:
+    #: The second axis of the approval matrix. ``None`` is the lowest band,
+    #: not a free pass — a caller that omits it gets the most restrictive
+    #: treatment, because the alternative is that a scoring bug becomes an
+    #: autonomous containment.
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class ActionResult(BaseModel):

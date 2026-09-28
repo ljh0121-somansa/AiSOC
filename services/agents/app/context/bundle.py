@@ -35,6 +35,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
 import structlog
 from pydantic import BaseModel, Field
 
@@ -263,6 +264,38 @@ LLM_SAFE_KEYS = (
 )
 
 
+class IncidentContextDimensions(BaseModel):
+    """Identity, asset, cloud, business and threat context for the alert.
+
+    Distinct from ``entity_neighborhoods``, which answers "what is reachable"
+    as an undifferentiated node set. This answers "what does it mean": which
+    person is behind the account, what is exploitable on the host, which
+    business application it serves, who is accountable, and which actor the
+    indicators point at. A narrative and a prompt both need the dimensions
+    kept apart; a node set makes the caller re-derive them.
+    """
+
+    identities: list[dict[str, Any]] = Field(default_factory=list)
+    assets: list[dict[str, Any]] = Field(default_factory=list)
+    cloud: list[dict[str, Any]] = Field(default_factory=list)
+    business: list[dict[str, Any]] = Field(default_factory=list)
+    threat: list[dict[str, Any]] = Field(default_factory=list)
+    narrative: list[str] = Field(default_factory=list)
+    # True when some dimensions could not be read. Without this an agent
+    # cannot distinguish "this alert has no context" from "we could not
+    # look", and will reason as though the first were true.
+    partial: bool = False
+    errors: list[str] = Field(default_factory=list)
+
+    @property
+    def dimensions_resolved(self) -> int:
+        return sum(1 for d in (self.identities, self.assets, self.cloud, self.business, self.threat) if d)
+
+    @property
+    def has_content(self) -> bool:
+        return self.dimensions_resolved > 0
+
+
 class ContextBundle(BaseModel):
     """Pre-fetched, structured context handed to every sub-agent."""
 
@@ -276,6 +309,7 @@ class ContextBundle(BaseModel):
     entity_neighborhoods: dict[str, EntityNeighborhood] = Field(default_factory=dict)
     peer_baselines: dict[str, UEBABaseline] = Field(default_factory=dict)
     threat_intel: dict[str, ThreatIntelMatch] = Field(default_factory=dict)
+    incident_context: IncidentContextDimensions = Field(default_factory=IncidentContextDimensions)
 
     # Memory (institutional tier) recall.
     historical_similar_cases: list[HistoricalCase] = Field(default_factory=list)
@@ -300,7 +334,13 @@ class ContextBundle(BaseModel):
         Used by sub-agents to decide whether to short-circuit to the
         bundle-aware prompt or fall back to bare-alert reasoning.
         """
-        return bool(self.entity_neighborhoods or self.peer_baselines or self.threat_intel or self.historical_similar_cases)
+        return bool(
+            self.entity_neighborhoods
+            or self.peer_baselines
+            or self.threat_intel
+            or self.historical_similar_cases
+            or self.incident_context.has_content
+        )
 
     def prompt_context_lines(self) -> list[str]:
         """Render the bundle's safe summary fields as prompt-ready lines.
@@ -311,12 +351,17 @@ class ContextBundle(BaseModel):
         Only fields enumerated by ``summary_for_llm`` are surfaced — never
         raw OCSF or log payloads.
         """
-        if not self.has_any_context:
+        # A bundle with no content but a failed context lookup still has
+        # something to say. Returning [] here meant the one case worth
+        # warning about — we tried to resolve identity, asset and business
+        # context and could not — reached the model as silence, which reads
+        # the same as "this alert has no context".
+        if not self.has_any_context and not self.incident_context.partial:
             return []
         s = self.summary_for_llm()
         parts: list[str] = ["", "Pre-fetched investigation context (ContextBundle):"]
         if s.get("entity_count"):
-            parts.append(f"- Entities resolved: {s['entity_count']} " f"({', '.join(s.get('entity_types') or []) or 'unknown'})")
+            parts.append(f"- Entities resolved: {s['entity_count']} ({', '.join(s.get('entity_types') or []) or 'unknown'})")
         if s.get("neighborhood_summaries"):
             parts.append("- Graph neighbourhood:")
             for line in s["neighborhood_summaries"]:
@@ -328,19 +373,36 @@ class ContextBundle(BaseModel):
                 (h["similarity"] for h in s.get("historical_verdicts") or []),
                 default=0.0,
             )
-            parts.append(f"- Similar historical cases: {s['historical_similar_count']} " f"(top similarity={top:.2f})")
+            parts.append(f"- Similar historical cases: {s['historical_similar_count']} (top similarity={top:.2f})")
             for h in (s.get("historical_verdicts") or [])[:3]:
                 parts.append(f"    * {h['key']} → {h['verdict']} (sim={h['similarity']:.2f})")
         if s.get("ueba_entities_with_baseline"):
             parts.append(
-                f"- UEBA: {s['ueba_entities_with_baseline']} entities with baseline, "
-                f"max deviation={s.get('ueba_max_deviation', 0.0):.2f}"
+                f"- UEBA: {s['ueba_entities_with_baseline']} entities with baseline, max deviation={s.get('ueba_max_deviation', 0.0):.2f}"
             )
         if s.get("threat_intel_match_count"):
             parts.append(
                 f"- Threat-intel matches: {s['threat_intel_match_count']} "
                 f"(high-risk IOCs: {', '.join(s.get('threat_intel_high_risk_iocs') or []) or 'none'})"
             )
+
+        # Identity, asset, cloud, business and threat depth. Rendered last
+        # and rendered verbatim: the API composes these lines, and
+        # re-summarising them here would drop the qualifiers that keep them
+        # honest — an unconfirmed attribution, a partial lookup, a departed
+        # employee whose account is still live.
+        ctx = self.incident_context
+        if ctx.narrative:
+            parts.append("- Entity context:")
+            parts.extend(f"    {line}" for line in ctx.narrative)
+        elif ctx.partial:
+            # No content *and* a failed lookup. Saying nothing here would
+            # let the model read absence of context as absence of risk.
+            parts.append(
+                "- Entity context: unavailable (" + ", ".join(ctx.errors) + "). Treat missing identity/asset/business context as unknown, "
+                "not as benign."
+            )
+
         return parts
 
     def summary_for_llm(self) -> dict[str, Any]:
@@ -503,10 +565,15 @@ class ContextBundleBuilder:
                 self._fetch_threat_intel(bundle.entities),
                 bundle,
             ),
+            self._safe(
+                "incident_context",
+                self._fetch_incident_context(tenant_id, raw_alert),
+                bundle,
+            ),
             return_exceptions=False,
         )
 
-        neigh_result, history_result, ueba_result, ti_result = results
+        neigh_result, history_result, ueba_result, ti_result, ctx_result = results
         if isinstance(neigh_result, dict):
             bundle.entity_neighborhoods = neigh_result
         if isinstance(history_result, list):
@@ -515,6 +582,8 @@ class ContextBundleBuilder:
             bundle.peer_baselines = ueba_result
         if isinstance(ti_result, dict):
             bundle.threat_intel = ti_result
+        if isinstance(ctx_result, IncidentContextDimensions):
+            bundle.incident_context = ctx_result
 
         bundle.build_completed_at = datetime.now(UTC)
         bundle.build_latency_ms = int((time.monotonic() - t0) * 1000)
@@ -563,7 +632,12 @@ class ContextBundleBuilder:
         out: dict[str, EntityNeighborhood] = {}
         results = await asyncio.gather(*[_walk(e) for e in principals], return_exceptions=True)
         for r in results:
-            if isinstance(r, Exception):
+            # BaseException, not Exception: `gather(return_exceptions=True)`
+            # hands back a cancelled child's `CancelledError`, which is a
+            # BaseException on 3.8+. Filtering on `Exception` let it through
+            # to the unpack below, turning a cancelled graph walk into
+            # `TypeError: cannot unpack non-sequence CancelledError`.
+            if isinstance(r, BaseException):
                 logger.debug("context.neighborhood.failed", error=str(r))
                 continue
             key, nbr = r
@@ -625,11 +699,6 @@ class ContextBundleBuilder:
         entities: list[EntityRef],
     ) -> dict[str, UEBABaseline]:
         """Pull per-entity UEBA baselines from the UEBA service."""
-        try:
-            import httpx  # type: ignore
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"httpx unavailable: {exc}") from exc
-
         ueba_url = os.getenv("AISOC_UEBA_URL", "http://ueba:8086")
         principals = [e for e in entities if e.type in ("user", "email", "host", "ip")]
         if not principals:
@@ -673,12 +742,55 @@ class ContextBundleBuilder:
 
             results = await asyncio.gather(*[_one(e) for e in principals], return_exceptions=True)
             for r in results:
-                if isinstance(r, Exception) or r is None:
+                # See `_fetch_neighborhoods`: a cancelled child returns a
+                # `CancelledError`, which is not an `Exception`.
+                if isinstance(r, BaseException) or r is None:
                     continue
                 key, baseline = r
                 out[key] = baseline
         self._record_source("ueba")
         return out
+
+    async def _fetch_incident_context(
+        self,
+        tenant_id: str,
+        raw_alert: dict[str, Any],
+    ) -> IncidentContextDimensions:
+        """Resolve the alert into identity, asset, cloud, business and threat.
+
+        Delegated to the API rather than queried here: the API owns the Neo4j
+        session and the tenant-scoping predicate, and duplicating a Cypher
+        traversal whose correctness is a security property in a second
+        service is how the two drift apart.
+        """
+        alert_id = raw_alert.get("id") or raw_alert.get("alert_id") or raw_alert.get("external_id")
+        if not alert_id:
+            self._record_source("incident_context")
+            return IncidentContextDimensions()
+
+        api_url = os.getenv("AISOC_API_URL", "http://api:8000")
+        async with httpx.AsyncClient(timeout=self.per_source_timeout) as client:
+            response = await client.get(
+                f"{api_url}/api/v1/graph/incident-context/{alert_id}",
+                headers={"X-Tenant-ID": tenant_id},
+            )
+            response.raise_for_status()
+            payload = response.json()
+
+        self._record_source("incident_context")
+        if not isinstance(payload, dict):
+            return IncidentContextDimensions()
+
+        return IncidentContextDimensions(
+            identities=payload.get("identities") or [],
+            assets=payload.get("assets") or [],
+            cloud=payload.get("cloud") or [],
+            business=payload.get("business") or [],
+            threat=payload.get("threat") or [],
+            narrative=payload.get("narrative") or [],
+            partial=bool(payload.get("partial")),
+            errors=payload.get("errors") or [],
+        )
 
     async def _fetch_threat_intel(self, entities: list[EntityRef]) -> dict[str, ThreatIntelMatch]:
         """Bulk-enrich every IOC-shaped entity in the alert."""

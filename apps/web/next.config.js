@@ -1,6 +1,22 @@
 /** @type {import('next').NextConfig} */
 
+const fs = require('fs');
 const path = require('path');
+
+// Repo-root VERSION file is the single source of truth for the app version
+// shown in Settings → About. Baked into the bundle at build time since the
+// browser has no way to read a file off the deployed container's disk.
+// Falls back to "0.0.0" rather than failing the build if some build context
+// doesn't carry the file through (e.g. a Dockerfile COPY list falling out of
+// sync, or `next build` invoked from an unexpected working directory).
+let APP_VERSION = '0.0.0';
+try {
+  APP_VERSION = fs
+    .readFileSync(path.resolve(__dirname, '..', '..', 'VERSION'), 'utf8')
+    .trim();
+} catch {
+  console.warn('[next.config.js] Could not read repo-root VERSION file; using 0.0.0');
+}
 
 // ─── Server-side rewrite targets ────────────────────────────────────────────
 //
@@ -66,10 +82,23 @@ const nextConfig = {
     NEXT_PUBLIC_ENRICHMENT_URL: process.env.NEXT_PUBLIC_ENRICHMENT_URL || '',
     NEXT_PUBLIC_WS_URL: process.env.NEXT_PUBLIC_WS_URL || '',
     NEXT_PUBLIC_REALTIME_URL: process.env.NEXT_PUBLIC_REALTIME_URL || '',
-    NEXT_PUBLIC_TENANT_ID: process.env.NEXT_PUBLIC_TENANT_ID || '00000000-0000-0000-0000-000000000001',
+    // The canonical tenant seeded by migration 001. This defaulted to the
+    // *slug* 'default', which every tenant-scoped caller then sent where a
+    // UUID was required — `/api/v1/fusion/entity-risk/queue` declares
+    // `tenant_id: UUID` and answered 422. It was also invisible: `api.ts`
+    // carries the correct UUID as its own fallback, but this inlining runs
+    // first, so that fallback could never be reached and reading it suggested
+    // the console was already doing the right thing. Worse, the slug is not a
+    // reliable handle either — the demo seed renames tenant ...0001's slug
+    // from 'default' to 'demo', so the literal matches neither the id nor the
+    // slug on a seeded install. Keep this equal to `DEFAULT_TENANT_ID` in
+    // `apps/web/src/lib/api.ts`; a test asserts the two agree.
+    NEXT_PUBLIC_TENANT_ID:
+      process.env.NEXT_PUBLIC_TENANT_ID || '00000000-0000-0000-0000-000000000001',
     NEXT_PUBLIC_PURPLE_TEAM_API: process.env.NEXT_PUBLIC_PURPLE_TEAM_API || '',
     NEXT_PUBLIC_HONEYTOKENS_URL: process.env.NEXT_PUBLIC_HONEYTOKENS_URL || '',
     NEXT_PUBLIC_OSQUERY_TLS_URL: process.env.NEXT_PUBLIC_OSQUERY_TLS_URL || '',
+    NEXT_PUBLIC_APP_VERSION: APP_VERSION,
   },
   // ─── Permanent URL redirects (browser-visible) ───────────────────────────
   //

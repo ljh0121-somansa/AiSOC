@@ -61,6 +61,7 @@ from app.interactions import (
     NEED_INFO_ACTION_ID,
     handle_action_decision,
 )
+from app.notify import router as notify_router
 from app.services.aisoc_clients import AisocActionsClient, AisocApiClient
 from app.services.approval_audit import StructlogAuditSink
 from app.services.approval_timeout import ApprovalTimeoutScheduler
@@ -260,10 +261,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     timer_store = None
     dsn = os.getenv("DATABASE_URL", "").strip()
     if dsn:
-        try:
-            from app.services.timer_store import PostgresTimerStore  # noqa: PLC0415
+        from app.services.timer_store import MissingApprovalTimersTable, PostgresTimerStore  # noqa: PLC0415
 
-            timer_store = await PostgresTimerStore.create(dsn)
+        try:
+            timer_store = await PostgresTimerStore.create(dsn, get_settings().AISOC_DEFAULT_TENANT_ID)
+        except MissingApprovalTimersTable as exc:
+            # Distinguished from a transient database problem and logged at
+            # error: the deployment asked for durable approval timers, they
+            # are not durable, and the remedy is a migration rather than a
+            # retry. Still non-fatal — the in-memory fallback is the pre-B3
+            # behaviour, not a broken bot.
+            logger.error("approval_timer_store.schema_missing", error=str(exc))
+            timer_store = None
         except Exception as exc:  # noqa: BLE001 — durable store is best-effort
             logger.warning("approval_timer_store.init_failed", error=str(exc))
             timer_store = None
@@ -315,6 +324,12 @@ app = FastAPI(
     version="0.1.0",
     lifespan=_lifespan,
 )
+
+# The bot's only outbound route: other AiSOC services call this to have a
+# card posted into a channel. Every other route here is Slack calling in, and
+# Bolt's respond() only works inside an inbound interaction — which is why an
+# agent could not ask for approval until a human asked first.
+app.include_router(notify_router)
 
 # Phase 2.6 — k8s liveness + readiness probes (see app/_health.py).
 _mark_ready, _mark_not_ready = install_health_routes(app, service_name="aisoc-slack-bot")

@@ -20,7 +20,7 @@ This document describes the end-to-end architecture of the AiSOC platform after 
                        ┌─────────────────┐   ┌──────────────────────┐
                        │  services/api   │   │ services/connectors  │
                        │  inbox tokens + │   │  APScheduler poll    │
-                       │  HMAC webhooks  │   │  83 connector classes│
+                       │  HMAC webhooks  │   │  84 connector classes│
                        │  CEF / HEC / DNS│   │  push_case + status  │
                        └────────┬────────┘   └──────────┬───────────┘
                                 │                       │
@@ -91,7 +91,7 @@ This document describes the end-to-end architecture of the AiSOC platform after 
 | `services/enrichment` | Go 1.21 | Per-IOC TTL-cached enrichment lookups | n/a |
 | `services/fusion` | Python 3.11 | Simhash dedup → correlation → ML scoring → publish fused alerts | Background ML retrain on feedback |
 | `services/api` | Python 3.11 | REST + WS, RBAC, case mgmt, rule engine, graph queries, ITSM webhook inbox, case fan-out | Schema migrations on boot |
-| `services/connectors` | Python 3.11 | 83 connector classes, APScheduler poll, `push_case` / `push_status_change` for Jira & ServiceNow | CredentialVault decrypt at poll time |
+| `services/connectors` | Python 3.11 | 84 connector classes, APScheduler poll, `push_case` / `push_status_change` for Jira & ServiceNow | CredentialVault decrypt at poll time |
 | `services/agents` | Python 3.11 | LangGraph multi-agent investigation runs | Loads full ATT&CK STIX bundle on boot, optional Qdrant embed |
 | `services/actions` | Python 3.11 | SOAR action execution with blast-radius gating | Approval workflows |
 | `services/threatintel` | Python 3.11 | IOC/actor search API | APScheduler poll loop for TAXII/MISP/OTX/KEV |
@@ -101,8 +101,8 @@ This document describes the end-to-end architecture of the AiSOC platform after 
 | `services/osquery-tls` | Go 1.25 | TLS server for osquery enrol / config / distributed / log endpoints | Ships normalised host events into `services/ingest` |
 | `services/osquery-extensions` | Go 1.25 | Out-of-band osquery extensions (custom virtual tables + decorators) | Loaded by `osquery-tls`-managed agents |
 | `services/slack-bot` | Python 3.11 | ChatOps surface: posts approval prompts, `/aisoc` slash command | Verifies inbound interactions with HMAC-signed Slack request signatures |
-| `services/realtime` | Node 20 | WebSocket fan-out + Web Push for the web console + Responder PWA | n/a |
-| `services/mcp` | Node 20 (TypeScript) | Model Context Protocol stdio server, 13 tools for IDE-side agents (Claude / Cursor / Continue / Cody) — discovery, deep-dive, action/replay, and the warm-tier lake query pair (`aisoc_lake_schema`, `aisoc_lake_query`) | n/a |
+| `services/realtime` | Node 22 | WebSocket fan-out + Web Push for the web console + Responder PWA | n/a |
+| `services/mcp` | Node 22 (TypeScript) | Model Context Protocol stdio server, 18 tools for IDE-side agents (Claude / Cursor / Continue / Cody) — discovery, deep-dive, action/replay, and the warm-tier lake query pair (`aisoc_lake_schema`, `aisoc_lake_query`) | n/a |
 | `apps/web` | Next.js 14 | Server components + SWR + Responder PWA route group + benchmark scoreboard | n/a |
 
 ---
@@ -314,7 +314,7 @@ The following subsystems were added on top of the v2 design described above. The
 
 ### 12.1 Connector Platform (`services/connectors`)
 
-A first-class, in-process polling tier with **83 registered connector classes** spanning seven categories — `edr`, `siem`, `cloud`, `iam`, `saas`, `vcs`, `network`. Every connector subclasses `BaseConnector` and declares:
+A first-class, in-process polling tier with **84 registered connector classes** spanning seven categories — `edr`, `siem`, `cloud`, `iam`, `saas`, `vcs`, `network`. Every connector subclasses `BaseConnector` and declares:
 
 * `schema()` — self-describing `ConnectorSchema(name, label, category, fields, oauth, default_poll_interval_seconds)` consumed by the web console for the connect form.
 * `capabilities()` — tuple of `Capability` enum values (`PULL_ALERTS`, `PUSH_CASE`, `PUSH_STATUS`, `FEDERATED_SEARCH`, …) that the orchestrator inspects at runtime.
@@ -416,7 +416,7 @@ Two cross-platform bootstrap installers live at the repo root:
 * `install.sh` — Linux + macOS bash; supports `apt`, `dnf`, `pacman`, `zypper`, `apk`, and `brew`. Idempotent; safe to re-run.
 * `install.ps1` — Windows PowerShell; uses `winget` and handles WSL2 enablement for Docker Desktop.
 
-Both detect the OS, install missing prerequisites (git, Docker Engine + Compose v2 / Docker Desktop, Node.js 20 LTS, pnpm 8+ via `corepack`), clone the repo into `~/aisoc`, then invoke `pnpm aisoc:demo` to bring up the slim demo stack from the published GHCR images and open the browser at the seeded LockBit case. Companion uninstallers (`uninstall.sh`, `uninstall.ps1`) provide graduated cleanup — stop stack only, drop volumes, remove pulled images, delete `node_modules`, delete the repo clone — gated behind interactive confirmation prompts unless `--all --yes` is supplied.
+Both detect the OS, install missing prerequisites (git, Docker Engine + Compose v2 / Docker Desktop, Node.js 22 LTS, pnpm 8+ via `corepack`), clone the repo into `~/aisoc`, then invoke `pnpm aisoc:demo` to bring up the slim demo stack from the published GHCR images and open the browser at the seeded LockBit case. Companion uninstallers (`uninstall.sh`, `uninstall.ps1`) provide graduated cleanup — stop stack only, drop volumes, remove pulled images, delete `node_modules`, delete the repo clone — gated behind interactive confirmation prompts unless `--all --yes` is supplied.
 
 → [One-click install (Docusaurus)](../../apps/docs/docs/installation.md)
 → [Quick install reference](../QUICK_INSTALL.md)

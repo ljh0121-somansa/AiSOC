@@ -3,7 +3,7 @@
 > Run an AiSOC agent investigation **offline in under 30 seconds**. No Docker, no API key, no network.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-22c55e.svg)](https://github.com/beenuar/AiSOC/blob/main/LICENSE)
-[![PyPI release](https://img.shields.io/badge/pypi-coming%20in%20v8.0-f59e0b)](https://github.com/beenuar/AiSOC/blob/main/CHANGELOG.md)
+[![PyPI release](https://img.shields.io/badge/pypi-coming%20in%20v8.1-f59e0b)](https://github.com/beenuar/AiSOC/blob/main/CHANGELOG.md)
 
 `aisoc-sandbox` is the quickest possible on-ramp to [AiSOC](https://github.com/beenuar/AiSOC). It walks one alert fixture through a four-stage agent funnel — **Detect → Triage → Hunt → Respond** — using a deterministic offline reasoner in place of a real LLM, and prints the resulting Investigation Ledger to your terminal.
 
@@ -22,10 +22,10 @@ This package collapses the boot time to **< 5 seconds** and the disk footprint t
 git clone https://github.com/beenuar/AiSOC.git
 cd AiSOC && pip install -e packages/aisoc-sandbox
 
-# v8.0+ (once aisoc-sandbox lands on PyPI):
-pip install aisoc-sandbox
-# or, for one-off use without polluting your site-packages:
-pipx run aisoc-sandbox demo
+# Once published to PyPI (ready, unpublished — the upload is blocked on
+# registry credentials, which is an account action, not a code change):
+#   pip install aisoc-sandbox
+#   pipx run aisoc-sandbox demo
 ```
 
 Python 3.10+ on Linux / macOS / Windows. Zero runtime dependencies.

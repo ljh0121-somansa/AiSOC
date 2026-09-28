@@ -19,8 +19,12 @@ class Settings(BaseSettings):
         default="localhost:9092",
         validation_alias=AliasChoices("KAFKA_BOOTSTRAP_SERVERS", "UEBA_KAFKA_BOOTSTRAP_SERVERS"),
     )
+    # The topic ingest actually publishes normalized events to. This used to
+    # default to ``security.events``, which no service in the platform writes,
+    # so the scorer consumed an empty topic forever and fusion's UEBA
+    # confidence boost — on by default — was permanently inert.
     kafka_input_topic: str = Field(
-        default="security.events",
+        default="aisoc.raw_events",
         validation_alias=AliasChoices("KAFKA_INPUT_TOPIC", "UEBA_KAFKA_INPUT_TOPIC"),
     )
     kafka_output_topic: str = Field(
@@ -43,6 +47,10 @@ class Settings(BaseSettings):
     peer_group_min_size: int = Field(
         default=3,
         validation_alias=AliasChoices("PEER_GROUP_MIN_SIZE", "UEBA_PEER_GROUP_MIN_SIZE"),
+    )
+    min_baseline_samples: int = Field(
+        default=30,
+        validation_alias=AliasChoices("MIN_BASELINE_SAMPLES", "UEBA_MIN_BASELINE_SAMPLES"),
     )
     scoring_batch_size: int = Field(
         default=100,

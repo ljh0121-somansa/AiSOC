@@ -17,7 +17,7 @@ These tests pin the API half of that contract so it cannot silently regress:
   shared secret is unconfigured in prod.
 
 The Node-side signature/aud/exp verification is pinned separately in
-``services/realtime/src/auth.test.ts``. The claim shape here must stay in sync
+``services/realtime/test/auth.test.ts``. The claim shape here must stay in sync
 with ``RealtimeClaims`` / ``verifyRealtimeTicket`` there.
 
 AiSOC — open-source AI Security Operations Center (MIT License)
@@ -27,13 +27,13 @@ from __future__ import annotations
 
 import uuid
 
+import jwt
 import pytest
 from app.api.v1.deps import CurrentUser
 from app.api.v1.endpoints import realtime as realtime_ep
 from app.core.config import DEV_REALTIME_TICKET_SECRET, Settings, realtime_ticket_secret, warn_if_insecure_defaults
 from app.core.security import REALTIME_TICKET_AUDIENCE
 from fastapi import HTTPException
-from jose import jwt
 
 # A real 64-char secret used across the "happy path" tests — anything outside
 # INSECURE_SECRET_KEY_DEFAULTS and non-empty resolves as configured.
@@ -67,9 +67,23 @@ def test_secret_uses_configured_value_in_any_env():
     assert realtime_ticket_secret(s) == _REAL_SECRET
 
 
-def test_secret_falls_back_to_dev_default_in_development():
+def test_secret_does_not_fall_back_to_the_published_default_in_development():
+    """GHSA-4m55-xhcm-wjcr. This asserted the fallback and was the vulnerability.
+
+    The fallback was a constant committed to this repository, and the check
+    that was supposed to confine it to development read an environment
+    variable no shipped manifest passed to the realtime container — so it was
+    the effective HMAC key everywhere, and a ticket for any tenant could be
+    minted by signing with a published value.
+    """
     s = _settings(ENVIRONMENT="development", AISOC_REALTIME_JWT_SECRET="")
-    assert realtime_ticket_secret(s) == DEV_REALTIME_TICKET_SECRET
+    assert realtime_ticket_secret(s) is None
+
+
+def test_the_retired_dev_secret_is_refused_even_when_set_explicitly():
+    """Pasting it out of an older checkout must not produce a working key."""
+    s = _settings(ENVIRONMENT="development", AISOC_REALTIME_JWT_SECRET=DEV_REALTIME_TICKET_SECRET)
+    assert realtime_ticket_secret(s) is None
 
 
 def test_secret_is_none_in_prod_when_unset():
@@ -157,7 +171,7 @@ async def test_mint_rejects_foreign_audience(configured):
     """A ticket scoped to the realtime edge must not validate for any other
     audience — guards against a stolen ticket being replayed at the API."""
     ticket = await realtime_ep.mint_realtime_ticket(_user())
-    with pytest.raises(jwt.JWTError):
+    with pytest.raises(jwt.PyJWTError):
         jwt.decode(
             ticket.token,
             _REAL_SECRET,

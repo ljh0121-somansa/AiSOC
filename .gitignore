@@ -51,11 +51,20 @@ coverage.xml
 # uploaded as artefacts — never committed.
 coverage/
 **/coverage/
-# BUT keep app-source route directories literally named `coverage` (e.g. the
-# /tools/coverage page). The rules above are for generated test-coverage output;
-# without this negation the coverage tool page silently drops from the build.
+# BUT keep app-source directories literally named `coverage` (the
+# /tools/coverage route, and `components/coverage/` behind /coverage-advisor).
+# The rules above are for generated test-coverage output; without these
+# negations the coverage tool page silently drops from the build.
+#
+# `components/` was missing here, which is worse than it sounds: the component
+# was tracked because it predates the rule, so nothing looked wrong, but every
+# *new* file beside it — a test especially — was ignored on `git add -A` and
+# never reached CI. A test that cannot be committed is indistinguishable from
+# a test that passes.
 !apps/web/src/app/**/coverage/
 !apps/web/src/app/**/coverage/**
+!apps/web/src/components/coverage/
+!apps/web/src/components/coverage/**
 *.lcov
 
 # IDE
@@ -120,6 +129,14 @@ apps/docs/build/
 # Local QA artifacts (screenshots from manual UI checks)
 apps/web/.qa-screenshots/
 
+# Runtime playbook store. `PlaybookStore` keeps the bundled corpus read-only and
+# writes every mutation to `index.json` in the same directory, so anything that
+# exercises `POST /api/v1/playbooks` — a test, a local run, a reproduction of a
+# bug — leaves a several-thousand-line file behind. Committing it ships whatever
+# the last run happened to hold as if it were curated content, and the playbook
+# schema lint counts it as a 65th file.
+services/agents/data/playbooks/index.json
+
 # Marketplace index staged into the API service build context at deploy time
 # (see infra/fly/fly-demo-deploy.sh). The canonical source is marketplace/index.json
 # at the repo root; the API Dockerfile only sees its own dir as build context, so
@@ -135,3 +152,11 @@ schemas/graph-schema-current.yaml
 .pi/
 .venv*/
 hypercortex/
+
+# Compiled Go binaries. `services/demo-producer/demo-producer` was committed as
+# a 6.9 MB macOS arm64 executable in a repository whose Dockerfile builds a
+# GOOS=linux one — nothing consumed it, nothing rebuilt it, and running the
+# documented `go build ./...` silently overwrote it and dirtied the tree.
+/services/demo-producer/demo-producer
+/services/enrichment/enrichment
+/services/ingest/ingest

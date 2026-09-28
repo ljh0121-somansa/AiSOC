@@ -18,11 +18,14 @@ AiSOC exposes a fully documented OpenAPI 3.1 REST API.
 
 ### JWT Bearer (User)
 
+Use the administrator `make bootstrap` created. There are no default
+credentials — the password is generated per deployment and printed once.
+
 ```bash
 # Obtain a token
 curl -X POST http://localhost:8000/api/v1/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"email":"admin@aisoc.local","password":"changeme"}'
+  -d '{"email":"admin@aisoc.internal","password":"<the password make up printed>"}'
 
 # Use the token
 curl http://localhost:8000/api/v1/cases \
@@ -42,9 +45,9 @@ API keys are created via `POST /api/v1/api-keys` and can be scoped to specific p
 
 When running locally, interactive Swagger UI is available at:
 
-- **Swagger UI**: [http://localhost:8000/docs](http://localhost:8000/docs)
-- **ReDoc**: [http://localhost:8000/redoc](http://localhost:8000/redoc)
-- **OpenAPI JSON**: [http://localhost:8000/openapi.json](http://localhost:8000/openapi.json)
+- **Swagger UI**: [http://localhost:8000/api/docs](http://localhost:8000/api/docs)
+- **ReDoc**: [http://localhost:8000/api/redoc](http://localhost:8000/api/redoc)
+- **OpenAPI JSON**: [http://localhost:8000/api/openapi.json](http://localhost:8000/api/openapi.json)
 
 The full spec is also committed at [`docs/openapi.yaml`](https://github.com/beenuar/AiSOC/blob/main/docs/openapi.yaml).
 
@@ -72,7 +75,7 @@ The full spec is also committed at [`docs/openapi.yaml`](https://github.com/been
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET/POST` | `/alerts` | List / ingest alerts |
-| `POST` | `/alerts/submit` | **Founder-flow direct-write submit** — synthesises an `Alert` row directly from a batch of OCSF events, bypassing Kafka / `services/ingest` / `services/fusion`. Powers `aisoc submit` and the fresh-clone demo so the console at `/alerts` lights up immediately. See [`packages/aisoc-cli`](https://github.com/aisoc-community/aisoc/tree/main/packages/aisoc-cli) and [`examples/alerts/lateral-movement.json`](https://github.com/aisoc-community/aisoc/tree/main/examples/alerts/lateral-movement.json) for the canonical payload. |
+| `POST` | `/alerts/submit` | **Founder-flow direct-write submit** — synthesises an `Alert` row directly from a batch of OCSF events, bypassing Kafka / `services/ingest` / `services/fusion`. Powers `aisoc submit` and the fresh-clone demo so the console at `/alerts` lights up immediately. See [`packages/aisoc-cli`](https://github.com/beenuar/AiSOC/tree/main/packages/aisoc-cli) and [`examples/alerts/lateral-movement.json`](https://github.com/beenuar/AiSOC/tree/main/examples/alerts/lateral-movement.json) for the canonical payload. |
 | `GET/PATCH/DELETE` | `/alerts/{id}` | Alert detail / update / delete |
 | `POST` | `/alerts/{id}/assign` | Assign to analyst |
 | `GET/POST` | `/rules` | Detection rule catalog |
@@ -127,6 +130,50 @@ Time-decayed risk scores per entity, computed by the fusion service.
 |--------|------|-------------|
 | `GET` | `/entity-risk` | Top entities by risk score (descending) |
 | `GET` | `/entity-risk/{entity}` | Risk detail for a specific entity |
+
+### Entity Graph
+
+The Neo4j entity graph written at ingest time. Every read is scoped to the
+calling tenant on **every node of every traversed path**, not only on the node
+the walk starts from, and a node carrying no `tenant_id` is not readable —
+otherwise any entity two tenants happen to share would bridge between them.
+Global MITRE reference labels (`Technique`, `Tactic`, `Mitigation`) are the
+narrow exemption, because they belong to no tenant.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/graph` | Tenant-level overview: nodes, edges, `generatedAt` |
+| `GET` | `/graph/neighbors/{entity_type}/{entity_id}` | Immediate neighbours of one entity |
+| `GET` | `/graph/blast-radius/{entity_type}/{entity_id}` | Entities reachable within N hops |
+| `GET` | `/graph/attack-path/{case_id}` | Case → alerts → hosts/users → IOCs → techniques |
+| `GET` | `/graph/incident-context/{alert_id}` | Identity, asset, cloud, business and threat context |
+| `GET` | `/graph/mitre-coverage` | Technique coverage aggregated from tenant alerts |
+
+`GET /graph` backs the console's Attack Graph view. Two query parameters:
+`depth` (1–6, default 3) bounds how far the traversal walks out from the
+tenant's own nodes, and `entity` narrows the seed set to one named host, user
+or indicator.
+
+One response is bounded to at most 400 nodes and 900 edges — past that a
+force-directed canvas is unreadable — and sets `truncated: true` when the cut
+was applied, so a partial picture is never mistaken for the whole estate.
+
+Its two failure modes are deliberately distinguishable:
+
+- **`200` with an empty `nodes` array** means the tenant genuinely has no
+  graph yet.
+- **`503`** means the graph backend could not be reached. This endpoint does
+  *not* degrade to an empty graph, because "no attack relationships exist in
+  your estate" is a security claim and making it on evidence nobody retrieved
+  is worse than saying nothing. The console surfaces the status and the path.
+
+:::note Shared infrastructure fails closed
+The ingest graph writer merges nodes on `natural_key` with `tenant_id` as a
+property, so a genuinely shared entity such as a public IP is last-writer-wins.
+The strict read filter therefore drops those nodes rather than showing them
+under the wrong tenant: safe, never leaking, at some cost in completeness.
+Re-keying on `(tenant_id, natural_key)` is the proper fix and needs a migration.
+:::
 
 ### Cases & Response
 

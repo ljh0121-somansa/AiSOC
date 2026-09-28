@@ -33,6 +33,8 @@ from typing import Any
 import asyncpg
 import structlog
 
+from app.investigator.chatops_notify import notify_chatops
+
 logger = structlog.get_logger()
 
 
@@ -84,27 +86,50 @@ async def close_pool() -> None:
         _POOL = None
 
 
+# The canonical seed tenant (migration 001). Its slug/name can be renamed by the
+# demo seed (slug 'default' → 'demo'), but this UUID is stable — so the 'default'
+# placeholder ref resolves here regardless of the current slug. See issue #601.
+_CANONICAL_TENANT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+_PLACEHOLDER_TENANT_REFS = frozenset({"", "default"})
+
+
 async def _resolve_tenant_id(conn: asyncpg.Connection, tenant_ref: str) -> uuid.UUID | None:
     """Look up the canonical tenant UUID. Accepts a UUID string, slug, or name.
 
-    Returns None if no matching tenant exists. Callers should fall back to
-    skipping the write rather than violating the FK.
+    The ``"default"`` placeholder — the agents service's fallback when a caller
+    doesn't pass an explicit tenant — resolves to the canonical seed tenant, or,
+    in a single-tenant install, to the sole tenant. This fixes issue #601: the
+    demo seed renames the seed tenant's slug from ``default`` to ``demo``, so
+    ``"default"`` matched nothing and every investigation was silently skipped.
+
+    Returns None only when the ref is genuinely ambiguous (an unknown ref, or
+    ``"default"`` with several tenants and no canonical one). Callers skip the
+    write rather than violate the FK — but should log loudly, not at debug.
     """
-    # If already a UUID, trust it
+    ref = (tenant_ref or "").strip()
+
+    # 1. An explicit UUID is trusted as-is.
     try:
-        return uuid.UUID(tenant_ref)
+        return uuid.UUID(ref)
     except (ValueError, TypeError):
         pass
 
-    row = await conn.fetchrow(
-        """
-        SELECT id FROM tenants
-        WHERE slug = $1 OR name = $1
-        LIMIT 1
-        """,
-        tenant_ref,
-    )
-    return row["id"] if row else None
+    # 2. Exact slug / name match.
+    row = await conn.fetchrow("SELECT id FROM tenants WHERE slug = $1 OR name = $1 LIMIT 1", ref)
+    if row:
+        return row["id"]
+
+    # 3. Placeholder ref → the canonical seed tenant (stable UUID, ignoring its
+    #    current slug/name), else the sole tenant in a single-tenant install.
+    if ref.lower() in _PLACEHOLDER_TENANT_REFS:
+        canonical = await conn.fetchrow("SELECT id FROM tenants WHERE id = $1", _CANONICAL_TENANT_ID)
+        if canonical:
+            return canonical["id"]
+        only = await conn.fetch("SELECT id FROM tenants LIMIT 2")
+        if len(only) == 1:
+            return only[0]["id"]
+
+    return None
 
 
 async def resolve_tenant(tenant_ref: str) -> uuid.UUID | None:
@@ -125,8 +150,16 @@ async def resolve_tenant(tenant_ref: str) -> uuid.UUID | None:
 
 async def _set_rls_context(conn: asyncpg.Connection, tenant_id: uuid.UUID) -> None:
     """Match the API service's set_rls_context — required so the audit-log
-    immutability trigger and tenant policies allow our INSERTs."""
-    await conn.execute("SELECT set_config('app.tenant_id', $1, true)", str(tenant_id))
+    immutability trigger and tenant policies allow our INSERTs.
+
+    The variable is ``app.current_tenant_id``. It said ``app.tenant_id`` until
+    2026-09, which is a name no policy in this schema reads, so the scoping
+    this function exists to provide was never applied: every policy fell
+    through its ``current_tenant_id() IS NULL`` arm and admitted everything.
+    Nothing failed, because failing open is what an unset context does — and
+    because the role the services connect as bypasses RLS outright.
+    """
+    await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", str(tenant_id))
 
 
 async def start_run(
@@ -149,10 +182,16 @@ async def start_run(
         async with pool.acquire() as conn:
             tenant_id = await _resolve_tenant_id(conn, tenant_ref)
             if tenant_id is None:
-                logger.debug(
+                # Loud, not debug (issue #601): the Investigation Ledger is a
+                # headline capability — a silent skip leaves it off with no
+                # operator signal after the run has already spent compute.
+                logger.warning(
                     "ledger.skip_run",
                     reason="unknown_tenant",
                     tenant_ref=tenant_ref,
+                    run_id=str(run_id),
+                    case_id=case_id,
+                    hint="pass an explicit tenant_id (UUID/slug); 'default' resolves only when a canonical or single tenant exists",
                 )
                 return None
             await _set_rls_context(conn, tenant_id)
@@ -304,9 +343,24 @@ async def complete_run(
     error: str | None = None,
     iterations: int = 0,
     total_tokens: int = 0,
-    total_cost_usd: float = 0.0,
+    total_cost_usd: float | None = None,
+    measured_call_count: int = 0,
+    estimated_cost_usd: float | None = None,
+    estimated_call_count: int = 0,
+    unpriced_call_count: int = 0,
 ) -> None:
-    """Finalise the run. Status should be 'completed' or 'failed'."""
+    """Finalise the run. Status should be 'completed' or 'failed'.
+
+    ``total_cost_usd`` is **measured** cost — what the gateway reported — and
+    ``None`` means no call on this run reported one. It is not defaulted to
+    ``0.0`` any more: every caller in this service omitted it, so every deep
+    investigation closed with a hard-coded zero that the ledger UI rendered as
+    ``$0.0000`` beside a run that had made real LLM calls.
+
+    The counts travel with the sums so a consumer can distinguish "measured,
+    and it was free" from "nothing measured it" — see migration
+    ``055_cost_provenance.sql``.
+    """
     pool = await get_pool()
     if pool is None:
         return
@@ -321,7 +375,11 @@ async def complete_run(
                        error = $3,
                        iterations = $4,
                        total_tokens = $5,
-                       total_cost_usd = $6,
+                       total_cost_usd = COALESCE($6, total_cost_usd),
+                       measured_call_count = $7,
+                       estimated_cost_usd = COALESCE($8, estimated_cost_usd),
+                       estimated_call_count = $9,
+                       unpriced_call_count = $10,
                        completed_at = now()
                  WHERE id = $1
                 """,
@@ -331,6 +389,10 @@ async def complete_run(
                 iterations,
                 total_tokens,
                 total_cost_usd,
+                measured_call_count,
+                estimated_cost_usd,
+                estimated_call_count,
+                unpriced_call_count,
             )
             logger.info(
                 "ledger.run_completed",
@@ -369,7 +431,14 @@ async def persist_auto_triage(
     auto_closed: bool = False,
     iterations: int = 0,
     tokens: int = 0,
-    cost_usd: float = 0.0,
+    cost_usd: float | None = None,
+    measured_call_count: int = 0,
+    estimated_cost_usd: float | None = None,
+    estimated_call_count: int = 0,
+    unpriced_call_count: int = 0,
+    groundedness: float | None = None,
+    ungrounded: bool | None = None,
+    shadow: bool = False,
 ) -> bool:
     """Durably record an auto-triage outcome (issue #571) in ONE transaction:
 
@@ -387,6 +456,16 @@ async def persist_auto_triage(
     configured, or an unknown tenant — neither is retryable). Raises
     :class:`LedgerPersistError` on a real DB error so the caller can retry /
     dead-letter. A completed run therefore always carries a non-null verdict.
+
+    ``shadow`` (gap-closure Phase 2.1) leaves the analyst's own columns alone:
+    ``disposition``, ``status`` and ``resolved_at`` keep whatever they held,
+    while the run, the event and the ``ai_*`` columns are written exactly as
+    they would be otherwise. ``alerts.disposition`` is the field an analyst
+    fills in and the field agreement is later measured against, so a shadow
+    verdict landing there would have the agent answering the question it is
+    about to be graded on. The guard is in the statement rather than left to
+    the caller, so a future caller that forgets to force ``auto_closed`` off
+    still cannot close an alert it was only meant to observe.
     """
     pool = await get_pool()
     if pool is None:
@@ -446,16 +525,47 @@ async def persist_auto_triage(
                     ),
                 )
                 await conn.execute(
+                    # `total_cost_usd` is measured cost only. It used to carry
+                    # a list-price guess keyed on a gateway alias, so a local
+                    # deployment that spent nothing accrued a per-alert dollar
+                    # figure here and everywhere reading from here.
+                    #
+                    # COALESCE on both sums, matching `complete_run` above.
+                    # Both columns are NOT NULL, and `None` is the ordinary
+                    # value of `estimated_cost_usd` whenever no estimate was
+                    # made — which is every run against a local model, because
+                    # there is no list price for `ollama_chat/...`. Binding it
+                    # directly made the UPDATE violate the constraint, so the
+                    # whole transaction rolled back, the worker retried three
+                    # times and dead-lettered the alert. With a model shipped in
+                    # CORE that is not an edge case: it was *every* auto-triage
+                    # run on a default install, and the console showed no
+                    # verdict for an LLM call that had genuinely happened.
+                    #
+                    # Leaving the column at its DEFAULT 0 is not a claim that
+                    # the run cost nothing — `estimated_call_count` and
+                    # `unpriced_call_count` are what carry that distinction, and
+                    # they are written from the same tuple.
                     """
                     UPDATE investigation_runs
                        SET status = 'completed', iterations = $2,
-                           total_tokens = $3, total_cost_usd = $4, completed_at = now()
+                           total_tokens = $3,
+                           total_cost_usd = COALESCE($4, total_cost_usd),
+                           measured_call_count = $5,
+                           estimated_cost_usd = COALESCE($6, estimated_cost_usd),
+                           estimated_call_count = $7,
+                           unpriced_call_count = $8,
+                           completed_at = now()
                      WHERE id = $1
                     """,
                     run_id,
                     iterations,
                     tokens,
                     cost_usd,
+                    measured_call_count,
+                    estimated_cost_usd,
+                    estimated_call_count,
+                    unpriced_call_count,
                 )
                 if alert_uuid is not None:
                     # Surface the automated verdict on the alert row. Status is
@@ -465,12 +575,19 @@ async def persist_auto_triage(
                     await conn.execute(
                         """
                         UPDATE alerts
-                           SET disposition = $3,
+                           SET disposition = CASE WHEN $10 THEN disposition ELSE $3 END,
                                ai_score = $4,
                                ai_summary = $5,
                                ai_recommendations = $6::jsonb,
-                               status = CASE WHEN $7 THEN 'resolved' ELSE status END,
-                               resolved_at = CASE WHEN $7 THEN now() ELSE resolved_at END,
+                               status = CASE WHEN $7 AND NOT $10 THEN 'resolved' ELSE status END,
+                               resolved_at = CASE WHEN $7 AND NOT $10 THEN now() ELSE resolved_at END,
+                               -- Nullable on purpose: NULL is "not scored",
+                               -- which is a different fact from "scored zero".
+                               -- The deterministic path never assesses
+                               -- groundedness, and defaulting it would read as
+                               -- every such verdict being unsupported.
+                               triage_groundedness = $8,
+                               triage_ungrounded = $9,
                                updated_at = now()
                          WHERE id = $1 AND tenant_id = $2
                         """,
@@ -481,18 +598,125 @@ async def persist_auto_triage(
                         (rationale or "")[:8000] or None,
                         json.dumps(recommendations),
                         auto_closed,
+                        float(groundedness) if groundedness is not None else None,
+                        ungrounded,
+                        shadow,
                     )
         logger.info(
             "ledger.auto_triage_persisted",
             run_id=str(run_id),
             verdict=verdict,
             auto_closed=auto_closed,
+            shadow=shadow,
             alert_id=str(alert_id or ""),
         )
         return True
     except Exception as exc:  # noqa: BLE001 — re-raised as a typed, retryable error
         logger.warning("ledger.auto_triage_persist_failed", run_id=str(run_id), error=str(exc))
         raise LedgerPersistError(str(exc)) from exc
+
+
+async def raise_approval(
+    *,
+    tenant_ref: str,
+    run_id: uuid.UUID | None,
+    alert_id: Any,
+    title: str,
+    summary: str,
+    risk_level: str,
+    action: dict[str, Any],
+    requested_by: str = "agent",
+) -> uuid.UUID | None:
+    """Queue a proposed action for human sign-off, returning the approval id.
+
+    The ``agent_approvals`` table, its API and the whole responder-app
+    approvals screen already existed. Nothing ever inserted a row: the API
+    docstring said "the agents service calls this" and a grep of this service
+    for ``approvals`` returned nothing. So the queue was structurally empty on
+    every deployment, and the feature was indistinguishable from a working one
+    that simply had no pending work.
+
+    Written from here rather than over HTTP because this is where the rest of
+    the triage outcome is persisted, under the same pool and the same RLS
+    context, so an approval cannot end up recorded against a verdict that
+    failed to save. Best-effort in the same sense as the other ledger writes:
+    no database or an unknown tenant is a no-op, because a triage verdict is
+    still worth having without one.
+
+    ``ON CONFLICT DO NOTHING`` on the deterministic id makes a Kafka replay
+    re-raise the same approval rather than a second copy of it — an operator
+    seeing the same containment request twice cannot tell which one is live.
+    """
+    pool = await get_pool()
+    if pool is None:
+        return None
+    try:
+        async with pool.acquire() as conn:
+            tenant_id = await _resolve_tenant_id(conn, tenant_ref)
+            if tenant_id is None:
+                logger.warning(
+                    "ledger.approval_skipped_unknown_tenant",
+                    tenant_ref=tenant_ref,
+                    run_id=str(run_id) if run_id else None,
+                )
+                return None
+            await _set_rls_context(conn, tenant_id)
+            approval_id = _deterministic_approval_id(tenant_id, run_id, action)
+            await conn.execute(
+                """
+                INSERT INTO agent_approvals
+                    (id, tenant_id, run_id, alert_id, requested_by, title,
+                     summary, risk_level, action, status, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', now(), now())
+                ON CONFLICT (id) DO NOTHING
+                """,
+                approval_id,
+                tenant_id,
+                run_id,
+                _coerce_uuid(alert_id),
+                requested_by[:120],
+                title[:200],
+                summary,
+                risk_level[:20],
+                json.dumps(action),
+            )
+        # Outside the connection block: the approval is durable now, and
+        # Slack being slow must not hold a database connection open.
+        await notify_chatops(approval_id, title=title, summary=summary, risk_level=risk_level, action=action)
+        # The id is returned whether the insert landed or the conflict
+        # clause fired: either way this is the approval that governs this
+        # action, and a replay must point at the one already queued.
+        return approval_id
+    except Exception as exc:  # noqa: BLE001 — an approval write must not fail triage
+        logger.warning(
+            "ledger.raise_approval_failed",
+            tenant_ref=tenant_ref,
+            run_id=str(run_id) if run_id else None,
+            error=str(exc),
+        )
+        return None
+
+
+def _deterministic_approval_id(
+    tenant_id: uuid.UUID,
+    run_id: uuid.UUID | None,
+    action: dict[str, Any],
+) -> uuid.UUID:
+    """One approval per (tenant, run, action type, target), stable across replays."""
+    key = "|".join(
+        [
+            str(tenant_id),
+            str(run_id or ""),
+            str(action.get("action_type") or ""),
+            str(action.get("target") or ""),
+        ]
+    )
+    return uuid.uuid5(_APPROVAL_NAMESPACE, key)
+
+
+#: Fixed namespace so an approval id is reproducible across processes and
+#: restarts. Any constant UUID would do; this one is arbitrary and permanent.
+_APPROVAL_NAMESPACE = uuid.UUID("6f1d3b6e-7a4f-5c2b-9f0a-2d5b8c1e4a37")
 
 
 async def record_suppression(

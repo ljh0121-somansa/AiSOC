@@ -108,7 +108,7 @@ test('accepts a ticket within the 30s clock-skew leeway', () => {
 
 test('rejects a ticket missing tenant_id', () => {
   const claims = validClaims();
-  delete (claims as Record<string, unknown>).tenant_id;
+  delete claims.tenant_id;
   assert.equal(verifyRealtimeTicket(mintTicket(claims), SECRET), null);
 });
 
@@ -117,17 +117,29 @@ test('rejects a non-numeric exp', () => {
   assert.equal(verifyRealtimeTicket(token, SECRET), null);
 });
 
-test('resolveTicketSecret falls back to the dev secret outside production', () => {
+// GHSA-4m55-xhcm-wjcr. This asserted the fallback and was the vulnerability:
+// the constant is published in this repository, and the production check read
+// an environment variable no shipped manifest passed to this container, so it
+// was the effective HMAC key in every deployment.
+test('resolveTicketSecret does not fall back to the published dev secret', () => {
   const prev = { ...process.env };
   try {
     delete process.env.AISOC_REALTIME_JWT_SECRET;
     process.env.ENVIRONMENT = 'development';
     delete process.env.AISOC_ENV;
     delete process.env.APP_ENV;
-    assert.equal(
-      resolveTicketSecret(),
-      'aisoc-dev-realtime-ticket-secret-not-for-production',
-    );
+    assert.equal(resolveTicketSecret(), null);
+  } finally {
+    process.env = prev;
+  }
+});
+
+test('the retired dev secret is refused even when set explicitly', () => {
+  const prev = { ...process.env };
+  try {
+    process.env.AISOC_REALTIME_JWT_SECRET =
+      'aisoc-dev-realtime-ticket-secret-not-for-production';
+    assert.equal(resolveTicketSecret(), null);
   } finally {
     process.env = prev;
   }

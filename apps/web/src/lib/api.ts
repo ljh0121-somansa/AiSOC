@@ -418,6 +418,8 @@ export interface ChildTenant {
   created_at?: string;
 }
 
+// Full tenant record from `GET /api/v1/tenants/me` (requires `settings:read`).
+// See services/api/app/api/v1/endpoints/tenants.py, class TenantResponse.
 export interface FullTenant {
   id: string;
   name: string;
@@ -431,6 +433,8 @@ export interface FullTenant {
   created_at?: string;
 }
 
+// Tenant member from `GET /api/v1/tenants/me/users` (requires `users:read`).
+// See services/api/app/api/v1/endpoints/tenants.py, class UserResponse.
 export interface TenantUser {
   id: string;
   tenant_id: string;
@@ -449,6 +453,34 @@ export interface CreateTenantUserPayload {
   role?: string;
 }
 
+/**
+ * What the product is called and what it looks like, for this tenant.
+ *
+ * Resolved server-side from the organisation the tenant belongs to, so the
+ * console never has to know whether a deployment is white-labelled: an
+ * unbranded one gets the platform defaults from the same endpoint. One code
+ * path rather than a branded one and an unbranded one that drift.
+ */
+export interface Branding {
+  product_name: string;
+  primary_color: string;
+  accent_color: string;
+  support_email: string | null;
+  support_url: string | null;
+  sender_name: string;
+  footer_text: string;
+  /** A path on this deployment, never a third-party address. */
+  logo_url: string | null;
+  org_id: string | null;
+  is_white_labelled: boolean;
+}
+
+export const brandingApi = {
+  /** Readable by any authenticated member; the console calls it per page load. */
+  async get(): Promise<Branding> {
+    return request<Branding>('/api/v1/branding');
+  },
+};
 export const tenantsApi = {
   /**
    * Lightweight tenant identity for the SOC console TopBar.
@@ -462,6 +494,11 @@ export const tenantsApi = {
     return request<MyTenant>('/api/v1/tenants/me/identity');
   },
 
+  /** Full tenant record (plan, limits, settings) for the Workspace settings panel. */
+  async getFull(): Promise<FullTenant> {
+    return request<FullTenant>('/api/v1/tenants/me');
+  },
+
   async getMeFull(): Promise<FullTenant> {
     return request<FullTenant>('/api/v1/tenants/me');
   },
@@ -473,6 +510,7 @@ export const tenantsApi = {
     });
   },
 
+  /** All users in the current tenant, for the Workspace settings panel. */
   async listUsers(): Promise<TenantUser[]> {
     return request<TenantUser[]>('/api/v1/tenants/me/users');
   },
@@ -515,9 +553,124 @@ export const tenantsApi = {
   },
 };
 
+// The managed-portfolio read surface. Every figure below is counted from the
+// tenant's own rows by `services/api/app/services/mssp_portfolio.py`; there is
+// no revenue, risk-score or analyst-allocation data anywhere in this product,
+// so the console does not have columns for them.
+
+export interface PortfolioConnectorHealth {
+  total: number;
+  healthy: number;
+  stale: number;
+  error: number;
+}
+
+export interface PortfolioLimitHeadroom {
+  key: string;
+  label: string;
+  used: number;
+  limit: number | null;
+  remaining: number | null;
+  pct_used: number | null;
+  /** unlimited | ok | warning | exhausted */
+  state: string;
+}
+
+export interface PortfolioTenant {
+  tenant_id: string;
+  name: string;
+  slug: string;
+  relationship: string;
+  is_active: boolean;
+  open_alerts: number;
+  critical_alerts: number;
+  high_alerts: number;
+  untriaged_alerts: number;
+  /** Seeded demo rows, counted apart from the figures above. */
+  synthetic_alerts: number;
+  open_cases: number;
+  sla_breached_cases: number;
+  /** Null when this tenant closed no cases in the trailing window. */
+  mttr_minutes: number | null;
+  connectors: PortfolioConnectorHealth;
+  last_event_at: string | null;
+  limits: PortfolioLimitHeadroom[];
+  limits_exhausted: number;
+  limits_warning: number;
+}
+
+export interface PortfolioSummary {
+  tenants: number;
+  tenants_active: number;
+  open_alerts: number;
+  critical_alerts: number;
+  high_alerts: number;
+  untriaged_alerts: number;
+  synthetic_alerts: number;
+  open_cases: number;
+  sla_breached_cases: number;
+  mttr_minutes: number | null;
+  connectors_total: number;
+  connectors_healthy: number;
+  connectors_stale: number;
+  connectors_error: number;
+  tenants_with_exhausted_limits: number;
+  tenants_with_limit_warnings: number;
+  tenants_without_connectors: number;
+}
+
+export interface Portfolio {
+  org_id: string | null;
+  org_slug: string | null;
+  org_name: string | null;
+  org_role: string | null;
+  /** True when the caller's role reaches the whole portfolio rather than explicit grants. */
+  portfolio_wide: boolean;
+  /**
+   * How many tenants the caller is scoped to. Distinguishes "your organisation
+   * manages none" from "you were granted none" — different problems, and a bare
+   * zero row count tells them apart for nobody.
+   */
+  scoped_tenants: number;
+  summary: PortfolioSummary;
+  tenants: PortfolioTenant[];
+}
+
+export interface PortfolioAlert {
+  alert_id: string;
+  tenant_id: string;
+  tenant_name: string;
+  title: string;
+  severity: string;
+  status: string;
+  category: string | null;
+  created_at: string | null;
+  event_time: string | null;
+  case_id: string | null;
+  is_synthetic: boolean;
+}
+
 export const msspApi = {
   async listChildren(): Promise<ChildTenant[]> {
     return request<ChildTenant[]>('/api/v1/mssp/children');
+  },
+
+  /**
+   * Managed portfolio: per-tenant posture plus derived totals.
+   *
+   * Throws `ApiError` with status 403 when the caller belongs to no operator
+   * organisation. That is not an error state in the console — cross-tenant
+   * reads simply are not theirs to make — so callers should branch on it.
+   */
+  async getPortfolio(): Promise<Portfolio> {
+    return request<Portfolio>('/api/v1/mssp/portfolio');
+  },
+
+  /** Open alerts across the portfolio. Excludes seeded demo rows by default. */
+  async listPortfolioAlerts(params: { severity?: string; limit?: number } = {}): Promise<PortfolioAlert[]> {
+    return request<PortfolioAlert[]>('/api/v1/mssp/portfolio/alerts', {
+      params: { severity: params.severity, limit: params.limit ?? 25 },
+    });
   },
 };
 
@@ -624,6 +777,12 @@ export interface Alert {
   updatedAt: string;
   resolvedAt?: string;
   confidenceLabel?: ConfidenceLabel;
+  /**
+   * Fusion detection confidence as an integer 0-100, normalised by
+   * `normalizeAlert` regardless of which key and scale the payload used.
+   * Render it as `N/100` — it is not a probability that the verdict is
+   * correct, and it is independent of severity.
+   */
   confidenceScore?: number;
   confidenceRationale?: ConfidenceFactor[];
   ledgerRunId?: string;
@@ -639,6 +798,29 @@ export interface Alert {
   relatedEntities?: RelatedEntity[];
   miniTimeline?: MiniTimelineEvent[];
   recommendedActions?: RecommendedAction[];
+  // ─── Automated triage ────────────────────────────────────────────────────
+  //
+  // `services/agents` auto-triages every fused alert and writes the verdict
+  // back onto the row (`ledger.persist_auto_triage`). The API has returned
+  // `ai_score` / `ai_summary` / `triage_groundedness` on every alert since,
+  // and this mapper dropped all three — so the one output of the AI the
+  // product leads with was metered, persisted, and rendered nowhere.
+  /** 0–1 confidence the triage run reported. Distinct from `confidenceScore`,
+   *  which is fusion's detection confidence and has nothing to do with the
+   *  agent. */
+  aiScore?: number;
+  /** The verdict's rationale, as written by whichever path produced it. The
+   *  model's own text is prefixed `LLM auto-triage verdict:`; the
+   *  deterministic fallback reads as a description of the signals it matched.
+   *  Rendered verbatim so the reader can tell them apart. */
+  aiSummary?: string;
+  /** Fraction of the verdict's cited indicators that appear in the evidence.
+   *  `null`/absent means *not assessed* — the deterministic path never scores
+   *  groundedness, and rendering that as 0 would read as "wholly unsupported".
+   */
+  triageGroundedness?: number | null;
+  /** Indicators the verdict cited that the evidence never contained. */
+  triageUngrounded?: string[];
 }
 
 /**
@@ -722,15 +904,53 @@ function normalizeAlert(raw: unknown): Alert {
       }))
     : undefined;
 
+  // Confidence arrives on two keys at two different scales, and this field
+  // used to accept whichever showed up first: the API surfaces `confidence`
+  // as an integer 0-100, while fusion's `confidence_score` is the raw
+  // [0.0, 1.0] float the band was derived from. One field carrying two
+  // scales meant every consumer had to guess, and they guessed differently —
+  // `AlertDetailView` multiplied by 100 and rendered a real confidence of 21
+  // as "2100%", while `AttackStory` rendered the same value as "21/100".
+  // Both passed their tests because each mock used the scale its own view
+  // assumed.
+  //
+  // Normalised here, once, to the canonical 0-100 integer. The scale is
+  // decided by the *key*, never by the magnitude: a genuine confidence of 1
+  // is indistinguishable from a raw score of 1.0 by value alone.
+  const canonicalConfidence = pickNum('confidence', 'confidence');
+  const rawConfidenceScore = pickNum('confidence_score', 'confidenceScore');
+  const confidenceScore =
+    canonicalConfidence !== undefined
+      ? canonicalConfidence
+      : rawConfidenceScore !== undefined
+        ? Math.round(rawConfidenceScore * 100)
+        : undefined;
+
   // ── Investigation Rail envelope (W6) ────────────────────────────────────
+  // `alert_rail.RelatedEntity` serialises as `{group, kind, value, label,
+  // pivot}`. This mapper read `e.type` and `e.pivot_path`, which the API has
+  // never sent, and passed `e.kind` ("host") into the client's `kind`, which
+  // is the rail *column* ("principal"). All three were wrong in the same
+  // direction: `pivotPath` was always null so no chip was ever a link, `type`
+  // was always empty, and `ENTITY_KIND_CONFIG[kind]` missed on every row — so
+  // the section rendered its header with a count and no chips beneath it. The
+  // `/graph?entity=…` route fix and its URL encoding were therefore
+  // unreachable from the console on every deployment.
+  //
+  // `group`/`kind` are read first and the old spellings kept as fallbacks, so
+  // a console pointed at an older API still renders.
   const relatedRaw = r.related_entities ?? r.relatedEntities;
   const relatedEntities = Array.isArray(relatedRaw)
     ? (relatedRaw as Array<Record<string, unknown>>).map((e) => ({
-        kind: (e.kind ?? 'principal') as RelatedEntity['kind'],
-        type: String(e.type ?? ''),
+        kind: (e.group ?? e.kind ?? 'principal') as RelatedEntity['kind'],
+        // `type` prefers its own spelling so a legacy `{kind: 'principal',
+        // type: 'host'}` payload still reports the concrete type, and falls
+        // back to `kind` for the current `{group, kind}` shape.
+        type: String(e.type ?? e.kind ?? ''),
         value: String(e.value ?? ''),
         label: (e.label as string | null | undefined) ?? null,
         pivotPath:
+          (e.pivot as string | null | undefined) ??
           (e.pivot_path as string | null | undefined) ??
           (e.pivotPath as string | null | undefined) ??
           null,
@@ -827,6 +1047,16 @@ function normalizeAlert(raw: unknown): Alert {
     relatedEntities,
     miniTimeline,
     recommendedActions,
+    aiScore: pickNum('ai_score', 'aiScore'),
+    aiSummary: pickStr('ai_summary', 'aiSummary'),
+    // `?? null` and not `?? undefined`: the column is nullable because NULL
+    // means "not assessed", and collapsing that into absent loses the
+    // distinction the schema comment exists to preserve.
+    triageGroundedness:
+      typeof (r.triage_groundedness ?? r.triageGroundedness) === 'number'
+        ? ((r.triage_groundedness ?? r.triageGroundedness) as number)
+        : null,
+    triageUngrounded: pickArr<string>('triage_ungrounded', 'triageUngrounded'),
   };
 }
 
@@ -853,6 +1083,7 @@ export interface AlertFilters {
 export const alertsApi = {
   list: async (filters: AlertFilters = {}) => {
     const raw = await request<{
+      items?: unknown[];
       alerts?: unknown[];
       total?: number;
       page?: number;
@@ -861,12 +1092,18 @@ export const alertsApi = {
     }>('/api/v1/alerts', {
       params: filters as Record<string, string>,
     });
+    // `AlertListResponse` puts the rows under `items`, not `alerts`
+    // (services/api/app/api/v1/endpoints/alerts.py). Reading only `alerts`
+    // resolved every page to [] while `total` reported the real count, so
+    // the queue rendered "1,247 alerts" above an empty table. `alerts` is
+    // still accepted because the mobile responder routes emit that shape.
+    const rows = Array.isArray(raw.items)
+      ? raw.items
+      : Array.isArray(raw.alerts)
+        ? raw.alerts
+        : [];
     return {
-      alerts: Array.isArray(raw.alerts)
-        ? raw.alerts.map(normalizeAlert)
-        : Array.isArray((raw as any).items)
-          ? (raw as any).items.map(normalizeAlert)
-          : [],
+      alerts: rows.map(normalizeAlert),
       total: typeof raw.total === 'number' ? raw.total : 0,
       page: typeof raw.page === 'number' ? raw.page : 1,
       pageSize:
@@ -1162,6 +1399,15 @@ export interface EntityRiskStats {
  */
 const FUSION_PATH = '/api/v1/fusion';
 
+// The tenant is no longer sent by default. It used to be, resolved from the
+// build-time `NEXT_PUBLIC_TENANT_ID` when nothing better was cached — and the
+// server took whatever arrived, because the entity-risk routes had no auth
+// dependency at all. Now the server derives the tenant from the bearer token
+// and treats the parameter as a filter it intersects with that scope, so
+// sending a stale build-time value would turn into a 403 for a perfectly
+// legitimate session. Omitting it is both safer and more correct: an explicit
+// `tenantId` is still honoured for an operator narrowing to one managed
+// customer, and naming a tenant outside their scope is refused server-side.
 export const entityRiskApi = {
   /** Top-N entities by current decayed risk score. */
   queue: (params: {
@@ -1171,7 +1417,7 @@ export const entityRiskApi = {
   } = {}) =>
     request<EntityRiskQueueResponse>(`${FUSION_PATH}/entity-risk/queue`, {
       params: {
-        tenant_id: params.tenantId ?? TENANT_ID,
+        tenant_id: params.tenantId,
         limit: params.limit ?? 25,
         promoted_only: params.promotedOnly ? 'true' : undefined,
       },
@@ -1180,7 +1426,7 @@ export const entityRiskApi = {
   /** Tenant-scoped queue stats for dashboards (banding, totals, threshold). */
   stats: (tenantId?: string) =>
     request<EntityRiskStats>(`${FUSION_PATH}/entity-risk/stats`, {
-      params: { tenant_id: tenantId ?? TENANT_ID },
+      params: { tenant_id: tenantId },
     }),
 
   /** Full risk record for a single entity (drawer detail). */
@@ -1188,7 +1434,7 @@ export const entityRiskApi = {
     const pathType = entityType === 'ip' ? 'src_ip' : entityType;
     return request<EntityRiskRecord>(
       `${FUSION_PATH}/entity-risk/${pathType}/${encodeURIComponent(entityValue)}`,
-      { params: { tenant_id: tenantId ?? TENANT_ID } },
+      { params: { tenant_id: tenantId } },
     );
   },
 };
@@ -1771,7 +2017,12 @@ export interface LedgerRunSummary {
   model_used: string | null;
   iterations: number;
   total_tokens: number;
+  /** Measured (gateway-reported) spend; 0 with a 0 count means unmeasured. */
   total_cost_usd: number;
+  measured_call_count: number;
+  estimated_cost_usd: number;
+  estimated_call_count: number;
+  unpriced_call_count: number;
   started_at: string;
   completed_at: string | null;
   error: string | null;
@@ -1779,9 +2030,15 @@ export interface LedgerRunSummary {
 
 export interface LedgerModelCost {
   model: string;
+  /** What the gateway resolved ``model`` to; ``model`` is often an alias. */
+  resolved_model: string | null;
   total_prompt_tokens: number;
   total_completion_tokens: number;
   total_cost_usd: number;
+  measured_call_count: number;
+  estimated_cost_usd: number;
+  estimated_call_count: number;
+  unpriced_call_count: number;
   total_latency_ms: number;
   call_count: number;
 }
@@ -1898,7 +2155,10 @@ export interface DashboardMetrics {
     low: number;
     info?: number;
     resolvedToday: number;
+    /** Mean time to resolve, in **hours**, from closed cases. */
     mttr: number;
+    /** Cases the mean was taken over. Zero means unmeasured, not zero hours. */
+    mttr_sample_count?: number;
   };
   cases: {
     open: number;
@@ -1986,6 +2246,22 @@ export interface SOCKpis {
   cases_opened_7d: number;
   cases_closed_7d: number;
   analyst_overrides_7d: number;
+  /**
+   * How many rows each mean above was averaged over. Zero means the figure is
+   * unmeasured rather than zero — render "not measured", not "0.0 hrs".
+   * Optional so the console still works against an API that predates them.
+   */
+  mttd_sample_count?: number;
+  mttr_sample_count?: number;
+  mttc_sample_count?: number;
+  /**
+   * The denominator each rate above was computed over. Zero means the rate is
+   * undefined rather than 0% — a tenant that has resolved nothing has not
+   * achieved a 0% false-positive rate. Optional for the same reason as the
+   * sample counts.
+   */
+  false_positive_rate_sample_count?: number;
+  escalation_rate_sample_count?: number;
 }
 
 export interface AttackHeatmapCell {
@@ -2020,7 +2296,12 @@ export interface CostAggregateRow {
   total_prompt_tokens: number;
   total_completion_tokens: number;
   total_cost_usd: number;
+  measured_call_count: number;
+  estimated_cost_usd: number;
+  estimated_call_count: number;
+  unpriced_call_count: number;
   total_latency_ms: number;
+  /** Read with ``measured_call_count``: zero there means this is not a mean. */
   avg_cost_per_run: number;
   avg_latency_per_call_ms: number;
 }
@@ -2058,6 +2339,87 @@ export const metricsApi = {
    * and X-Tenant-Id header that `request()` already attaches.
    */
   getSOC: () => request<SOCMetrics>('/api/v1/metrics/soc'),
+};
+
+// ─── Operational health: connector fleet, rejected events, alert posture ─────
+//
+// Three endpoints that existed server-side with no client. They answer the
+// question the alert-centric dashboards structurally cannot: whether the
+// absence of alerts means the estate is quiet or the pipeline stopped.
+
+/** How a connector is doing against *its own* configured poll cadence. */
+export type FleetHealthState = 'healthy' | 'degraded' | 'failed' | 'unproven' | 'disabled';
+
+export interface FleetConnectorHealth {
+  connector_id: string;
+  name: string;
+  connector_type: string;
+  state: FleetHealthState;
+  /** Operator-actionable wording from the server. Never bare "unhealthy". */
+  reason: string;
+  last_sync: string | null;
+  seconds_since_sync: number | null;
+  poll_interval_seconds: number;
+  /** How many poll cycles have been missed. Fractional. */
+  missed_intervals: number | null;
+  error_count: number;
+  events_ingested: number;
+  oauth_refresh_failures: number;
+  schema_drift_at: string | null;
+}
+
+export interface FleetHealth {
+  generated_at: string;
+  /** Worst enabled connector's state — deliberately not an average. */
+  state: FleetHealthState;
+  counts: Record<FleetHealthState, number>;
+  connectors: FleetConnectorHealth[];
+}
+
+export interface DeadLetterEntry {
+  id: string;
+  topic: string;
+  reason: string;
+  schema_version: string | null;
+  payload_excerpt: string | null;
+  source_event_id: string | null;
+  occurred_at: string | null;
+  acknowledged: boolean;
+}
+
+export interface DeadLetters {
+  window_hours: number;
+  total: number;
+  by_reason: Array<{ reason: string; count: number }>;
+  truncated: boolean;
+  dead_letters: DeadLetterEntry[];
+}
+
+export interface AlertStats {
+  total: number;
+  by_severity: Record<string, number>;
+  by_status: Record<string, number>;
+  new_last_24h: number;
+  critical_open: number;
+}
+
+export const operationsApi = {
+  /**
+   * Which connectors have quietly stopped working.
+   *
+   * Staleness is judged per connector against its own cadence, so a daily
+   * connector is not reported as failing eleven hours in.
+   */
+  fleetHealth: () => request<FleetHealth>('/api/v1/health/fleet'),
+
+  /** Events the pipeline refused, and why. */
+  deadLetters: (params: { hours?: number; limit?: number } = {}) =>
+    request<DeadLetters>('/api/v1/health/dead-letters', {
+      params: params as Record<string, string>,
+    }),
+
+  /** Severity / status distribution plus the two counters worth paging on. */
+  alertStats: () => request<AlertStats>('/api/v1/alerts/stats'),
 };
 
 // ─── Investigations ─────────────────────────────────────────────────────────
@@ -2816,8 +3178,11 @@ export const threatIntelApi = {
       body: JSON.stringify({ iocs }),
     }),
 
+  // `total` is the store's count of indicators in scope; `shown` is how many
+  // this response carries. They are different numbers and the console renders
+  // both — it used to render the page length as the catalogue size.
   list: (filters: { type?: IndicatorType; tag?: string; q?: string } = {}) =>
-    request<{ indicators: ThreatIndicator[]; total: number }>(
+    request<{ indicators: ThreatIndicator[]; total: number; shown?: number; bounded?: boolean }>(
       '/api/v1/threat-intel/indicators',
       { params: filters as Record<string, string> },
     ),
@@ -3157,6 +3522,170 @@ export const lakeApi = {
   schema: () => request<LakeSchemaResponse>('/api/v1/lake/schema'),
 };
 
+// ─── Federated SIEM search ───────────────────────────────────────────────────
+//
+// Client for `services/api/app/api/v1/endpoints/federated.py`, which fans one
+// `UnifiedQuery` out to every federated-capable connector the tenant has
+// enabled (Splunk, Microsoft Sentinel, Elastic, QRadar) using that tenant's
+// own vault-encrypted credentials, and merges the rows.
+//
+// The shape worth preserving through the client is `sources[]`. The endpoint
+// deliberately never fails the whole call because one backend is slow, 401s or
+// 5xxs — it returns a per-backend verdict instead. Collapsing that into a
+// single throw would discard exactly the information an analyst needs to tell
+// "Sentinel has nothing" from "Sentinel did not answer", so nothing here
+// treats a per-source error as a request error.
+
+/** Operator vocabulary accepted by `Indicator` in the connectors service. */
+export type FederatedOperator =
+  | 'eq'
+  | 'ne'
+  | 'contains'
+  | 'starts_with'
+  | 'ends_with'
+  | 'gt'
+  | 'gte'
+  | 'lt'
+  | 'lte'
+  | 'in';
+
+export const FEDERATED_OPERATORS: readonly FederatedOperator[] = [
+  'eq',
+  'ne',
+  'contains',
+  'starts_with',
+  'ends_with',
+  'gt',
+  'gte',
+  'lt',
+  'lte',
+  'in',
+] as const;
+
+/** One `field <op> value` triple. Stacking indicators implies AND. */
+export interface FederatedIndicator {
+  field: string;
+  operator: FederatedOperator;
+  value: unknown;
+}
+
+export interface FederatedSearchRequest {
+  free_text?: string;
+  indicators?: FederatedIndicator[];
+  since_seconds?: number;
+  limit?: number;
+  connector_ids?: string[] | null;
+  per_backend_timeout_seconds?: number | null;
+}
+
+/**
+ * Per-backend outcome.
+ *
+ * `status` is `ok` (rows returned, possibly zero), `error` (this backend
+ * failed and `error` carries the message; others may have succeeded), or
+ * `unsupported` (the connector type does not speak federated search).
+ */
+export interface FederatedSourceVerdict {
+  connector_id: string;
+  connector_name: string;
+  connector_type: string;
+  status: 'ok' | 'error' | 'unsupported';
+  row_count: number;
+  duration_ms: number;
+  error: string | null;
+}
+
+/** Source tag the API stamps onto every merged row. */
+export interface FederatedRowSource {
+  connector_id: string;
+  connector_name: string;
+  connector_type: string;
+}
+
+export type FederatedRow = Record<string, unknown> & {
+  _aisoc_source?: FederatedRowSource;
+};
+
+export interface FederatedSearchResponse {
+  rows: FederatedRow[];
+  row_count: number;
+  sources: FederatedSourceVerdict[];
+  truncated: boolean;
+}
+
+export interface FederatedBackend {
+  connector_id: string;
+  connector_type: string;
+  name: string;
+  health_status: string;
+  is_enabled: boolean;
+}
+
+export interface FederatedBackendsResponse {
+  backends: FederatedBackend[];
+}
+
+/**
+ * Thrown when the deployment has `AISOC_FEATURE_FED_SEARCH=false`.
+ *
+ * The endpoint answers 404 for that case, which is indistinguishable from a
+ * routing mistake unless the client names it. A disabled feature is a
+ * configuration fact the operator can act on; a generic "not found" is not.
+ */
+export class FederatedSearchDisabledError extends Error {
+  constructor() {
+    super('Federated search is disabled on this deployment (AISOC_FEATURE_FED_SEARCH).');
+    this.name = 'FederatedSearchDisabledError';
+  }
+}
+
+function asFederatedError(err: unknown): never {
+  // `_ensure_feature_enabled` answers 404 with this detail. The same endpoint
+  // also 404s for an unknown `connector_ids` entry, so match on the body
+  // rather than the status alone — misreporting a typo'd connector id as a
+  // disabled feature would send the operator to the wrong config file.
+  if (
+    err instanceof ApiError &&
+    err.status === 404 &&
+    /AISOC_FEATURE_FED_SEARCH|federated search is disabled/i.test(err.body)
+  ) {
+    throw new FederatedSearchDisabledError();
+  }
+  throw err;
+}
+
+export const federatedApi = {
+  /** Connector instances `search()` would fan out to, with their health. */
+  listBackends: async (): Promise<FederatedBackendsResponse> => {
+    try {
+      const raw = await request<Partial<FederatedBackendsResponse>>(
+        '/api/v1/federated/backends',
+      );
+      return { backends: Array.isArray(raw.backends) ? raw.backends : [] };
+    } catch (err) {
+      return asFederatedError(err);
+    }
+  },
+
+  search: async (body: FederatedSearchRequest): Promise<FederatedSearchResponse> => {
+    try {
+      const raw = await request<Partial<FederatedSearchResponse>>(
+        '/api/v1/federated/search',
+        { method: 'POST', body: JSON.stringify(body) },
+      );
+      const rows = Array.isArray(raw.rows) ? raw.rows : [];
+      return {
+        rows,
+        row_count: typeof raw.row_count === 'number' ? raw.row_count : rows.length,
+        sources: Array.isArray(raw.sources) ? raw.sources : [],
+        truncated: raw.truncated === true,
+      };
+    } catch (err) {
+      return asFederatedError(err);
+    }
+  },
+};
+
 // ─── Natural-language query translator (T3.4) ────────────────────────────────
 //
 // Wraps `services/api/app/api/v1/endpoints/nl_query.py`. The translator
@@ -3298,6 +3827,19 @@ export interface AttackGraph {
   nodes: GraphNode[];
   edges: GraphEdge[];
   generatedAt: string;
+  /**
+   * The response was cut at the server's ceiling, so paths are missing.
+   *
+   * Optional because `/graph/blast-radius` and the case attack-path route
+   * reuse this shape and bound differently. A consumer must treat `undefined`
+   * as "this endpoint does not say" and not as "complete" — the two are only
+   * the same for a response that was never bounded.
+   */
+  truncated?: boolean;
+  /** The node ceiling the service applied, when it reports one. */
+  nodeLimit?: number;
+  /** The edge ceiling the service applied, when it reports one. */
+  edgeLimit?: number;
 }
 
 export interface AttackPath {
@@ -4626,7 +5168,176 @@ export const autonomyPolicyApi = {
       `/api/v1/autonomy-policy/${encodeURIComponent(action)}`,
       { method: 'DELETE' },
     ),
+
+  /** Which alert classes this tenant is measuring rather than acting on. */
+  shadowMode: () =>
+    request<ShadowModeResponse>('/api/v1/autonomy-policy/shadow-mode'),
+
+  /** Start or stop measuring one alert class. */
+  setShadowMode: (alertClass: string, enabled: boolean) =>
+    request<ShadowModeEntry>(
+      `/api/v1/autonomy-policy/shadow-mode/${encodeURIComponent(alertClass)}`,
+      { method: 'PUT', body: JSON.stringify({ enabled }) },
+    ),
+
+  /** Capabilities this tenant has earned, or that an operator overruled into place. */
+  grants: () => request<GrantListResponse>('/api/v1/autonomy-policy/grants'),
+
+  /**
+   * Ask for a capability. A refusal is a 200 with `granted: false` and the
+   * reasons: being told no by a safety control is the control working, and
+   * surfacing it as an error invites a client to retry it.
+   */
+  requestGrant: (payload: PromotionRequestBody) =>
+    request<PromotionResponse>('/api/v1/autonomy-policy/grants', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  /** Hand a capability back. Audited as a revocation, not as a demotion. */
+  revokeGrant: (params: { scope_kind: string; scope_key: string; capability: string }) =>
+    request<void>(
+      `/api/v1/autonomy-policy/grants?${new URLSearchParams(params).toString()}`,
+      { method: 'DELETE' },
+    ),
+
+  /** Rolling agreement between the agent and this tenant's own analysts. */
+  agreement: (params?: { scope_kind?: string; scope_key?: string }) => {
+    const query = new URLSearchParams();
+    if (params?.scope_kind) query.set('scope_kind', params.scope_kind);
+    if (params?.scope_key) query.set('scope_key', params.scope_key);
+    const suffix = query.toString();
+    return request<AgreementResponse>(
+      `/api/v1/autonomy-policy/agreement${suffix ? `?${suffix}` : ''}`,
+    );
+  },
 };
+
+// ─── Shadow mode and rolling agreement (gap-closure Phase 2.1 / 2.2) ─────────
+//
+// Every rate below is `number | null`, and `null` means there was no
+// denominator. It renders as "not measured", never as 0: a zero in the
+// agreement column says the agent was wrong every time, and "it was never
+// asked" is a different fact calling for a different response. The counts
+// travel with the rates for the same reason — 100% over four answers is not
+// the claim 100% over four hundred is.
+
+export interface ShadowModeEntry {
+  alert_class: string;
+  enabled: boolean;
+  enabled_at?: string | null;
+  updated_at?: string | null;
+  updated_by?: string | null;
+}
+
+export interface ShadowModeResponse {
+  tenant_id: string;
+  entries: ShadowModeEntry[];
+}
+
+export interface AgreementWindow {
+  resolved: number;
+  labelled: number;
+  unlabeled: number;
+  answered: number;
+  abstained: number;
+  agreed: number;
+  malicious_support: number;
+  malicious_caught: number;
+  agreement_rate: number | null;
+  malicious_recall: number | null;
+  abstention_rate: number | null;
+}
+
+export interface AgreementScope {
+  key: string;
+  window: AgreementWindow;
+}
+
+export interface AgreementThresholds {
+  min_decisions: number;
+  min_malicious: number;
+  min_agreement: number;
+  min_malicious_recall: number;
+  max_abstention_rate: number;
+  window_days: number;
+  demotion_agreement: number;
+  demotion_malicious_recall: number;
+  drift_sample: number;
+  drift_min_answered: number;
+}
+
+// ─── Evidence-gated autonomy (gap-closure Phase 2.3) ────────────────────────
+//
+// `source` and `is_override` are both carried because the distinction has to
+// survive without anyone inferring it. An override is autonomy a human
+// overruled a refusal to grant, and six months later "was this earned" must
+// be answerable from the row rather than reconstructed from the numbers.
+
+export type GrantState = 'shadow' | 'granted' | 'demoted';
+export type GrantSource = 'earned' | 'operator_override';
+
+export interface AutonomyGrant {
+  id: string;
+  scope_kind: string;
+  scope_key: string;
+  capability: string;
+  state: GrantState;
+  source: GrantSource;
+  is_override: boolean;
+  evidence?: Record<string, unknown> | null;
+  granted_at?: string | null;
+  demoted_at?: string | null;
+  demoted_reason?: string | null;
+  override_reason?: string | null;
+}
+
+export interface GrantListResponse {
+  tenant_id: string;
+  grants: AutonomyGrant[];
+  /** Grants this request's reconciliation pass demoted. */
+  demoted_now: Array<Record<string, unknown>>;
+}
+
+export interface PromotionRequestBody {
+  scope_kind: string;
+  scope_key: string;
+  capability: string;
+  override?: boolean;
+  override_reason?: string | null;
+}
+
+export interface PromotionResponse {
+  granted: boolean;
+  state: GrantState;
+  source: GrantSource;
+  is_override: boolean;
+  /** What to fix on a refusal; what was waived on an override. */
+  refusals: string[];
+  evidence: Record<string, unknown>;
+  changed: boolean;
+}
+
+export interface AgreementResponse {
+  tenant_id: string;
+  scope_kind: string;
+  scope_key: string;
+  window: AgreementWindow;
+  /**
+   * The trailing slice of the most recent decisions, scored on its own. A
+   * window average is where a gradual decline hides, so any surface showing
+   * one has to show both or it is showing the flattering half.
+   */
+  recent: AgreementWindow;
+  window_start: string;
+  window_end: string;
+  thresholds: AgreementThresholds;
+  reconciled: number;
+  by_alert_class: AgreementScope[];
+  by_rule: AgreementScope[];
+  by_source: AgreementScope[];
+  by_model: AgreementScope[];
+}
 
 // ─── Analyst override feedback loop (Tier 1.5) ───────────────────────────────
 //
@@ -5028,36 +5739,66 @@ export interface DashboardPeriod {
 }
 
 export interface CostHeadline {
-  /** Sum of recorded LLM cost in USD over the window. */
+  /**
+   * **Measured** LLM cost in USD — what the gateway reported it charged.
+   * Only meaningful when ``measured_call_count > 0``: a zero there means
+   * nothing measured this window, which is not the same as a free one.
+   */
   total_cost_usd: number;
+  /** Calls the measured sum was computed over. 0 ⇒ render "not measured". */
+  measured_call_count: number;
+  /** List-price estimate for calls the gateway did not price. Label it. */
+  estimated_cost_usd: number;
+  estimated_call_count: number;
+  /** Calls nothing could price at all. */
+  unpriced_call_count: number;
   /** Sum of prompt + completion tokens. */
   total_tokens: number;
   /** Total LLM API call count (one row in aisoc_run_costs ≈ one call). */
   total_calls: number;
   /** Distinct investigation_runs that produced cost in the window. */
   total_runs: number;
-  /** Mean cost per run; null when no runs landed in the window. */
+  /** Mean measured cost per run; null when nothing was measured. */
   avg_cost_per_run_usd: number | null;
 }
 
 export interface CostBucket {
   /** Calendar day in UTC, ISO ``YYYY-MM-DD``. */
   day: string;
+  /** Measured cost for the day; see ``measured_call_count``. */
   total_cost_usd: number;
+  measured_call_count: number;
+  estimated_cost_usd: number;
+  estimated_call_count: number;
+  unpriced_call_count: number;
   total_tokens: number;
   call_count: number;
 }
 
 export interface ModelBreakdown {
-  /** Lowercased model id, e.g. ``gpt-4o-mini``. */
+  /** Lowercased model id as requested — usually an ``aisoc-<role>`` alias. */
   model: string;
+  /** What the gateway resolved that alias to, e.g. ``ollama/qwen2:1.5b``. */
+  resolved_model: string | null;
   runs: number;
   calls: number;
   total_prompt_tokens: number;
   total_completion_tokens: number;
+  /** Measured cost; see ``measured_call_count``. */
   total_cost_usd: number;
-  /** What this volume would have cost on the public list price. */
+  measured_call_count: number;
+  estimated_cost_usd: number;
+  estimated_call_count: number;
+  unpriced_call_count: number;
+  /**
+   * What this volume would have cost on the public list price. Read it with
+   * ``imputed_is_estimable``: false means the model has no published price
+   * and this is 0 because there is nothing to compute, not because it is free.
+   */
   imputed_public_cost_usd: number;
+  imputed_is_estimable: boolean;
+  /** Tokens the imputation had to skip, so partial coverage is visible. */
+  unpriced_tokens: number;
   avg_latency_ms: number | null;
 }
 
@@ -5065,6 +5806,9 @@ export interface TopCostCase {
   case_id: string;
   runs: number;
   total_cost_usd: number;
+  measured_call_count: number;
+  estimated_cost_usd: number;
+  estimated_call_count: number;
   total_tokens: number;
 }
 
@@ -5079,13 +5823,24 @@ export interface ByokSavings {
   is_byok_active: boolean;
   /** Provider id from /llm/status (e.g. ``openai``, ``local-ollama``). */
   provider: string;
-  /** Recorded cost — what the cost tracker actually booked. */
+  /** Measured cost — what the gateway reported. See ``recorded_is_measured``. */
   recorded_cost_usd: number;
-  /** Re-priced cost using public list pricing (BYOK-neutral baseline). */
+  /** False when nothing in the window was measured, so 0 means "unknown". */
+  recorded_is_measured: boolean;
+  /**
+   * Re-priced using public list pricing (BYOK-neutral baseline). There is no
+   * default rate: applying one to a gateway alias is what produced savings
+   * figures for spend that never happened.
+   */
   imputed_public_cost_usd: number;
+  /** False => no model in the window has a published price; render "—". */
+  imputed_is_estimable: boolean;
+  /** Tokens excluded from the imputation because nothing prices them. */
+  unpriced_tokens: number;
   /**
    * Estimated savings vs hosted: equals imputed_public_cost on BYOK,
-   * ``max(imputed - recorded, 0)`` otherwise.
+   * ``max(imputed - recorded, 0)`` otherwise. Meaningless unless
+   * ``imputed_is_estimable``.
    */
   savings_usd: number;
 }
@@ -5427,4 +6182,171 @@ export default {
   reports: reportsApi,
   costs: costsApi,
   savedViews: savedViewsApi,
+};
+
+// ─── API keys ────────────────────────────────────────────────────────────────
+//
+// The settings panel used to mint an `aisoc_live_…` secret in the browser with
+// `crypto.getRandomValues` and report "API key created". That string
+// authenticated nothing, so a user would wire it into a CI pipeline or a
+// forwarder and get silent 401s — while believing they held a working
+// credential. The real CRUD backend has existed at `/api/v1/api-keys` all
+// along; it simply had no client binding.
+
+export interface ApiKeyRecord {
+  id: string;
+  name: string;
+  prefix: string;
+  scopes: string[];
+  is_active: boolean;
+  expires_at: string | null;
+  last_used_at: string | null;
+  created_at: string;
+}
+
+/** Create response. `key` is the raw secret and is returned exactly once. */
+export interface CreatedApiKey extends Omit<ApiKeyRecord, 'is_active' | 'last_used_at'> {
+  key: string;
+}
+
+export interface CreateApiKeyInput {
+  name: string;
+  scopes?: string[];
+  expires_in_days?: number | null;
+}
+
+export const apiKeysApi = {
+  list: () => request<ApiKeyRecord[]>('/api/v1/api-keys'),
+
+  create: (data: CreateApiKeyInput) =>
+    request<CreatedApiKey>('/api/v1/api-keys', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  update: (id: string, data: Partial<CreateApiKeyInput>) =>
+    request<ApiKeyRecord>(`/api/v1/api-keys/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    }),
+
+  revoke: (id: string) =>
+    request<void>(`/api/v1/api-keys/${id}`, { method: 'DELETE' }),
+};
+
+// ─── Replay evaluation (gap-closure Phase 1.4) ───────────────────────────────
+//
+// Wraps `services/api/app/api/v1/endpoints/evaluations.py`: measure triage
+// against a tenant's own analysts, on their own closed findings.
+//
+// Every field the console needs to show sample sizes beside the headline is
+// on the summary, not buried in `score`. That is deliberate on both sides: a
+// headline accuracy rendered without the count behind it is the single most
+// misleading thing this surface could print, so the two travel together
+// through the wire shape rather than by a convention the UI has to remember.
+//
+// `headline_accuracy` is `null` when the window held too few malicious cases
+// for a headline to mean anything, and `headline_withheld_reason` carries the
+// sentence explaining that. Null is not zero: a zero in an accuracy column
+// says the agent got every answer wrong, which is a different fact with a
+// different remedy.
+
+export type ReplayEvaluationStatus = 'queued' | 'running' | 'completed' | 'failed';
+
+export interface ReplayEvaluationSummary {
+  id: string;
+  status: ReplayEvaluationStatus;
+  error: string | null;
+  connector_id: string;
+  vendor: string;
+  window_start: string;
+  window_end: string;
+  train_fraction: number;
+  bootstrap_seed: number;
+  bootstrap_resamples: number;
+  findings_read: number;
+  findings_labelled: number;
+  decisions_recorded: number;
+  graded: number;
+  malicious_support: number;
+  headline_accuracy: number | null;
+  headline_withheld_reason: string | null;
+  malicious_recall: number | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  is_terminal: boolean;
+}
+
+export interface ReplayEvaluationDetail extends ReplayEvaluationSummary {
+  /** The full `ReplayScore.as_dict()`. */
+  score: Record<string, unknown> | null;
+  /** Split point, frozen-context provenance, attempted writes, envelope gaps. */
+  method: Record<string, unknown> | null;
+  /** The artefact stored when the run completed, not a re-render. */
+  report_markdown: string | null;
+}
+
+export interface ReplayableConnectorInfo {
+  connector_type: string;
+  vendor: string;
+  label: string;
+}
+
+export interface ReplayCapabilities {
+  connectors: ReplayableConnectorInfo[];
+  default_window_days: number;
+  default_train_fraction: number;
+  default_bootstrap_seed: number;
+  default_bootstrap_resamples: number;
+  /** Below this many malicious cases no headline accuracy is printed. */
+  min_malicious_for_headline: number;
+  max_findings: number;
+}
+
+export interface StartReplayInput {
+  connector_id: string;
+  since?: string;
+  until?: string;
+  train_fraction?: number;
+  limit?: number;
+}
+
+export type ReplayExportFormat = 'markdown' | 'json' | 'pdf';
+
+export const evaluationsApi = {
+  capabilities: () =>
+    request<ReplayCapabilities>('/api/v1/evaluations/replay/capabilities'),
+
+  list: (limit = 50) =>
+    request<ReplayEvaluationSummary[]>('/api/v1/evaluations/replay', {
+      params: { limit },
+    }),
+
+  get: (id: string) =>
+    request<ReplayEvaluationDetail>(`/api/v1/evaluations/replay/${id}`),
+
+  decisions: (id: string, limit = 2000) =>
+    request<Array<Record<string, unknown>>>(
+      `/api/v1/evaluations/replay/${id}/decisions`,
+      { params: { limit } },
+    ),
+
+  start: (data: StartReplayInput) =>
+    request<ReplayEvaluationSummary>('/api/v1/evaluations/replay', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  /**
+   * Where a download points. Built rather than fetched because the browser
+   * does the download, and the route already sets `Content-Disposition`.
+   *
+   * `exclude_latency` is offered on every format: the two wall-clock figures
+   * are the only part of the report that does not reproduce between runs, so
+   * an operator diffing two exports wants them gone.
+   */
+  exportUrl: (id: string, format: ReplayExportFormat, excludeLatency = false): string =>
+    `${API_BASE}/api/v1/evaluations/replay/${id}/export` +
+    `?format=${format}&exclude_latency=${excludeLatency ? 'true' : 'false'}`,
 };

@@ -2,6 +2,8 @@
 
 import { useState } from 'react'
 import useSWR from 'swr'
+import { demoFallback } from '@/lib/demoFallback';
+import { useTenantId } from '@/components/layout/TenantProvider';
 
 // Same-origin by default — Next.js rewrites proxy `/api/v1/purple-team/*` to
 // the purple-team service. Override with `NEXT_PUBLIC_PURPLE_TEAM_API` for
@@ -107,7 +109,17 @@ interface TabletopSession {
 // --------------------------------------------------------------------------
 // Helpers
 // --------------------------------------------------------------------------
-const TENANT_ID = '00000000-0000-0000-0000-000000000001'
+// Every request on this page is tenant-scoped through an explicit
+// `?tenant_id=` parameter, and that parameter used to be the hardcoded literal
+// `00000000-0000-0000-0000-000000000001` for all nine of them. On a
+// single-tenant install it happened to be right; on any other it asked for a
+// different tenant's ATT&CK coverage, drift history, executions and tabletop
+// sessions, and rendered whatever came back as the operator's own. It also
+// wrote: `captureNow()` POSTed a drift snapshot, and `createSession()` created
+// a tabletop session, into that tenant.
+//
+// `useTenantId()` returns `null` until the tenant resolves, and every SWR key
+// below is `null`-gated on it so no request is issued against a guess.
 
 const fetcher = (url: string) =>
   fetch(url).then((r) => {
@@ -171,14 +183,16 @@ function driftDeltaLabel(d: number, suffix = ''): string {
 // --------------------------------------------------------------------------
 
 function CoverageHeatmap() {
+  const tenantId = useTenantId()
+
   const { data } = useSWR<CoverageMatrix>(
-    `${API}/api/v1/purple-team/coverage?tenant_id=${TENANT_ID}`,
+    tenantId ? `${API}/api/v1/purple-team/coverage?tenant_id=${tenantId}` : null,
     fetcher,
-    { refreshInterval: 30000, fallbackData: MOCK_COVERAGE }
+    { refreshInterval: 30000, fallbackData: demoFallback(MOCK_COVERAGE) }
   )
 
   const { data: drift, mutate: mutateDrift } = useSWR<DriftLatestResponse>(
-    `${API}/api/v1/purple-team/drift/latest?tenant_id=${TENANT_ID}`,
+    tenantId ? `${API}/api/v1/purple-team/drift/latest?tenant_id=${tenantId}` : null,
     fetcher,
     { refreshInterval: 60000 }
   )
@@ -187,11 +201,15 @@ function CoverageHeatmap() {
   const [captureError, setCaptureError] = useState<string | null>(null)
 
   async function captureNow() {
+    if (!tenantId) {
+      setCaptureError('No active tenant — cannot capture a snapshot.')
+      return
+    }
     setCapturing(true)
     setCaptureError(null)
     try {
       const res = await fetch(
-        `${API}/api/v1/purple-team/drift/snapshot?tenant_id=${TENANT_ID}&trigger=manual`,
+        `${API}/api/v1/purple-team/drift/snapshot?tenant_id=${tenantId}&trigger=manual`,
         { method: 'POST' }
       )
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -203,13 +221,26 @@ function CoverageHeatmap() {
     }
   }
 
-  const resolved = data ?? MOCK_COVERAGE
+  // `fallbackData` above withholds MOCK_COVERAGE outside the hosted demo.
+  // Naming the constant again here put it back: with the purple-team service
+  // absent — it is an `extras`-profile service, so it is not running in
+  // `core` or `full` — the page rendered an invented ATT&CK matrix with
+  // per-technique test and detection counts as the tenant's own coverage.
+  // Zeroed rather than absent: `summary` is required by CoverageMatrix and is
+  // dereferenced unguarded below, and "0 of 0 techniques, 0% coverage" is the
+  // truthful reading when the service has told us nothing.
+  const EMPTY_COVERAGE: CoverageMatrix = {
+    tactics: [],
+    techniques: {},
+    summary: { total_techniques: 0, tested_techniques: 0, detected_techniques: 0, overall_coverage: 0 },
+  }
+  const resolved = data ?? EMPTY_COVERAGE
   const {
     summary: rawSummary,
-    tactics = MOCK_COVERAGE.tactics,
-    techniques = MOCK_COVERAGE.techniques,
+    tactics = EMPTY_COVERAGE.tactics,
+    techniques = EMPTY_COVERAGE.techniques,
   } = resolved
-  const summary = rawSummary ?? MOCK_COVERAGE.summary
+  const summary = rawSummary ?? EMPTY_COVERAGE.summary
 
   // Index drift status by technique_id for O(1) lookup while rendering cells.
   const driftByTid = new Map<string, DriftTechnique>()
@@ -411,12 +442,14 @@ function CoverageHeatmap() {
 }
 
 function ExecutionsTable({ onReportDetection }: { onReportDetection: (ex: Execution) => void }) {
+  const tenantId = useTenantId()
   const { data, error, isLoading } = useSWR<Execution[]>(
-    `${API}/api/v1/purple-team/executions?tenant_id=${TENANT_ID}&limit=50`,
+    tenantId ? `${API}/api/v1/purple-team/executions?tenant_id=${tenantId}&limit=50` : null,
     fetcher,
     { refreshInterval: 10000 }
   )
 
+  if (!tenantId) return <div className="text-sm text-gray-500 p-4">Resolving tenant…</div>
   if (isLoading) return <div className="text-sm text-gray-500 p-4">Loading executions…</div>
   if (error || !data) return <div className="text-sm text-red-500 p-4">Failed to load executions</div>
 
@@ -484,13 +517,14 @@ function ExecutionsTable({ onReportDetection }: { onReportDetection: (ex: Execut
 }
 
 function TabletopPanel() {
+  const tenantId = useTenantId()
   const [showCreate, setShowCreate] = useState(false)
   const [selectedSession, setSelectedSession] = useState<TabletopSession | null>(null)
   const [newFinding, setNewFinding] = useState('')
   const [newFindingSeverity, setNewFindingSeverity] = useState('medium')
 
   const { data: sessions, mutate } = useSWR<TabletopSession[]>(
-    `${API}/api/v1/purple-team/tabletop?tenant_id=${TENANT_ID}`,
+    tenantId ? `${API}/api/v1/purple-team/tabletop?tenant_id=${tenantId}` : null,
     fetcher,
     { refreshInterval: 15000 }
   )
@@ -498,11 +532,12 @@ function TabletopPanel() {
   const [form, setForm] = useState({ name: '', scenario: '', technique_ids: '' })
 
   async function createSession() {
+    if (!tenantId) return
     await fetch(`${API}/api/v1/purple-team/tabletop`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        tenant_id: TENANT_ID,
+        tenant_id: tenantId,
         name: form.name,
         scenario: form.scenario,
         technique_ids: form.technique_ids.split(',').map((s) => s.trim()).filter(Boolean),
@@ -793,11 +828,13 @@ const TABS = ['Coverage', 'Executions', 'Tabletop'] as const
 type Tab = typeof TABS[number]
 
 export default function PurpleTeamPage() {
+  const tenantId = useTenantId()
   const [tab, setTab] = useState<Tab>('Coverage')
   const [reportTarget, setReportTarget] = useState<Execution | null>(null)
 
+  // Same key as `ExecutionsTable` so revalidating here refreshes that table.
   const { mutate: mutateExecutions } = useSWR<Execution[]>(
-    `${API}/api/v1/purple-team/executions?tenant_id=${TENANT_ID}&limit=50`,
+    tenantId ? `${API}/api/v1/purple-team/executions?tenant_id=${tenantId}&limit=50` : null,
     fetcher,
     { refreshInterval: 10000 }
   )

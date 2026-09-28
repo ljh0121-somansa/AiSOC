@@ -35,7 +35,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Final
+from urllib.parse import quote
 
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -186,6 +187,81 @@ class _EntityBucket:
         self.entities.append(RelatedEntity(group=group, kind=kind, value=v, label=label, pivot=pivot))
 
 
+def _graph_pivot(kind: str, value: str) -> str:
+    """Deep-link into the entity graph with the node pre-selected.
+
+    The route is ``/graph`` — ``apps/web/src/app/(app)/graph/page.tsx``. There
+    has never been an ``/attack-graph`` route, so the earlier prefix 404'd
+    before the query string mattered; ``tests/test_pivot_routes_resolve.py``
+    now checks this against the routes the console actually defines.
+
+    The value is encoded exactly as the federated-search helper encodes it
+    (``apps/web/src/components/federated/pivot.ts``), because an asset named
+    ``Finance & Legal`` otherwise truncates at the ampersand and pivots to a
+    different entity while looking like it worked. ``AttackGraphView`` splits
+    on the first colon after Next has decoded the parameter.
+    """
+    return f"/graph?entity={quote(f'{kind}:{value}', safe='')}"
+
+
+# Entity kinds the rail files under "network" rather than "principal".
+_NETWORK_KINDS: Final[frozenset[str]] = frozenset({"ip", "domain", "url"})
+
+# `type` values the fusion sink emits, mapped to the rail's kinds. Anything
+# outside this map is ignored rather than guessed at: an unrecognised kind
+# would build a `/graph?entity=<kind>:…` link the graph cannot resolve, which
+# is the class of defect the pivot-route test exists to prevent.
+_PIPELINE_ENTITY_KINDS: Final[dict[str, str]] = {
+    "host": "host",
+    "hostname": "host",
+    "device": "host",
+    "user": "user",
+    "username": "user",
+    "account": "user",
+    "asset": "asset",
+    "ip": "ip",
+    "ip_address": "ip",
+    "src_ip": "ip",
+    "domain": "domain",
+    "url": "url",
+}
+
+
+def _pipeline_entities(alert: Alert) -> list[tuple[str, str]]:
+    """Entities the fusion sink recorded, as ``(kind, value)`` pairs.
+
+    `services/fusion` writes `alerts.entities` as
+    ``[{"type": "host", "value": "WIN-01"}, …]`` and does **not** write
+    `affected_hosts` / `affected_users` / `affected_ips` — its INSERT does not
+    list those columns. Only `seed_demo.py` populates them. So every entity
+    pivot in the rail rendered for demo data and for nothing the real pipeline
+    produced, on every deployment.
+
+    Order is preserved and the caller's bucket dedups against the
+    denormalised columns, so a row that happens to carry both spellings
+    yields one chip rather than two.
+    """
+    raw = getattr(alert, "entities", None)
+    if not isinstance(raw, list):
+        return []
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        declared = _norm_str(item.get("type")) or ""
+        kind = _PIPELINE_ENTITY_KINDS.get(declared.lower())
+        value = _norm_str(item.get("value"))
+        if not kind or not value:
+            continue
+        key = (kind, value.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((kind, value))
+    return out
+
+
 def build_related_entities(alert: Alert) -> list[RelatedEntity]:
     """Produce the rail's Related Entities list from an ``Alert`` row.
 
@@ -200,28 +276,36 @@ def build_related_entities(alert: Alert) -> list[RelatedEntity]:
 
     # ── Principal ───────────────────────────────────────────────────────
     # Hosts and users an analyst would isolate / disable. We promote
-    # the denormalised columns first, then mine the raw event blob
-    # for fields the connector didn't curate into a top-level column.
+    # the denormalised columns first, then the `entities` blob the fusion
+    # sink writes, then mine the raw event for fields the connector didn't
+    # curate into a top-level column.
+    for kind, value in _pipeline_entities(alert):
+        bucket.add(
+            group="network" if kind in _NETWORK_KINDS else "principal",
+            kind=kind,
+            value=value,
+            pivot=_graph_pivot(kind, value),
+        )
     for host in _dedup_strs(alert.affected_hosts or ()):
         bucket.add(
             group="principal",
             kind="host",
             value=host,
-            pivot=f"/attack-graph?entity=host:{host}",
+            pivot=_graph_pivot("host", host),
         )
     for user in _dedup_strs(alert.affected_users or ()):
         bucket.add(
             group="principal",
             kind="user",
             value=user,
-            pivot=f"/attack-graph?entity=user:{user}",
+            pivot=_graph_pivot("user", user),
         )
     for asset in _dedup_strs(alert.affected_assets or ()):
         bucket.add(
             group="principal",
             kind="asset",
             value=asset,
-            pivot=f"/attack-graph?entity=asset:{asset}",
+            pivot=_graph_pivot("asset", asset),
         )
 
     # ── Network ─────────────────────────────────────────────────────────
@@ -230,7 +314,7 @@ def build_related_entities(alert: Alert) -> list[RelatedEntity]:
             group="network",
             kind="ip",
             value=ip,
-            pivot=f"/attack-graph?entity=ip:{ip}",
+            pivot=_graph_pivot("ip", ip),
         )
     dst_ip = _from_blob(raw_event, ("dst_ip", "destination_ip", "remote_ip"))
     if dst_ip:
@@ -239,7 +323,7 @@ def build_related_entities(alert: Alert) -> list[RelatedEntity]:
             kind="ip",
             value=dst_ip,
             label="destination",
-            pivot=f"/attack-graph?entity=ip:{dst_ip}",
+            pivot=_graph_pivot("ip", dst_ip),
         )
     domain = _from_blob(raw_event, ("domain", "target_domain", "host_domain"))
     if domain:
@@ -247,7 +331,7 @@ def build_related_entities(alert: Alert) -> list[RelatedEntity]:
             group="network",
             kind="domain",
             value=domain,
-            pivot=f"/attack-graph?entity=domain:{domain}",
+            pivot=_graph_pivot("domain", domain),
         )
     url = _from_blob(raw_event, ("url", "request_url", "uri"))
     if url:
@@ -414,7 +498,12 @@ async def build_mini_timeline(
 
     # ── Case timeline ───────────────────────────────────────────────────
     if alert.case_id is not None:
-        case_q = select(CaseTimeline).where(CaseTimeline.case_id == alert.case_id).order_by(CaseTimeline.created_at.desc()).limit(limit)
+        case_q = (
+            select(CaseTimeline)
+            .where(CaseTimeline.case_id == alert.case_id, CaseTimeline.tenant_id == alert.tenant_id)
+            .order_by(CaseTimeline.created_at.desc())
+            .limit(limit)
+        )
         case_rows = (await db.execute(case_q)).scalars().all()
         events.extend(_case_event(row) for row in case_rows)
 

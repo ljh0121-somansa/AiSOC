@@ -55,6 +55,27 @@ class OktaClient:
             raise ValueError(f"No Okta user found for: {login_or_id}")
         return users[0]
 
+    async def get_user_status(self, login_or_id: str) -> str | None:
+        """Read the user's lifecycle status, for post-action verification.
+
+        The action APIs return 200 on an accepted request, which says the
+        request was accepted and nothing about whether the account is now
+        blocked. Okta already returns the status on the user object, so
+        verification costs one read.
+
+        Returns ``None`` when the user cannot be found or the read fails:
+        indeterminate, never a confirmation. A renamed or deprovisioned
+        account is not the same fact as "the disable did not take".
+        """
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                user = await self._find_user(client, login_or_id)
+                status = user.get("status")
+                return str(status) if status else None
+        except Exception as exc:  # noqa: BLE001 - indeterminate, never a false VERIFIED
+            logger.warning("okta.get_user_status.failed", login=login_or_id, error=str(exc))
+            return None
+
     async def suspend_user(self, login_or_id: str) -> dict[str, Any]:
         """Suspend an Okta user (blocks sign-in without deactivating)."""
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -122,15 +143,23 @@ class OktaClient:
             logger.info("okta.clear_sessions.success", user_id=user_id)
             return {"success": True, "action": "clear_sessions", "user_id": user_id, "login": login_or_id}
 
-    async def reset_password(self, login_or_id: str) -> dict[str, Any]:
-        """Trigger a password reset email for the user."""
+    async def reset_password(self, login_or_id: str, *, send_email: bool = True) -> dict[str, Any]:
+        """Trigger a password reset for the user.
+
+        ``send_email`` maps to Okta's ``sendEmail`` query parameter. It is a
+        keyword because ``ResetPasswordExecutor`` has always read
+        ``parameters.send_email`` and passed it here — against a signature
+        that did not accept it, so every live Okta reset raised ``TypeError``
+        and came back as a FAILED action. Simulation mode never constructs
+        this client, which is why nothing caught it.
+        """
         async with httpx.AsyncClient(timeout=20.0) as client:
             user = await self._find_user(client, login_or_id)
             user_id = user["id"]
             resp = await client.post(
                 f"{self._domain}/api/v1/users/{user_id}/lifecycle/reset_password",
                 headers=self._headers(),
-                params={"sendEmail": "true"},
+                params={"sendEmail": "true" if send_email else "false"},
             )
             resp.raise_for_status()
             data = resp.json()

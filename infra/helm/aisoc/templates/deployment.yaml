@@ -49,6 +49,54 @@ spec:
             matchLabels:
               {{- include "aisoc.selectorLabels" $ | nindent 14 }}
               app.kubernetes.io/component: {{ $name }}
+      {{- if and $svc.waitForKafka $.Values.kafka.waitForBroker.enabled }}
+      {{- /*
+        Hold a consumer or producer back until a broker answers.
+
+        Without this, a cold install races: the Kafka StatefulSet is still
+        forming its controller quorum when fusion's lifespan runs, aiokafka's
+        bootstrap raises KafkaConnectionError, the worker task ends, and
+        nothing retries. The pod stays Running and /health keeps answering
+        200, so the install looks complete with nothing consuming the spine.
+        Observed on a three-node kind cluster on 2026-09-27: every event was
+        accepted by ingest and none became an alert.
+
+        A readiness probe alone does not fix this, because Kubernetes does not
+        restart on readiness failure, by design, so that a broker fault is
+        not hidden behind a restart loop. Ordering is the chart's job.
+      */}}
+      initContainers:
+        - name: wait-for-kafka
+          image: "{{ $.Values.kafka.waitForBroker.image.repository }}:{{ $.Values.kafka.waitForBroker.image.tag }}"
+          imagePullPolicy: {{ $.Values.kafka.waitForBroker.image.pullPolicy }}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -uo pipefail
+              bootstrap="{{ include "aisoc.kafkaBootstrap" $ }}"
+              for attempt in $(seq 1 {{ $.Values.kafka.waitForBroker.attempts }}); do
+                if /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server "$bootstrap" >/dev/null 2>&1; then
+                  echo "broker reachable at $bootstrap"
+                  exit 0
+                fi
+                echo "waiting for $bootstrap (attempt $attempt)"
+                sleep {{ $.Values.kafka.waitForBroker.intervalSeconds }}
+              done
+              echo "no broker answered at $bootstrap; refusing to start a consumer that would detach silently" >&2
+              exit 1
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 768Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+      {{- end }}
       containers:
         - name: {{ $name }}
           image: "{{ $svc.image.repository }}:{{ $svc.image.tag | default $.Chart.AppVersion }}"
@@ -71,6 +119,36 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- if eq $name "web" }}
+            {{- /*
+              The console proxies every browser request to these addresses.
+              They have to be named here because the published image is built
+              against the Compose network's DNS (`http://api:8000`), and no
+              such host exists in a cluster — the chart's Services are
+              `<release>-api`, `<release>-agents`, `<release>-realtime`. The
+              chart set none of them, so a Helm install rendered a console
+              whose every API call resolved nowhere.
+
+              Setting them was necessary and not sufficient: until
+              apps/web/docker-entrypoint.sh shipped, these were read by
+              nothing at run time, because `next build` compiles rewrite
+              destinations into .next/routes-manifest.json. An image older
+              than that entrypoint will ignore these and still dial
+              `http://api:8000`.
+
+              `values.yaml`'s `services.web.env` wins, for an API that lives
+              outside the release.
+            */}}
+            {{- $fullname := include "aisoc.fullname" $ }}
+            {{- $webEnv := $svc.env | default dict }}
+            {{- range $upstream, $target := dict "API_URL" "api" "AGENTS_URL" "agents" "REALTIME_URL" "realtime" }}
+            {{- if not (hasKey $webEnv $upstream) }}
+            {{- $targetSvc := get $.Values.services $target }}
+            - name: {{ $upstream }}
+              value: "http://{{ $fullname }}-{{ $target }}:{{ $targetSvc.service.port | default 80 }}"
+            {{- end }}
+            {{- end }}
+            {{- end }}
             {{- range $k, $v := $svc.env }}
             - name: {{ $k }}
               value: {{ $v | quote }}

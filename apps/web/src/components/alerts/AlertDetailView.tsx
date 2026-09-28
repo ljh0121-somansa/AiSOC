@@ -1,16 +1,16 @@
 'use client';
 
 import { useState } from 'react';
+import { useRouter } from 'next/navigation';
 import useSWR from 'swr';
 import Link from 'next/link';
 import toast from 'react-hot-toast';
 import {
   alertsApi,
-  agentsApi,
+  casesApi,
   ledgerApi,
   feedbackApi,
   type Alert,
-  type AgentInvestigation,
   type ConfidenceFactor,
   type ConfidenceLabel,
   type AnalystVerdict,
@@ -21,6 +21,7 @@ import { clsx } from 'clsx';
 import { ContextualActions } from '@/components/copilot/ContextualActions';
 import { ExplainDrawer } from '@/components/alerts/ExplainDrawer';
 import { CreateCaseModal } from '@/components/alerts/CreateCaseModal';
+import { demoFallback } from '@/lib/demoFallback';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -60,6 +61,7 @@ const CONFIDENCE_CONFIG: Record<ConfidenceLabel, { label: string; badge: string;
     description: 'Weak or partial signal; likely needs analyst validation.',
   },
 };
+
 
 // ─── Sections ─────────────────────────────────────────────────────────────────
 
@@ -119,25 +121,38 @@ function ConfidenceChip({ label, score }: { label: ConfidenceLabel; score?: numb
     >
       <span className={clsx('w-2 h-2 rounded-full', cfg.dot)} />
       {cfg.label}
-      {pct !== null && <span className="opacity-70 font-mono">· {pct}%</span>}
+      {points !== null && (
+        <span className="opacity-70 font-mono">{`· ${points}/100`}</span>
+      )}
     </span>
   );
 }
 
+/** `+0.20` / `−0.30`, never `+-0.30`. Matches the narrative builder's glyphs. */
+function signedContribution(contribution: number): string {
+  const sign = contribution < 0 ? '\u2212' : '+';
+  return `${sign}${Math.abs(contribution).toFixed(2)}`;
+}
+
 function ConfidenceFactorBar({ factor }: { factor: ConfidenceFactor }) {
-  const pct = Math.max(0, Math.min(1, factor.contribution / Math.max(factor.weight, 0.001)));
-  const widthPct = Math.round(pct * 100);
+  // A factor can push the score down as well as up. The magnitude drives the
+  // bar width and the sign drives its colour, so a negative factor reads as
+  // "this argued against the verdict" rather than as an empty bar: clamping
+  // the signed ratio to [0, 1] rendered every negative factor at zero width.
+  const magnitude = Math.min(1, Math.abs(factor.contribution) / Math.max(factor.weight, 0.001));
+  const widthPct = Math.round(magnitude * 100);
+  const negative = factor.contribution < 0;
   return (
     <div>
       <div className="flex items-baseline justify-between gap-3 mb-1">
         <span className="text-sm text-gray-200">{factor.label}</span>
         <span className="text-xs font-mono text-gray-500 shrink-0">
-          +{factor.contribution.toFixed(2)} / {factor.weight.toFixed(2)}
+          {`${signedContribution(factor.contribution)} / ${factor.weight.toFixed(2)}`}
         </span>
       </div>
       <div className="h-1.5 bg-gray-800 rounded overflow-hidden">
         <div
-          className="h-full bg-emerald-500/70"
+          className={clsx('h-full', negative ? 'bg-red-500/70' : 'bg-emerald-500/70')}
           style={{ width: `${widthPct}%` }}
           aria-hidden="true"
         />
@@ -348,44 +363,26 @@ function AIInvestigation({ alertId, alert }: { alertId: string; alert?: Alert })
         </button>
       </div>
 
-      {/* Findings */}
-      {investigation.findings && (
-        <div className="bg-gray-950/60 rounded-lg p-4 text-xs text-gray-300 font-mono leading-relaxed whitespace-pre-wrap max-h-64 overflow-y-auto">
-          {investigation.findings}
+      {error && (
+        <div className="mb-4 rounded-lg border border-red-900/60 bg-red-950/40 px-3 py-2 text-xs text-red-300">
+          {error}
         </div>
       )}
 
-      {/* Recommendations */}
-      {investigation.recommendations && investigation.recommendations.length > 0 && (
-        <div className="space-y-2">
-          <p className="text-xs font-medium text-gray-400">Recommended Actions</p>
-          {investigation.recommendations.map((rec, i) => (
-            <div key={i} className="flex items-start gap-2 text-xs text-gray-300">
-              <span className="text-blue-400 shrink-0 mt-0.5">→</span>
-              {rec}
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Actions */}
-      {investigation.actions && investigation.actions.length > 0 && (
-        <div className="space-y-2">
-          <p className="text-xs font-medium text-gray-400">Automated Actions Available</p>
-          {investigation.actions.map((action, i) => (
-            <div key={i} className="flex items-center justify-between bg-gray-800/60 rounded-lg px-3 py-2">
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-blue-400 font-mono">{action.type}</span>
-                <span className="text-xs text-gray-500">→</span>
-                <span className="text-xs text-gray-300 font-mono">{action.target}</span>
-              </div>
-              <button className="text-xs bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 px-2 py-1 rounded transition-colors">
-                Execute
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
+      <button
+        onClick={startInvestigation}
+        disabled={isRunning}
+        className="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium px-6 py-2 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+      >
+        {isRunning ? (
+          <span className="flex items-center gap-2">
+            <span className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+            Starting investigation...
+          </span>
+        ) : (
+          'Start AI investigation'
+        )}
+      </button>
     </div>
   );
 }

@@ -33,13 +33,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+# `scripts/` is on sys.path when this file is run as a program, but not when a
+# test loads it by path with importlib. gate_toolkit sits beside it either way.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from gate_toolkit import repo_root, self_test_if_requested
+
+self_test_if_requested(__file__, ["python"])
+
 # ─── Data types ───────────────────────────────────────────────────────────────
 
 SEVERITY_ORDER = {"info": 0, "low": 1, "moderate": 2, "high": 3, "critical": 4}
 
-IGNORE_ID_PATTERN = re.compile(
-    r"^(CVE-\d{4}-\d{4,}|GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}|GO-\d{4}-\d{4,}|PYSEC-\d{4}-\d+)$"
-)
+IGNORE_ID_PATTERN = re.compile(r"^(CVE-\d{4}-\d{4,}|GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}|GO-\d{4}-\d{4,}|PYSEC-\d{4}-\d+)$")
 
 
 @dataclass
@@ -65,6 +71,16 @@ class Report:
     findings: list[Finding] = field(default_factory=list)
     ignored: list[Finding] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    #: Services that could not be scanned at all. Tracked separately from
+    #: `warnings` because they mean something categorically different: not "we
+    #: scanned and found something questionable" but "we did not scan this".
+    #:
+    #: A dependency gate that quietly skips a service is worse than one that
+    #: fails, because it reads as coverage that is not there. `services/slack-bot`
+    #: was dropped this way by a stale poetry.lock, and while it was missing its
+    #: lock resolved an idna and a pydantic-settings version with known
+    #: advisories that every other service had already moved past (#650).
+    unscanned: list[str] = field(default_factory=list)
 
     @property
     def high_critical(self) -> list[Finding]:
@@ -105,21 +121,16 @@ def load_ignores(path: Path, today: dt.date | None = None) -> list[Ignore]:
 
         parts = [p.strip() for p in line.split("|")]
         if len(parts) != 4:
-            raise ValueError(
-                f"Line {line_no}: expected 4 pipe-delimited fields, got {len(parts)}"
-            )
+            raise ValueError(f"Line {line_no}: expected 4 pipe-delimited fields, got {len(parts)}")
 
         tool, vuln_id, reason, expiry_str = parts
 
         if tool not in allowed_tools:
-            raise ValueError(
-                f"Line {line_no}: invalid tool '{tool}' (expected: {sorted(allowed_tools)})"
-            )
+            raise ValueError(f"Line {line_no}: invalid tool '{tool}' (expected: {sorted(allowed_tools)})")
 
         if not IGNORE_ID_PATTERN.match(vuln_id):
             raise ValueError(
-                f"Line {line_no}: invalid ID '{vuln_id}' "
-                "(expected CVE-YYYY-NNNNN, GHSA-xxxx-xxxx-xxxx, GO-YYYY-NNNN, or PYSEC-YYYY-N)"
+                f"Line {line_no}: invalid ID '{vuln_id}' (expected CVE-YYYY-NNNNN, GHSA-xxxx-xxxx-xxxx, GO-YYYY-NNNN, or PYSEC-YYYY-N)"
             )
 
         if not reason:
@@ -127,16 +138,14 @@ def load_ignores(path: Path, today: dt.date | None = None) -> list[Ignore]:
 
         try:
             expiry = dt.date.fromisoformat(expiry_str)
-        except ValueError:
-            raise ValueError(f"Line {line_no}: invalid date '{expiry_str}' (expected YYYY-MM-DD)")
+        except ValueError as exc:
+            raise ValueError(f"Line {line_no}: invalid date '{expiry_str}' (expected YYYY-MM-DD)") from exc
 
         if expiry < today:
             raise ValueError(f"Line {line_no}: ignore for {vuln_id} expired on {expiry_str}")
 
         if expiry > max_expiry:
-            raise ValueError(
-                f"Line {line_no}: expiry {expiry_str} exceeds 90-day maximum from today ({max_expiry})"
-            )
+            raise ValueError(f"Line {line_no}: expiry {expiry_str} exceeds 90-day maximum from today ({max_expiry})")
 
         ignores.append(Ignore(tool=tool, vuln_id=vuln_id, reason=reason, expires=expiry))
 
@@ -155,7 +164,29 @@ def is_ignored(tool: str, vuln_ids: list[str], ignores: list[Ignore]) -> Ignore 
 # ─── pnpm scanner ────────────────────────────────────────────────────────────
 
 
-def classify_pnpm_audit(audit_json: dict[str, Any], ignores: list[Ignore]) -> Report:
+def pnpm_install_roots(repo_root: Path) -> list[str]:
+    """Every directory holding its own ``pnpm-lock.yaml``, relative to the repo root.
+
+    Read from the tree rather than listed, because a listed set is the artefact
+    that drifts. ``apps/mobile`` is a deliberately separate install root — it
+    has its own ``pnpm-workspace.yaml`` so its installs stop rewriting the root
+    lock — and auditing only the repo root never saw it. Two high-severity
+    advisories stood open there while this arm reported a clean workspace.
+    """
+    proc = subprocess.run(
+        ["git", "ls-files", "-z", "*pnpm-lock.yaml"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    return sorted({str(Path(p).parent) for p in proc.stdout.split("\0") if p})
+
+
+def classify_pnpm_audit(
+    audit_json: dict[str, Any],
+    ignores: list[Ignore],
+    location: str = "pnpm workspace",
+) -> Report:
     """Classify pnpm audit JSON into a Report using native severity."""
     report = Report()
 
@@ -172,7 +203,7 @@ def classify_pnpm_audit(audit_json: dict[str, Any], ignores: list[Ignore]) -> Re
             severity=severity,
             vuln_id=all_ids[0] if all_ids else str(advisory.get("id", "unknown")),
             package=advisory.get("module_name", "unknown"),
-            location="pnpm workspace",
+            location=location,
             title=advisory.get("title") or advisory.get("overview") or "",
         )
 
@@ -185,7 +216,37 @@ def classify_pnpm_audit(audit_json: dict[str, Any], ignores: list[Ignore]) -> Re
 
 
 def run_pnpm_audit(repo_root: Path, ignores: list[Ignore]) -> Report:
-    """Run pnpm audit with fallback registry on 403."""
+    """Audit every pnpm install root in the tree, not only the repo root."""
+    roots = pnpm_install_roots(repo_root)
+    merged = Report()
+    if not roots:
+        # Zero install roots is not zero workspaces vulnerable. Without this the
+        # arm prints "pnpm: 0 findings" over a tree with no lockfile in it,
+        # which is the sentence a clean audit also prints.
+        merged.unscanned.append(f"no pnpm-lock.yaml anywhere in {repo_root} — NOTHING was scanned")
+        return merged
+
+    for rel in roots:
+        label = "pnpm workspace" if rel == "." else f"pnpm workspace {rel}"
+        part = run_pnpm_audit_at(repo_root / rel, label, ignores)
+        merged.findings.extend(part.findings)
+        merged.ignored.extend(part.ignored)
+        merged.warnings.extend(part.warnings)
+        merged.unscanned.extend(part.unscanned)
+    return merged
+
+
+def run_pnpm_audit_at(root: Path, label: str, ignores: list[Ignore]) -> Report:
+    """Run pnpm audit in one install root, with fallback registry on 403."""
+    lockfile = root / "pnpm-lock.yaml"
+    if not lockfile.is_file():
+        # `pnpm audit` in a directory with no lockfile has nothing to resolve
+        # and can still answer with an empty advisory set. Refuse instead:
+        # the workspace the audit is supposed to cover is not there.
+        report = Report()
+        report.unscanned.append(f"no pnpm-lock.yaml at {lockfile} — the workspace was NOT scanned")
+        return report
+
     fallback = os.environ.get("PNPM_AUDIT_REGISTRY", "https://registry.npmjs.org/")
 
     for attempt, registry in enumerate([None, fallback]):
@@ -195,7 +256,7 @@ def run_pnpm_audit(repo_root: Path, ignores: list[Ignore]) -> Report:
 
         proc = subprocess.run(
             ["pnpm", "audit", "--json"],
-            cwd=repo_root,
+            cwd=root,
             env=env,
             capture_output=True,
             text=True,
@@ -211,13 +272,17 @@ def run_pnpm_audit(repo_root: Path, ignores: list[Ignore]) -> Report:
         except json.JSONDecodeError:
             print(f"Failed to parse pnpm audit output:\n{output}", file=sys.stderr)
             report = Report()
-            report.warnings.append("pnpm audit returned unparseable output")
+            # Unparseable output means the workspace was not audited. Recorded
+            # as a coverage gap rather than a warning for the same reason the
+            # Python arm does it: a warning still exits 0, so the job would
+            # report "pnpm: 0 findings" having scanned nothing at all.
+            report.unscanned.append(f"{label}: audit returned unparseable output — NOT scanned")
             return report
 
-        return classify_pnpm_audit(data, ignores)
+        return classify_pnpm_audit(data, ignores, label)
 
     report = Report()
-    report.warnings.append("pnpm audit failed on all registries")
+    report.unscanned.append(f"{label}: audit failed on every registry — NOT scanned")
     return report
 
 
@@ -236,9 +301,7 @@ def parse_pip_audit_json(raw: str) -> list[dict[str, Any]]:
     return []
 
 
-def classify_pip_audit(
-    target: str, dependencies: list[dict[str, Any]], ignores: list[Ignore]
-) -> Report:
+def classify_pip_audit(target: str, dependencies: list[dict[str, Any]], ignores: list[Ignore]) -> Report:
     """Classify pip-audit findings. All findings are treated as high (fail-closed)."""
     report = Report()
 
@@ -295,10 +358,13 @@ def _export_requirements(service_dir: Path, work_dir: Path) -> Path | None:
         req_path = work_dir / "requirements.txt"
         proc = subprocess.run(
             [
-                "poetry", "export",
-                "--format", "requirements.txt",
+                "poetry",
+                "export",
+                "--format",
+                "requirements.txt",
                 "--without-hashes",
-                "--output", str(req_path),
+                "--output",
+                str(req_path),
             ],
             cwd=work_dir,
             capture_output=True,
@@ -312,6 +378,17 @@ def _export_requirements(service_dir: Path, work_dir: Path) -> Path | None:
     return req_path
 
 
+def _python_manifests(repo_root: Path) -> list[Path]:
+    """Every service or package directory holding a ``pyproject.toml``."""
+    found: list[Path] = []
+    for search_dir in ("services", "packages"):
+        parent = repo_root / search_dir
+        if not parent.is_dir():
+            continue
+        found.extend(child for child in sorted(parent.iterdir()) if child.is_dir() and (child / "pyproject.toml").exists())
+    return found
+
+
 def run_pip_audit(repo_root: Path, ignores: list[Ignore]) -> Report:
     """Run pip-audit on all Python services with pyproject.toml.
 
@@ -320,57 +397,59 @@ def run_pip_audit(repo_root: Path, ignores: list[Ignore]) -> Report:
       2. pip-audit -r requirements.txt --format json
     """
     combined = Report()
+    manifests = _python_manifests(repo_root)
+    if not manifests:
+        # Zero manifests discovered is not zero manifests vulnerable. The arm
+        # would otherwise print "python: 0 findings" over a tree with nothing
+        # in it, which is the same sentence a clean audit of twenty services
+        # prints. Recorded as unscanned so `exit_code_for` fails.
+        combined.unscanned.append(f"no pyproject.toml under services/ or packages/ in {repo_root} — NOTHING was scanned")
+        return combined
 
     with tempfile.TemporaryDirectory(prefix="security_audit_py_") as tmp:
         tmp_root = Path(tmp)
 
-        for search_dir in ["services", "packages"]:
-            parent = repo_root / search_dir
-            if not parent.exists():
+        for child in manifests:
+            target = str(child.relative_to(repo_root))
+            safe_name = target.replace("/", "__")
+            work_dir = tmp_root / safe_name
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+            req_path = _export_requirements(child, work_dir)
+            if req_path is None:
+                # Not a warning: this service is now unscanned, and the
+                # usual cause is a poetry.lock whose content hash no longer
+                # matches pyproject.toml. Recorded so `exit_code_for` can
+                # fail rather than letting coverage silently shrink.
+                combined.unscanned.append(f"{target}: poetry export failed (stale poetry.lock?) — NOT scanned")
                 continue
-            for child in sorted(parent.iterdir()):
-                if not child.is_dir():
-                    continue
-                pyproject = child / "pyproject.toml"
-                if not pyproject.exists():
-                    continue
 
-                target = str(child.relative_to(repo_root))
-                safe_name = target.replace("/", "__")
-                work_dir = tmp_root / safe_name
-                work_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                cmd = [
+                    "pip-audit",
+                    "-r",
+                    str(req_path),
+                    "--format",
+                    "json",
+                    "--progress-spinner",
+                    "off",
+                ]
 
-                req_path = _export_requirements(child, work_dir)
-                if req_path is None:
-                    combined.warnings.append(
-                        f"poetry export failed for {target}; skipping pip-audit"
-                    )
-                    continue
+                proc = subprocess.run(cmd, capture_output=True, text=True, cwd=repo_root)
+            except FileNotFoundError:
+                combined.unscanned.append("pip-audit not found on PATH — NO Python service was scanned")
+                break
 
-                try:
-                    cmd = [
-                        "pip-audit",
-                        "-r", str(req_path),
-                        "--format", "json",
-                        "--progress-spinner", "off",
-                    ]
+            if proc.returncode not in (0, 1):
+                # pip-audit returns 1 when vulns found; anything else means
+                # it did not complete, so this service is unscanned too.
+                combined.unscanned.append(f"{target}: pip-audit exited {proc.returncode} — NOT scanned ({proc.stderr[:160].strip()})")
+                continue
 
-                    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=repo_root)
-                except FileNotFoundError:
-                    combined.warnings.append("pip-audit not found on PATH; skipping Python audit")
-                    break
-
-                if proc.returncode not in (0, 1):
-                    # pip-audit returns 1 when vulns found, other codes are errors
-                    combined.warnings.append(
-                        f"pip-audit on {target} exited {proc.returncode}: {proc.stderr[:200]}"
-                    )
-                    continue
-
-                deps = parse_pip_audit_json(proc.stdout)
-                sub = classify_pip_audit(target, deps, ignores)
-                combined.findings.extend(sub.findings)
-                combined.ignored.extend(sub.ignored)
+            deps = parse_pip_audit_json(proc.stdout)
+            sub = classify_pip_audit(target, deps, ignores)
+            combined.findings.extend(sub.findings)
+            combined.ignored.extend(sub.ignored)
 
     return combined
 
@@ -401,18 +480,18 @@ def parse_govulncheck_json(stdout: str) -> list[dict[str, Any]]:
     results = []
     for osv_id in sorted(finding_ids):
         osv = osv_by_id.get(osv_id, {})
-        results.append({
-            "id": osv_id,
-            "aliases": osv.get("aliases", []),
-            "summary": osv.get("summary", ""),
-        })
+        results.append(
+            {
+                "id": osv_id,
+                "aliases": osv.get("aliases", []),
+                "summary": osv.get("summary", ""),
+            }
+        )
 
     return results
 
 
-def classify_govulncheck(
-    module: str, vulns: list[dict[str, Any]], ignores: list[Ignore]
-) -> Report:
+def classify_govulncheck(module: str, vulns: list[dict[str, Any]], ignores: list[Ignore]) -> Report:
     """Classify govulncheck findings. All findings are treated as high (fail-closed)."""
     report = Report()
 
@@ -448,6 +527,12 @@ def run_govulncheck(repo_root: Path, ignores: list[Ignore]) -> Report:
         if parent.exists():
             go_mods.extend(sorted(parent.rglob("go.mod")))
 
+    if not go_mods:
+        # Same reason as the Python arm: "go: 0 findings" over a tree with no
+        # go.mod in it reads exactly like a clean scan of every Go module.
+        combined.unscanned.append(f"no go.mod under services/ or packages/ in {repo_root} — NOTHING was scanned")
+        return combined
+
     for go_mod in go_mods:
         module_dir = go_mod.parent
         module = str(module_dir.relative_to(repo_root))
@@ -460,13 +545,16 @@ def run_govulncheck(repo_root: Path, ignores: list[Ignore]) -> Report:
                 text=True,
             )
         except FileNotFoundError:
-            combined.warnings.append("govulncheck not found on PATH; skipping Go audit")
+            combined.unscanned.append("govulncheck not found on PATH — NO Go module was scanned")
             break
 
         if proc.returncode not in (0, 3):
-            combined.warnings.append(
-                f"govulncheck on {module} exited {proc.returncode}: {proc.stderr[:200]}"
-            )
+            # govulncheck exits 0 (clean) or 3 (vulnerabilities found); anything
+            # else — a build failure, a missing toolchain, an unresolvable
+            # module — means this module was not analysed. That is a coverage
+            # gap, not a warning: a warning exits 0 and the arm would print
+            # "go: 0 findings" for a module it never managed to read.
+            combined.unscanned.append(f"{module}: govulncheck exited {proc.returncode} — NOT scanned ({proc.stderr[:160].strip()})")
             continue
 
         vulns = parse_govulncheck_json(proc.stdout)
@@ -490,6 +578,10 @@ def emit_annotations(report: Report) -> None:
         print(f"::notice title=security-audit::{f.tool} {f.severity}: {f.vuln_id} in {f.package}")
     for w in report.warnings:
         print(f"::warning title=security-audit::{w}")
+    for gap in report.unscanned:
+        # An error, because an unscanned service is a hole in the gate rather
+        # than a noteworthy observation about it.
+        print(f"::error title=security-audit-coverage::{gap}")
 
 
 def emit_summary(report: Report) -> None:
@@ -506,6 +598,15 @@ def emit_summary(report: Report) -> None:
         f"- **Ignored**: {len(report.ignored)}",
         "",
     ]
+
+    if report.unscanned:
+        lines.append("### Not scanned — coverage gap")
+        lines.append("")
+        lines.append("These were skipped, so no claim is made about them:")
+        lines.append("")
+        for gap in report.unscanned:
+            lines.append(f"- `{gap}`")
+        lines.append("")
 
     if report.findings:
         lines.append("| Tool | Severity | ID | Package | Location |")
@@ -527,8 +628,21 @@ def emit_summary(report: Report) -> None:
 
 
 def exit_code_for(report: Report) -> int:
-    """Staged policy: high/critical → 1, everything else → 0."""
+    """Staged policy: high/critical → 1, a coverage gap → 1, otherwise 0.
+
+    A service that could not be scanned fails the job. That is a deliberate
+    change from treating it as a warning, because the two failure modes are
+    not comparable: a finding means the gate worked, while an unscanned
+    service means the gate did not run and reported success anyway.
+
+    `services/slack-bot` sat in that state — dropped by a stale poetry.lock —
+    and while it was missing, its lock resolved an idna and a
+    pydantic-settings version with known advisories that every other service
+    had already moved past. Nothing in CI would ever have said so (#650).
+    """
     if report.high_critical:
+        return 1
+    if report.unscanned:
         return 1
     return 0
 
@@ -537,14 +651,16 @@ def exit_code_for(report: Report) -> int:
 
 
 def get_repo_root() -> Path:
-    workspace = os.environ.get("GITHUB_WORKSPACE")
-    if workspace:
-        return Path(workspace)
-    # Walk up from this script to find the repo root (contains .git/)
-    p = Path(__file__).resolve().parent.parent
-    if (p / ".git").exists():
-        return p
-    return Path.cwd()
+    """The repository, per git.
+
+    This used to prefer ``GITHUB_WORKSPACE``, then a ``.git`` probe two levels
+    above this file, then ``Path.cwd()``. The last of those is the dangerous
+    one: run from anywhere else it returns that directory, and the audit then
+    scans whatever manifests happen to be under it and reports success. Under
+    Actions the environment variable and ``git rev-parse`` name the same
+    directory anyway, so nothing is lost by asking git.
+    """
+    return repo_root()
 
 
 def get_ignores_path() -> Path:
@@ -552,13 +668,27 @@ def get_ignores_path() -> Path:
 
 
 def cmd_validate_ignores(args: argparse.Namespace) -> int:
+    """Validate the suppression file, and refuse to validate one that is not there.
+
+    ``load_ignores`` returns an empty list for a file that does not exist, so
+    this printed "Validated 0 ignore entries." and exited 0 against a
+    repository containing nothing at all — the same sentence, and the same
+    exit status, as a real run over a file with every suppression retired.
+    Found nothing and scanned nothing are not the same result, and the one
+    that matters here is the one where the policy file has gone missing.
+    """
+    path = get_ignores_path()
+    if not path.is_file():
+        print(f"Ignore policy error: {path} does not exist — refusing to report a validated policy with no policy file.", file=sys.stderr)
+        return 1
+    lines = path.read_text(encoding="utf-8").splitlines()
     try:
-        ignores = load_ignores(get_ignores_path())
-        print(f"Validated {len(ignores)} ignore entries.")
-        return 0
+        ignores = load_ignores(path)
     except ValueError as e:
         print(f"Ignore policy error: {e}", file=sys.stderr)
         return 1
+    print(f"Validated {len(ignores)} ignore entries from {path} ({len(lines)} lines read).")
+    return 0
 
 
 def cmd_pnpm(args: argparse.Namespace) -> int:
@@ -568,9 +698,11 @@ def cmd_pnpm(args: argparse.Namespace) -> int:
     emit_summary(report)
     code = exit_code_for(report)
     n = len(report.findings)
-    print(f"pnpm: {n} findings ({len(report.high_critical)} high/critical, "
-          f"{len(report.moderate)} moderate, {len(report.low_info)} low/info), "
-          f"{len(report.ignored)} ignored")
+    print(
+        f"pnpm: {n} findings ({len(report.high_critical)} high/critical, "
+        f"{len(report.moderate)} moderate, {len(report.low_info)} low/info), "
+        f"{len(report.ignored)} ignored"
+    )
     return code
 
 

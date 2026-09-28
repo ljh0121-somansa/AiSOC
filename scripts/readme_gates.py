@@ -32,13 +32,21 @@ import json
 import re
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+# `scripts/` is on sys.path when this file is run as a program, but not when a
+# test loads it by path with importlib. gate_toolkit sits beside it either way.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from gate_toolkit import repo_root, self_test_if_requested
+
+self_test_if_requested(__file__)
+
+REPO_ROOT = repo_root()
 README = REPO_ROOT / "README.md"
 
 # Anything in this list is permitted to appear in README without resolving
@@ -53,16 +61,55 @@ KNOWN_UNPUBLISHED = {
 README_MAX_LINES = 250
 
 # Phrases that count as a "this is intentionally not yet published" guard.
+# The packaging milestone has moved twice, for the same reason each time: the
+# blocker is registry credentials, not code, so it cannot be scheduled by
+# writing a version number. v8.0 became "close the loop" and packaging moved
+# to v8.1; v8.1 became wave-2 features and it moved to v8.2. Older spellings
+# are kept so existing docs and blog posts are not flagged, but new README
+# text must use the current one — a README shipped *as* vX cannot coherently
+# promise that something lands in vX.
+#
+# v9.0 stops moving the number. The README no longer says packaging "comes
+# in" any version, because a README shipped *as* v9.0 promising v9.0 is the
+# incoherence this list was created to police, and promising v9.1 would just
+# be the fourth slip. It says what is true instead: the pipeline builds and
+# packs all eight packages on every tag, and the upload is blocked on
+# registry credentials — which is an account action and cannot be scheduled.
+#
+# Do not add the next version here speculatively. The phrase should move when
+# the milestone does, so the list is a record of what was actually promised.
 V8_GUARDS = (
     "coming in v8.0",
+    "coming in v8.1",
+    "coming in v8.2",
     "coming to npm in v8.0",
+    "coming to npm in v8.1",
+    "coming to npm in v8.2",
     "lands in v8.0",
+    "lands in v8.1",
+    "lands in v8.2",
     "lands with v8.0",
+    "lands with v8.1",
+    "lands with v8.2",
     "lands with the v8.0",
+    "lands with the v8.1",
+    "lands with the v8.2",
+    "packaging release",
+    # The v9.0 phrasing: a state, not a date.
+    "blocked on registry credentials",
+    "ready, unpublished",
     "publish lands in v8.0",
+    "publish lands in v8.1",
+    "publish lands in v8.2",
     "ships in v8.0",
+    "ships in v8.1",
+    "ships in v8.2",
     "ships with v8.0",
+    "ships with v8.1",
+    "ships with v8.2",
     "ships with the v8.0",
+    "ships with the v8.1",
+    "ships with the v8.2",
     "v8.0 launch",
     "with the next phase 2 visuals rollup",
     # Treat explicit monorepo-source-install references as their own guard:
@@ -112,8 +159,7 @@ def gate_readme_line_count() -> list[GateFailure]:
         return [
             GateFailure(
                 "readme-line-count",
-                f"README has {actual} lines; budget is {README_MAX_LINES}. "
-                f"Move detail to apps/docs/ or RELEASES.md.",
+                f"README has {actual} lines; budget is {README_MAX_LINES}. Move detail to apps/docs/ or RELEASES.md.",
             )
         ]
     return []
@@ -184,9 +230,7 @@ def gate_package_references(check_network: bool) -> list[GateFailure]:
         exists: Callable[[str], bool],
         known_unpublished: set[str],
     ) -> None:
-        any_line_guarded = any(
-            _has_guard(_surrounding_lines(text, idx)) for idx in line_idxs
-        )
+        any_line_guarded = any(_has_guard(_surrounding_lines(text, idx)) for idx in line_idxs)
         if any_line_guarded:
             return
         if name in known_unpublished:
@@ -222,20 +266,25 @@ def gate_package_references(check_network: bool) -> list[GateFailure]:
 # ── Gate 3: Demo asset references are honest ────────────────────────────────
 
 
-_DEMO_ASSET_PATTERN = re.compile(
-    r"apps/web/public/demo/(?P<asset>[A-Za-z0-9._-]+\.(?:mp4|gif|webm|webp|png|jpg))"
+# Both directories the README embeds from. `screenshots/` carries the four
+# console tiles above the fold and was previously unchecked entirely, so a
+# renamed or deleted tile would have rendered as a broken image on the busiest
+# page the project has without failing anything.
+_VISUAL_ASSET_PATTERN = re.compile(
+    r"apps/web/public/(?P<dir>demo|screenshots)/" r"(?P<asset>[A-Za-z0-9._-]+\.(?:mp4|gif|webm|webp|png|jpg|svg))"
 )
 
 
 def gate_demo_asset_references() -> list[GateFailure]:
-    """If README points at an `apps/web/public/demo/<asset>` file, the file
-    must either exist on disk or sit next to an explicit "rendered ... lands
-    with v8.0" guard."""
+    """If README points at an `apps/web/public/{demo,screenshots}/<asset>`
+    file, the file must either exist on disk or sit next to an explicit
+    "rendered ... lands with v8.0" guard."""
     text = _read(README)
     failures: list[GateFailure] = []
-    for match in _DEMO_ASSET_PATTERN.finditer(text):
+    for match in _VISUAL_ASSET_PATTERN.finditer(text):
+        directory = match.group("dir")
         asset = match.group("asset")
-        path = REPO_ROOT / "apps" / "web" / "public" / "demo" / asset
+        path = REPO_ROOT / "apps" / "web" / "public" / directory / asset
         if path.exists():
             continue
         # Find the line containing this match.
@@ -246,9 +295,10 @@ def gate_demo_asset_references() -> list[GateFailure]:
         failures.append(
             GateFailure(
                 "demo-asset",
-                f"README references apps/web/public/demo/{asset} but the "
-                f"file does not exist and no v8.0 guard was found within "
-                f"4 lines of the reference.",
+                f"README references apps/web/public/{directory}/{asset} but "
+                f"the file does not exist and no v8.0 guard was found within "
+                f"4 lines of the reference. Refresh the visuals with the "
+                f"console-visuals workflow, or fix the path.",
             )
         )
     return failures
@@ -271,8 +321,7 @@ def gate_sandbox_offline_smoke() -> list[GateFailure]:
         return [
             GateFailure(
                 "sandbox-offline",
-                "packages/aisoc-sandbox/src is missing — the sandbox package "
-                "was deleted or moved. Check phase3-sandbox.",
+                "packages/aisoc-sandbox/src is missing — the sandbox package was deleted or moved. Check phase3-sandbox.",
             )
         ]
     failures: list[GateFailure] = []
@@ -304,8 +353,7 @@ def gate_sandbox_offline_smoke() -> list[GateFailure]:
                 GateFailure(
                     "sandbox-offline",
                     f"`aisoc-sandbox demo --scenario {scenario}` exited "
-                    f"with code {result.returncode}:\n"
-                    + result.stderr.decode("utf-8", errors="replace")[:400],
+                    f"with code {result.returncode}:\n" + result.stderr.decode("utf-8", errors="replace")[:400],
                 )
             )
             continue
@@ -315,8 +363,7 @@ def gate_sandbox_offline_smoke() -> list[GateFailure]:
             failures.append(
                 GateFailure(
                     "sandbox-offline",
-                    f"`aisoc-sandbox demo --scenario {scenario}` did not "
-                    f"emit valid JSON: {exc}",
+                    f"`aisoc-sandbox demo --scenario {scenario}` did not emit valid JSON: {exc}",
                 )
             )
             continue
@@ -325,9 +372,7 @@ def gate_sandbox_offline_smoke() -> list[GateFailure]:
             failures.append(
                 GateFailure(
                     "sandbox-offline",
-                    f"Scenario {scenario} produced {len(steps)} ledger "
-                    f"steps; expected exactly 4 (Detect/Triage/Hunt/"
-                    f"Respond).",
+                    f"Scenario {scenario} produced {len(steps)} ledger steps; expected exactly 4 (Detect/Triage/Hunt/Respond).",
                 )
             )
     return failures
@@ -336,11 +381,204 @@ def gate_sandbox_offline_smoke() -> list[GateFailure]:
 # ── Driver ──────────────────────────────────────────────────────────────────
 
 
+# ── Gate 4: README figures must match their generated source of truth ────────
+#
+# The README quotes two numbers that are generated elsewhere: how many detection
+# rules actually execute, and how many product claims are CI-gated. Both drifted
+# — the README advertised 947 executable rules while the truth table said 833,
+# and 62 GATED while the matrix said 72. Neither is a typo class of error: a
+# reader has no way to tell the front page from the generated artifact, so the
+# larger number is simply believed. This gate makes the README unable to quote a
+# figure its source disagrees with.
+
+TRUTH_TABLE = REPO_ROOT / "docs" / "detections" / "truth-table.md"
+CLAIM_MATRIX = REPO_ROOT / "docs" / "audit" / "CLAIM_TO_GATE_MATRIX.md"
+
+#: Other documents that quote the claim-gate tally. Each is checked the
+#: same way the README is: a figure repeated in prose drifts from its
+#: source the first time the source changes, and a compliance page
+#: quoting a stale number is worse than one quoting none.
+#:
+#: `ROADMAP.md` was the omission that proved the point. Its tally line even
+#: instructs the reader to recount with the script "rather than trusting a
+#: figure quoted in prose — this line has gone stale before", and it had gone
+#: stale again (136/128 against a matrix holding 139/131) with every check in
+#: the repository green, because this tuple listed one compliance page and the
+#: governance documents were not in it.
+FIGURE_DOCS = (
+    REPO_ROOT / "apps" / "docs" / "docs" / "compliance" / "evidence-pack.md",
+    REPO_ROOT / "ROADMAP.md",
+    REPO_ROOT / "RELEASES.md",
+)
+
+#: A figure the prose explicitly dates is a record, not a claim about now.
+#: `RELEASES.md` deliberately quotes the tally as it stood at an older
+#: release; holding that to today's count would force the history to be
+#: rewritten every time the matrix grows.
+_HISTORICAL_QUOTE = re.compile(
+    r"at that time|at the time|as it stood|as of v\d|at the v\d[\d.]* cut",
+    re.IGNORECASE,
+)
+
+
+def _is_historical(text: str, index: int) -> bool:
+    """Whether the figure at ``index`` sits in a sentence that dates itself."""
+    start = text.rfind("\n", 0, index) + 1
+    end = text.find("\n", index)
+    return bool(_HISTORICAL_QUOTE.search(text[start : len(text) if end < 0 else end]))
+
+
+def _truth_table_executable() -> int | None:
+    """The executable-rule count from the generated truth table."""
+    if not TRUTH_TABLE.exists():
+        return None
+    m = re.search(
+        r"\|\s*\*\*executable \(loaded by the engine\)\*\*\s*\|\s*\*\*(\d+)\*\*",
+        _read(TRUTH_TABLE),
+    )
+    return int(m.group(1)) if m else None
+
+
+def _matrix_counts() -> tuple[int, int] | None:
+    """(gated, partial) counted from the matrix rows themselves, not its prose."""
+    if not CLAIM_MATRIX.exists():
+        return None
+    gated = partial = 0
+    for line in _read(CLAIM_MATRIX).splitlines():
+        if not line.lstrip().startswith("|"):
+            continue
+        if "NO GATE" in line:
+            continue
+        if "PARTIAL" in line:
+            partial += 1
+        elif "GATED" in line:
+            gated += 1
+    return (gated, partial) if (gated or partial) else None
+
+
+def _matrix_row_total() -> int | None:
+    """Every data row, `NO GATE` included.
+
+    `_matrix_counts` deliberately skips `NO GATE` rows, so the tally prose —
+    "N rows — G GATED / P PARTIAL / Z NO GATE" — had its *leading* figure
+    checked by nothing. Returned separately rather than widening that
+    function's tuple, which is unpacked as a pair by its tests.
+    """
+    if not CLAIM_MATRIX.exists():
+        return None
+    rows = sum(
+        1
+        for line in _read(CLAIM_MATRIX).splitlines()
+        if line.lstrip().startswith("|") and ("NO GATE" in line or "PARTIAL" in line or "GATED" in line)
+    )
+    return rows or None
+
+
+def gate_readme_figures() -> list[GateFailure]:
+    """Detection and claim-gate figures in the README must match their source."""
+    failures: list[GateFailure] = []
+    readme = _read(README)
+
+    executable = _truth_table_executable()
+    if executable is not None:
+        # Any "<n> executable" or "corpus (<n> rules)" phrasing in the README.
+        # Thousands separators are allowed and stripped: the corpus passed four
+        # digits, and a pattern that stopped at the comma read "2,603
+        # executable" as the number 603 — so the gate would have been comparing
+        # against a figure the README never claimed, in whichever direction
+        # happened to be wrong.
+        quoted = {
+            int(n.replace(",", ""))
+            for n in re.findall(r"([\d,]{3,7})\s+executable", readme) + re.findall(r"detection corpus \(([\d,]{3,7}) rules\)", readme)
+        }
+        for n in sorted(quoted - {executable}):
+            failures.append(
+                GateFailure(
+                    "readme-figures",
+                    f"README claims {n} executable detection rules; "
+                    f"docs/detections/truth-table.md says {executable}. "
+                    f"Regenerate with scripts/detection_truth_table.py and use its number.",
+                )
+            )
+
+    counts = _matrix_counts()
+    if counts is not None:
+        gated, partial = counts
+        # The matrix's own Summary block is checked first, and it is the one
+        # this gate used to skip. Every prose restatement elsewhere was
+        # compared against the rows while the document doing the claiming was
+        # not — so the summary read "GATED: 108" against 109 counted rows and
+        # every check in the repository passed. The file even carries a
+        # counting note about this exact failure; it recurred because the gate
+        # written afterwards pointed outward only.
+        sources: list[tuple[str, str]] = [
+            (
+                str(CLAIM_MATRIX.relative_to(REPO_ROOT)) if CLAIM_MATRIX.is_relative_to(REPO_ROOT) else CLAIM_MATRIX.name,
+                _read(CLAIM_MATRIX),
+            ),
+            ("README", readme),
+        ]
+        for path in FIGURE_DOCS:
+            if not path.exists():
+                continue
+            try:
+                label = str(path.relative_to(REPO_ROOT))
+            except ValueError:
+                # The tests repoint REPO_ROOT at a scratch tree; the label is
+                # cosmetic and must not take the gate down with it.
+                label = path.name
+            sources.append((label, _read(path)))
+
+        for label, text in sources:
+            for m in re.finditer(r"(\d+)\s+(?:rows\s+)?`?GATED`?[,/\s]+(?:and\s+)?(\d+)\s+`?PARTIAL", text):
+                if _is_historical(text, m.start()):
+                    continue
+                if (int(m.group(1)), int(m.group(2))) != (gated, partial):
+                    failures.append(
+                        GateFailure(
+                            "readme-figures",
+                            f"{label} claims {m.group(1)} GATED / {m.group(2)} "
+                            f"PARTIAL; docs/audit/CLAIM_TO_GATE_MATRIX.md has "
+                            f"{gated} GATED / {partial} PARTIAL.",
+                        )
+                    )
+            total = _matrix_row_total()
+            if total is not None:
+                for m in re.finditer(r"(\d+)\s+rows\s*[—–-]\s*\d+\s+`?GATED", text):
+                    if _is_historical(text, m.start()):
+                        continue
+                    if int(m.group(1)) != total:
+                        failures.append(
+                            GateFailure(
+                                "readme-figures",
+                                f"{label} claims {m.group(1)} matrix rows; docs/audit/CLAIM_TO_GATE_MATRIX.md holds {total}.",
+                            )
+                        )
+            # The bullet-list form the matrix's Summary uses. The inline
+            # pattern above needs both figures on one line and silently
+            # matched nothing here, which is how the stale count survived.
+            for label_word, expected in (("GATED", gated), ("PARTIAL", partial)):
+                for m in re.finditer(rf"^[-*]\s+`?{label_word}`?:\s*(\d+)", text, re.MULTILINE):
+                    if int(m.group(1)) != expected:
+                        failures.append(
+                            GateFailure(
+                                "readme-figures",
+                                f"{label} summarises {label_word}: {m.group(1)}; "
+                                f"docs/audit/CLAIM_TO_GATE_MATRIX.md has {expected} "
+                                f"{label_word} rows. Recompute with "
+                                f"scripts/check_claim_gate_matrix.py rather than editing the number.",
+                            )
+                        )
+
+    return failures
+
+
 def _run_all(check_network: bool, skip_sandbox: bool) -> list[GateFailure]:
     failures: list[GateFailure] = []
     failures.extend(gate_readme_line_count())
     failures.extend(gate_package_references(check_network))
     failures.extend(gate_demo_asset_references())
+    failures.extend(gate_readme_figures())
     if not skip_sandbox:
         failures.extend(gate_sandbox_offline_smoke())
     return failures
@@ -356,8 +594,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--skip-sandbox",
         action="store_true",
-        help="Skip the local aisoc-sandbox offline smoke test (the CI "
-        "matrix runs this independently).",
+        help="Skip the local aisoc-sandbox offline smoke test (the CI matrix runs this independently).",
     )
     args = parser.parse_args(argv)
     failures = _run_all(

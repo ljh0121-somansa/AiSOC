@@ -39,6 +39,8 @@ from sqlalchemy import text
 from app.api.v1.deps import AuthUser, DBSession
 from app.core.airgap import AirgapViolation, enforce_airgap_for_url
 from app.services.hunt_query_generator import _fallback_queries, generate_queries_tiered
+from app.services.llm_safety import LLMContractViolation, safe_chat_completions_request
+from app.services.model_aliases import chat_completions_url, resolve_api_key, resolve_model_alias
 
 logger = logging.getLogger(__name__)
 

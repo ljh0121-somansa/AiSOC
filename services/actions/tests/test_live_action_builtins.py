@@ -51,9 +51,22 @@ def test_register_builtin_executors_returns_full_count() -> None:
     cheap reminder to update docs / discovery snapshots.
     """
     count = register_builtin_executors()
-    # 19 original + 10 Phase B2 vendors (SentinelOne/Entra/GWS/PAN-OS/FortiGate/
-    # Cloudflare/Jira/ServiceNow/PagerDuty/Slack).
-    assert count == 29
+    # 19 original + 10 Phase B2 vendors + 6 read/rollback verbs + 17
+    # vendor-breadth executors + 5 disposition-writeback arms. The
+    # vendor-breadth group added no new integrations: every one calls a
+    # client method that already existed and had no route through the
+    # registry — SentinelOne implemented seven operations with one
+    # reachable, Entra six with one. The writeback arms are the return leg
+    # of a two-way SIEM integration: AiSOC's verdict back onto the notable,
+    # signal, incident or offense that produced the alert. Plus 3 for the
+    # verbs that were reachable from a recommendation and not from dispatch:
+    # Defender evidence acquisition, and the two ChatOps transports. Plus 7
+    # from gap-closure Phase 4.2: five new vendor arms on the three existing
+    # read verbs (SentinelOne agents and threats, Defender alerts, Entra
+    # sign-ins, Google Workspace login audit) and two verbs whose subject is
+    # neither a host nor a principal (AWS CloudTrail lookup, Defender
+    # endpoint-telemetry search).
+    assert count == 73
 
 
 def test_builtin_executors_cover_canonical_vendor_capability_pairs() -> None:
@@ -68,40 +81,84 @@ def test_builtin_executors_cover_canonical_vendor_capability_pairs() -> None:
     pairs = {(d.vendor_id, d.capability) for d in descriptors}
 
     expected = {
-        # Endpoint
+        ("aws_security_groups", "allow_ip"),
+        ("aws_security_groups", "block_ip"),
+        ("azure_entra", "disable_user"),
+        ("azure_entra", "enable_user"),
+        ("azure_entra", "force_mfa"),
+        ("azure_entra", "reset_password"),
+        ("azure_entra", "revoke_session"),
+        ("cloudflare", "allow_domain"),
+        ("cloudflare", "allow_ip"),
+        ("cloudflare", "block_domain"),
+        ("cloudflare", "block_ip"),
+        ("crowdstrike", "get_detections"),
+        ("crowdstrike", "get_host"),
         ("crowdstrike", "isolate_host"),
-        ("defender", "isolate_host"),
-        ("crowdstrike", "quarantine_file"),
         ("crowdstrike", "kill_process"),
+        ("crowdstrike", "quarantine_file"),
         ("crowdstrike", "run_script"),
+        ("crowdstrike", "unisolate_host"),
+        ("defender", "ack_alert"),
+        ("defender", "block_ioc"),
+        ("defender", "capture_forensics"),
+        ("defender", "update_alert_disposition"),
+        ("defender", "get_host"),
+        ("defender", "isolate_host"),
         ("defender", "run_av_scan"),
-        # Identity
+        ("defender", "suppress_alert"),
+        ("defender", "unisolate_host"),
+        ("elastic", "ack_alert"),
+        ("elastic", "search_siem"),
+        ("elastic", "suppress_alert"),
+        ("elastic", "update_alert_disposition"),
+        ("elastic", "update_watcher"),
+        ("fortigate", "allow_ip"),
+        ("fortigate", "block_ip"),
+        ("generic", "block_domain"),
+        ("google_workspace", "disable_user"),
+        ("google_workspace", "enable_user"),
+        ("google_workspace", "reset_password"),
+        ("google_workspace", "revoke_session"),
+        ("jira", "create_ticket"),
         ("okta", "disable_user"),
+        ("okta", "force_mfa"),
+        ("okta", "get_user_activity"),
+        # Gap-closure Phase 4.2. Five of these are new vendor arms on the
+        # three read verbs above, which is what declaring a contract per
+        # capability buys: they inherit the READ_ONLY classification and
+        # cannot drift low. The two `lookup_*` verbs needed their own
+        # contract because their subject is neither a host nor a principal.
+        ("sentinelone", "get_host"),
+        ("sentinelone", "get_detections"),
+        ("defender", "get_detections"),
+        ("entra", "get_user_activity"),
+        ("google_workspace", "get_user_activity"),
+        ("aws", "lookup_cloud_audit"),
+        ("defender", "lookup_endpoint_telemetry"),
         ("okta", "reset_password"),
         ("okta", "suspend_session"),
-        ("okta", "force_mfa"),
-        # Network
-        ("aws_security_groups", "block_ip"),
-        ("aws_security_groups", "allow_ip"),
-        ("generic", "block_domain"),
-        # SIEM
-        ("splunk", "search_siem"),
-        ("elastic", "search_siem"),
-        ("splunk", "create_notable_event"),
-        ("splunk", "sync_detection_rule"),
-        ("elastic", "update_watcher"),
-        ("defender", "block_ioc"),
-        # Phase B2 — previously-unregistered vendors
-        ("sentinelone", "isolate_host"),
-        ("azure_entra", "disable_user"),
-        ("google_workspace", "disable_user"),
-        ("panos", "block_ip"),
-        ("fortigate", "block_ip"),
-        ("cloudflare", "block_ip"),
-        ("jira", "create_ticket"),
-        ("servicenow", "create_ticket"),
         ("pagerduty", "create_ticket"),
+        ("qradar", "update_alert_disposition"),
+        ("panos", "allow_ip"),
+        ("panos", "block_ip"),
+        ("sentinel", "update_alert_disposition"),
+        ("sentinelone", "isolate_host"),
+        ("sentinelone", "kill_process"),
+        ("sentinelone", "quarantine_file"),
+        ("sentinelone", "run_av_scan"),
+        ("sentinelone", "run_script"),
+        ("sentinelone", "unisolate_host"),
+        ("servicenow", "create_ticket"),
+        ("slack", "chatops_verify"),
         ("slack", "notify"),
+        ("splunk", "ack_alert"),
+        ("splunk", "create_notable_event"),
+        ("splunk", "suppress_alert"),
+        ("splunk", "search_siem"),
+        ("splunk", "sync_detection_rule"),
+        ("splunk", "update_alert_disposition"),
+        ("teams", "chatops_verify"),
     }
     assert pairs == expected
 
@@ -132,7 +189,7 @@ def test_register_builtin_executors_is_idempotent_with_overwrite() -> None:
     register_builtin_executors()
     # Second call without overwrite would raise — confirm overwrite works.
     count = register_builtin_executors(overwrite=True)
-    assert count == 29
+    assert count == 73
 
 
 def test_register_builtin_twice_without_overwrite_raises() -> None:

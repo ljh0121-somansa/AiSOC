@@ -13,24 +13,88 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import os
 from datetime import UTC, datetime
-from typing import Any
+from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 import httpx
 import structlog
-from fastapi import APIRouter, BackgroundTasks, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 from fastapi import status
 
 from app.investigator import InvestigatorOrchestrator
 from app.orchestrator.router import RouterOrchestrator
+from app.security.tenant_scope import (
+    TENANT_HEADER,
+    TenantPrincipal,
+    require_console_or_service_auth,
+    resolve_console_secret,
+    resolve_service_token,
+    scoped_tenant_or_403,
+    verify_console_token,
+)
 
 logger = structlog.get_logger()
 router = APIRouter(prefix="/api/v1", tags=["investigations"])
+
+#: The console reaches this service directly through a Next rewrite, sending
+#: the first-party access token as a bearer credential. The tenant comes from
+#: that verified token; a `tenant_id` on the request is only ever a filter,
+#: intersected with it, so naming a foreign tenant is a 403 rather than a
+#: selector for somebody else's investigation.
+ScopedPrincipal = Annotated[TenantPrincipal, Depends(require_console_or_service_auth)]
+
+
+async def _ws_principal(ws: WebSocket) -> TenantPrincipal | None:
+    """Resolve a WebSocket caller's tenant scope, or ``None`` to refuse.
+
+    The HTTP routes take ``ScopedPrincipal`` and a router-level dependency
+    would be the obvious way to cover this one too — but a dependency that
+    raises ``HTTPException`` has no defined rendering on a WebSocket scope,
+    and a browser cannot set an ``Authorization`` header on a WS handshake
+    regardless. So the credential is read from the header when a machine
+    client sends one, and from ``?token=`` when the browser connects, which
+    is the same shape ``services/realtime`` already uses for its tickets.
+
+    Verification is the shared vendored logic, not a second implementation:
+    a parallel verifier is how one side ends up accepting ``alg: none`` after
+    the other stopped.
+    """
+    header = ws.headers.get("authorization") or ""
+    token = header[len("Bearer ") :].strip() if header.startswith("Bearer ") else (ws.query_params.get("token") or "").strip()
+    if not token:
+        return None
+
+    secret = resolve_console_secret()
+    if secret:
+        claims = verify_console_token(token, secret)
+        if claims is not None:
+            try:
+                return TenantPrincipal(
+                    tenant_ids=frozenset({UUID(str(claims["tenant_id"]))}),
+                    subject=f"console:{claims.get('sub', 'unknown')}",
+                )
+            except (KeyError, ValueError, TypeError):
+                return None
+
+    service_token = resolve_service_token()
+    if service_token and hmac.compare_digest(token, service_token):
+        declared = (ws.headers.get(TENANT_HEADER.lower()) or ws.query_params.get("tenant_id") or "").strip()
+        if not declared:
+            # A service token identifies a service, not a tenant. Absent is
+            # an empty scope, never every scope.
+            return None
+        try:
+            return TenantPrincipal(tenant_ids=frozenset({UUID(declared)}), subject="service", delegated=True)
+        except ValueError:
+            return None
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -416,8 +480,10 @@ async def launch_investigation(
     case_id: str,
     body: InvestigateRequest,
     background_tasks: BackgroundTasks,
+    principal: ScopedPrincipal,
 ):
     """Launch a Pillar-1 autonomous investigation for a case."""
+    body.tenant_id = str(scoped_tenant_or_403(principal, body.tenant_id))
     run_id = str(uuid4())
     await _save_run(run_id, {
         "run_id": run_id,
@@ -436,7 +502,7 @@ async def launch_investigation(
 
 
 @router.get("/investigations/{run_id}")
-async def get_investigation(run_id: str):
+async def get_investigation(run_id: str, principal: ScopedPrincipal):
     """Poll investigation status and results."""
     run = await _load_run(run_id)
     if not run:
@@ -465,7 +531,7 @@ async def _load_report_from_db(run_id: str, kind: str) -> str | None:
 
 
 @router.get("/investigations/{run_id}/report.md", response_class=PlainTextResponse)
-async def get_report_md(run_id: str):
+async def get_report_md(run_id: str, principal: ScopedPrincipal):
     """Download the Markdown incident report."""
     run = await _load_run(run_id)
     report = run.get("report_md", "") if run else None
@@ -477,7 +543,7 @@ async def get_report_md(run_id: str):
 
 
 @router.get("/investigations/{run_id}/report.html", response_class=HTMLResponse)
-async def get_report_html(run_id: str):
+async def get_report_html(run_id: str, principal: ScopedPrincipal):
     """Download the HTML incident report."""
     run = await _load_run(run_id)
     report = run.get("report_html", "") if run else None
@@ -489,7 +555,7 @@ async def get_report_html(run_id: str):
 
 
 @router.get("/investigations/{run_id}/report.pdf")
-async def get_report_pdf(run_id: str):
+async def get_report_pdf(run_id: str, principal: ScopedPrincipal):
     """Download the PDF incident report (rendered from HTML via weasyprint)."""
     from fastapi.responses import Response as FastAPIResponse
 
@@ -530,9 +596,20 @@ async def stream_investigation(ws: WebSocket, run_id: str):
     2. If query params case_id + alert_summary are supplied, run a fresh
        investigation directly on this connection (dev/test use-case).
     """
+    principal = await _ws_principal(ws)
+    if principal is None:
+        # 1008 = policy violation. Refused before accept() so an anonymous
+        # caller never reaches the branch below that starts a fresh
+        # investigation — which spends the tenant's LLM budget.
+        await ws.close(code=1008, reason="unauthenticated")
+        return
+
     case_id = ws.query_params.get("case_id", run_id)
     alert_summary = ws.query_params.get("alert_summary", "")
-    tenant_id = ws.query_params.get("tenant_id", "default")
+    # The tenant comes from the verified credential. It used to come from a
+    # query parameter defaulting to the literal "default", which names no
+    # tenant anywhere in this schema.
+    tenant_id = str(scoped_tenant_or_403(principal, ws.query_params.get("tenant_id")))
 
     await ws.accept()
     try:

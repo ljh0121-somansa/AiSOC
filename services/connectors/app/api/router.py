@@ -29,18 +29,41 @@ import inspect
 import re
 from typing import Any
 import structlog
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from pydantic import Field as PydField
 
 from app.connectors import CONNECTOR_REGISTRY, list_connector_schemas
 from app.connectors.base import Capability
+from app.db.connector_repo import fetch_enabled_connectors
+from app.db.engine import get_engine
 from app.federated.query import QueryError, parse_unified_query
+from app.security.credential_vault import CredentialVaultError, get_vault
+from app.security.tenant_scope import require_console_or_service_auth
 
 logger = structlog.get_logger()
-router = APIRouter()
+#: Default-deny. Everything on this router either reads the connector
+#: catalogue, decrypts a saved instance's credentials to test them, or
+#: pushes a case into a customer's ITSM — none of which should answer an
+#: anonymous caller. The console reaches these routes directly through a
+#: Next rewrite, so the guard accepts a console session as well as a
+#: service token declaring the tenant it acts for.
+router = APIRouter(dependencies=[Depends(require_console_or_service_auth)])
+
+#: Liveness is deliberately off the guarded router: a probe holds no
+#: credential, and an unauthenticated 401 would read as an outage.
+health_router = APIRouter()
 
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+#: Keys stored on a connector instance that are scheduler knobs rather than
+#: constructor arguments. Passing them through raises ``TypeError`` and turns a
+#: working connector into a 422. Mirrors the filter in ``ConnectorScheduler``.
+_SCHEDULER_ONLY_CONFIG_KEYS = frozenset({"poll_interval_seconds", "checkpoint", "filter_rules"})
+
+
+def _connector_kwargs(connector_config: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in connector_config.items() if k not in _SCHEDULER_ONLY_CONFIG_KEYS}
 
 
 def _safe_log_val(value: str) -> str:
@@ -85,6 +108,36 @@ class ResourceConfigRequest(BaseModel):
     connector_config: dict[str, Any] = PydField(default_factory=dict)
     resource_id: str = PydField(..., description="Vendor-native resource id to fetch.")
     at_ts: str = PydField(default="", description="Optional ISO-8601 point-in-time.")
+
+
+#: A normalize request carrying more rows than this is refused rather than
+#: truncated. Truncation would return a short list the caller reads as "these
+#: are all of them", and replay would grade a window it did not ask for.
+MAX_NORMALIZE_ROWS = 2000
+
+
+class NormalizeRequest(BaseModel):
+    """Map raw vendor rows through a connector's production ``normalize()``.
+
+    Gap-closure Phase 1.2. Replay evaluation runs in ``services/agents`` and
+    has to normalize a customer's closed findings exactly as the live pipeline
+    does. It cannot import a connector: both services package their code as
+    top-level ``app``, so one process can hold one of them. The alternative to
+    this route is a second copy of every vendor's field mapping inside the
+    agents service, which is the one thing the replay work is not allowed to
+    do, because a mapping that drifts would grade the agent on inputs the
+    product never produces.
+
+    Carries no ``auth_config``, and that is a property rather than an
+    omission: the handler never builds a configured client, so this route
+    cannot make an outbound call to a customer's SIEM no matter what it is
+    sent.
+    """
+
+    rows: list[dict[str, Any]] = PydField(
+        ...,
+        description="Raw vendor rows, exactly as the vendor returned them.",
+    )
 
 
 class FederatedQueryRequest(BaseModel):
@@ -276,6 +329,86 @@ async def test_connector_connection(connector_id: str, payload: TestConnectionRe
     return result
 
 
+@router.get("/connectors/instances/{instance_id}/resource-config")
+async def get_instance_resource_config(
+    instance_id: str,
+    resource_id: str = Query(..., description="Vendor-native resource id"),
+    ts: str | None = Query(None, description="Point in time (RFC 3339)"),
+):
+    """Fetch a resource's configuration for a **saved connector instance**.
+
+    The POST route below takes credentials in the body, which works for the
+    API service — it owns the vault — and cannot work for `services/ingest`.
+    The Go config-snapshotter has no credentials to send, so it called a GET
+    endpoint that did not exist; a 404 maps to `ErrNotImplemented`, which the
+    snapshotter treats as a soft skip. An operator therefore saw
+    "snapshots enabled" and zero Configuration nodes, with nothing logged.
+
+    This route resolves the instance and decrypts `auth_config` the same way
+    `ConnectorScheduler` does at poll time, so the caller needs no secrets.
+    That also means the ingest service never handles credentials, which is the
+    reason the original contract could not simply be renamed into place.
+    """
+    try:
+        engine = get_engine()
+        async with engine.begin() as conn:
+            instances = await fetch_enabled_connectors(conn)
+    except Exception as exc:  # noqa: BLE001 — surfaced as 503, never silent
+        logger.exception("connector.resource_config.instance_load_failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="could not load connector instances",
+        ) from exc
+
+    target = next((i for i in instances if str(i.id) == instance_id), None)
+    if target is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no enabled connector instance '{_safe_log_val(instance_id)}'",
+        )
+
+    cls = CONNECTOR_REGISTRY.get(target.connector_type)
+    if cls is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"connector type '{_safe_log_val(target.connector_type)}' is not in this build",
+        )
+
+    try:
+        auth = get_vault().decrypt_dict(target.auth_config or {})
+    except CredentialVaultError as exc:
+        logger.error("connector.resource_config.decrypt_failed instance=%s", _safe_log_val(instance_id))
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="could not decrypt stored credentials",
+        ) from exc
+
+    kwargs = {**auth, **_connector_kwargs(target.connector_config or {})}
+    try:
+        connector = cls(**kwargs)
+    except TypeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"connector config does not match schema: {exc}",
+        ) from exc
+
+    try:
+        config = await connector.get_resource_config(resource_id, ts)
+    except NotImplementedError as exc:
+        # 501 rather than an error: most connectors legitimately cannot
+        # time-travel a resource's configuration, and the snapshotter skips
+        # them without counting a failure.
+        raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("connector.resource_config.runtime_error instance=%s", _safe_log_val(instance_id))
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Resource-config fetch failed. Check connector configuration and connectivity.",
+        ) from exc
+
+    return config
+
+
 @router.post("/connectors/{connector_id}/resource_config")
 async def get_resource_config(connector_id: str, payload: ResourceConfigRequest):
     """Fetch one resource's live configuration (Phase C2 posture collection).
@@ -304,6 +437,58 @@ async def get_resource_config(connector_id: str, payload: ResourceConfigRequest)
         ) from exc
 
     return {"connector_id": connector_id, "resource_id": payload.resource_id, "config": config}
+
+
+@router.post("/connectors/{connector_id}/normalize")
+async def normalize_rows(connector_id: str, payload: NormalizeRequest):
+    """Run a connector's own ``normalize()`` over raw vendor rows.
+
+    The instance is built with ``__new__`` and no ``__init__``. That is
+    deliberate on two counts. ``normalize`` is a pure mapping in every
+    connector in this tree, so a configured client is not needed; and not
+    building one means this route holds no credential and has nothing to make
+    an outbound call with.
+
+    A connector whose ``normalize`` does reach for instance state raises
+    ``AttributeError``, and that becomes a 422 naming the connector rather
+    than a partially-mapped row. A half-normalized envelope would flow into
+    replay looking like a real one and quietly change what the agent was
+    graded on.
+    """
+    cls = CONNECTOR_REGISTRY.get(connector_id)
+    if cls is None:
+        raise HTTPException(status_code=404, detail=f"Connector '{connector_id}' not found")
+    if len(payload.rows) > MAX_NORMALIZE_ROWS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{len(payload.rows)} rows exceeds the {MAX_NORMALIZE_ROWS}-row limit for one normalize request",
+        )
+
+    connector = cls.__new__(cls)
+    normalized: list[dict[str, Any]] = []
+    for index, row in enumerate(payload.rows):
+        try:
+            normalized.append(cls.normalize(connector, dict(row)))
+        except AttributeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"connector '{connector_id}' cannot normalize without a configured instance ({exc}); "
+                    f"row {index} was not mapped and none are returned"
+                ),
+            ) from exc
+        except Exception as exc:
+            logger.exception("connector.normalize.runtime_error", connector_id=_safe_log_val(connector_id))
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"connector '{connector_id}' failed to normalize row {index}: {type(exc).__name__}",
+            ) from exc
+
+    return {
+        "connector_id": connector_id,
+        "row_count": len(normalized),
+        "rows": normalized,
+    }
 
 
 @router.post("/connectors/{connector_id}/query")
@@ -457,6 +642,6 @@ async def push_status_change(connector_id: str, payload: PushStatusChangeRequest
     return result
 
 
-@router.get("/health")
+@health_router.get("/health")
 async def health():
     return {"status": "healthy", "service": "aisoc-connectors"}

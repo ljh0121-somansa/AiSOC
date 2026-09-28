@@ -9,20 +9,28 @@
  * footer ("Sign in on desktop").
  *
  * Demo credentials live in `services/api/app/api/v1/dev_auth.py`:
- *   demo@tryaisoc.com / aisoc-demo
+ *   demo@example.com / aisoc-demo
  */
 
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { Suspense, useEffect, useState } from 'react';
 import { authApi } from '@/lib/api';
+import { isDemoMode } from '@/lib/demoMode';
 
 type Phase = 'idle' | 'pending' | 'success' | 'error';
 
 export const dynamic = 'force-dynamic';
 
-const DEMO_EMAIL = 'demo@tryaisoc.com';
-const DEMO_PASSWORD = 'aisoc-demo';
+// Supplied by the build, never written here. Next inlines NEXT_PUBLIC_* into
+// the client bundle wherever they are referenced, so a literal in this module
+// would put a working login pair into every image the project ships —
+// including one built with demo mode off for somebody's own deployment.
+// Gating the *render* on isDemoMode() hides the panel; it does not remove the
+// strings. Only the demo build passes these.
+const DEMO_EMAIL = process.env.NEXT_PUBLIC_DEMO_AUTOLOGIN_EMAIL?.trim() ?? '';
+const DEMO_PASSWORD = process.env.NEXT_PUBLIC_DEMO_AUTOLOGIN_PASSWORD?.trim() ?? '';
+const HAS_DEMO_CREDENTIALS = Boolean(DEMO_EMAIL && DEMO_PASSWORD);
 
 /**
  * Sanitize the ``?next=`` redirect target so a crafted link can't be used to
@@ -120,10 +128,11 @@ function LoginInner() {
               Sign in to AiSOC
             </h1>
             <p className="text-sm text-zinc-400 mt-2 leading-relaxed">
-              Open-source AI SOC console. Use the demo credentials below or
-              your own tenant&rsquo;s account.
+              Open-source AI SOC console. Sign in with your tenant&rsquo;s
+              account.
             </p>
           </div>
+
 
           {/* Form */}
           <form onSubmit={submit} className="space-y-4" noValidate>
@@ -222,7 +231,7 @@ function LoginInner() {
                 href="/"
                 className="hover:text-zinc-400 underline-offset-2 hover:underline"
               >
-                ← Back to tryaisoc.com
+                ← Back to home
               </Link>
             </p>
           </div>

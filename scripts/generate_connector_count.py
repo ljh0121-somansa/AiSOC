@@ -41,8 +41,17 @@ import re
 import sys
 from collections import Counter
 from pathlib import Path
+from typing import Any
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+# `scripts/` is on sys.path when this file is run as a program, but not when a
+# test loads it by path with importlib. gate_toolkit sits beside it either way.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from gate_toolkit import repo_root, self_test_if_requested
+
+self_test_if_requested(__file__)
+
+REPO_ROOT = repo_root()
 REGISTRY_FILE = REPO_ROOT / "services" / "connectors" / "app" / "connectors" / "__init__.py"
 CONNECTORS_DIR = REPO_ROOT / "services" / "connectors" / "app" / "connectors"
 JSON_OUT = REPO_ROOT / "apps" / "web" / "src" / "data" / "connector-count.json"
@@ -60,9 +69,7 @@ COUNT_BEARING_FILES: tuple[tuple[Path, tuple[re.Pattern[str], ...]], ...] = (
         # covered below). The lean README now anchors the count in a single
         # bullet near the top of "What's in the box".
         REPO_ROOT / "README.md",
-        (
-            re.compile(r"(?P<pre>\*\*)(?P<n>\d+)(?P<post> click-and-connect data connectors\*\*)"),
-        ),
+        (re.compile(r"(?P<pre>\*\*)(?P<n>\d+)(?P<post> click-and-connect data connectors\*\*)"),),
     ),
     (
         # The "corrected **N-connector count**" prose used to live in README.md
@@ -77,39 +84,27 @@ COUNT_BEARING_FILES: tuple[tuple[Path, tuple[re.Pattern[str], ...]], ...] = (
     ),
     (
         REPO_ROOT / "apps" / "docs" / "docs" / "connectors" / "index.md",
-        (
-            re.compile(r"(?P<pre>with \*\*)(?P<n>\d+) connectors(?P<post>\*\*)"),
-        ),
+        (re.compile(r"(?P<pre>with \*\*)(?P<n>\d+) connectors(?P<post>\*\*)"),),
     ),
     (
         REPO_ROOT / "apps" / "docs" / "docs" / "connectors" / "endpoint-decision-matrix.md",
-        (
-            re.compile(r"(?P<pre>the full )(?P<n>\d+)(?P<post>-connector catalog)"),
-        ),
+        (re.compile(r"(?P<pre>the full )(?P<n>\d+)(?P<post>-connector catalog)"),),
     ),
     (
         REPO_ROOT / "apps" / "docs" / "docs" / "connectors" / "api-coverage.md",
-        (
-            re.compile(r"(?P<pre>## Coverage table — )(?P<n>\d+)(?P<post> connectors)"),
-        ),
+        (re.compile(r"(?P<pre>## Coverage table — )(?P<n>\d+)(?P<post> connectors)"),),
     ),
     (
         REPO_ROOT / "apps" / "docs" / "docs" / "architecture.md",
-        (
-            re.compile(r"(?P<pre>now )(?P<n>\d+) connectors(?P<post>\*\*)"),
-        ),
+        (re.compile(r"(?P<pre>now )(?P<n>\d+) connectors(?P<post>\*\*)"),),
     ),
     (
         REPO_ROOT / "apps" / "docs" / "docs" / "intro.md",
-        (
-            re.compile(r"(?P<pre>a \*\*)(?P<n>\d+)(?P<post>-connector\*\* catalog)"),
-        ),
+        (re.compile(r"(?P<pre>a \*\*)(?P<n>\d+)(?P<post>-connector\*\* catalog)"),),
     ),
     (
         REPO_ROOT / "ROADMAP.md",
-        (
-            re.compile(r"(?P<pre>declares \*\*)(?P<n>\d+)(?P<post> first-party connectors)"),
-        ),
+        (re.compile(r"(?P<pre>declares \*\*)(?P<n>\d+)(?P<post> first-party connectors)"),),
     ),
     (
         REPO_ROOT / "docs" / "architecture" / "SYSTEM_DESIGN.md",
@@ -135,9 +130,7 @@ def parse_registry_count() -> int:
                 if isinstance(target, ast.Name) and target.id == "_CONNECTOR_CLASSES":
                     if isinstance(node.value, ast.Tuple):
                         return len(node.value.elts)
-    raise RuntimeError(
-        f"could not find _CONNECTOR_CLASSES tuple in {REGISTRY_FILE.relative_to(REPO_ROOT)}"
-    )
+    raise RuntimeError(f"could not find _CONNECTOR_CLASSES tuple in {REGISTRY_FILE.relative_to(REPO_ROOT)}")
 
 
 _CATEGORY_PATTERN = re.compile(r'^\s*connector_category\s*=\s*"([a-z][a-z0-9_-]*)"', re.MULTILINE)
@@ -156,8 +149,15 @@ def parse_category_counts() -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def build_payload() -> dict[str, object]:
-    """Produce the on-disk payload."""
+def build_payload() -> dict[str, Any]:
+    """Produce the on-disk payload.
+
+    `Any` rather than `object`: this is a JSON document with heterogeneous
+    values, and declaring `object` forced the two read sites below to carry
+    `# type: ignore[arg-type]` comments for an error code mypy does not emit
+    here — a suppression that suppresses nothing while telling the next
+    reader a checker was consulted and agreed.
+    """
     count = parse_registry_count()
     categories = parse_category_counts()
     return {
@@ -175,7 +175,7 @@ def render_typescript(payload: dict[str, object]) -> str:
         "// Do not edit by hand. Run the script (or `make connector-count`) instead.\n"
         "//\n"
         "// This module is the single source of truth for every prose claim of the\n"
-        "// form \"N connectors\" or \"All N connectors\" across the marketing site,\n"
+        '// form "N connectors" or "All N connectors" across the marketing site,\n'
         "// docs portal, and pricing surfaces. The count itself comes from the\n"
         "// _CONNECTOR_CLASSES tuple in services/connectors/app/connectors/__init__.py.\n"
         "\n"
@@ -211,22 +211,14 @@ def reconcile_prose(count: int, *, check_only: bool) -> list[str]:
         for pattern in patterns:
             matches = list(pattern.finditer(after))
             if not matches:
-                drift.append(
-                    f"{path.relative_to(REPO_ROOT)}: pattern {pattern.pattern!r} did not match"
-                )
+                drift.append(f"{path.relative_to(REPO_ROOT)}: pattern {pattern.pattern!r} did not match")
                 continue
             for match in matches:
                 if match.group("n") != str(count):
-                    after = (
-                        after[: match.start("n")]
-                        + str(count)
-                        + after[match.end("n") :]
-                    )
+                    after = after[: match.start("n")] + str(count) + after[match.end("n") :]
         if after != before:
             if check_only:
-                drift.append(
-                    f"{path.relative_to(REPO_ROOT)}: connector count drift (expected {count})"
-                )
+                drift.append(f"{path.relative_to(REPO_ROOT)}: connector count drift (expected {count})")
             else:
                 path.write_text(after, encoding="utf-8")
     return drift
@@ -242,44 +234,29 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     payload = build_payload()
-    count = int(payload["count"])  # type: ignore[arg-type]
+    count = int(payload["count"])
 
     drift: list[str] = []
 
     if args.check:
-        json_existing = (
-            json.loads(JSON_OUT.read_text(encoding="utf-8"))
-            if JSON_OUT.exists()
-            else None
-        )
+        json_existing = json.loads(JSON_OUT.read_text(encoding="utf-8")) if JSON_OUT.exists() else None
         if json_existing != payload:
-            drift.append(
-                f"{JSON_OUT.relative_to(REPO_ROOT)}: regenerate with"
-                " `python3 scripts/generate_connector_count.py`"
-            )
+            drift.append(f"{JSON_OUT.relative_to(REPO_ROOT)}: regenerate with `python3 scripts/generate_connector_count.py`")
         ts_existing = TS_OUT.read_text(encoding="utf-8") if TS_OUT.exists() else ""
         if ts_existing != render_typescript(payload):
-            drift.append(
-                f"{TS_OUT.relative_to(REPO_ROOT)}: regenerate with"
-                " `python3 scripts/generate_connector_count.py`"
-            )
+            drift.append(f"{TS_OUT.relative_to(REPO_ROOT)}: regenerate with `python3 scripts/generate_connector_count.py`")
     else:
         write_outputs(payload)
 
     drift.extend(reconcile_prose(count, check_only=args.check))
 
     if drift:
-        print(
-            f"connector-count drift detected (registry={count}):", file=sys.stderr
-        )
+        print(f"connector-count drift detected (registry={count}):", file=sys.stderr)
         for line in drift:
             print(f"  - {line}", file=sys.stderr)
         return 1
 
-    print(
-        f"connector-count OK — {count} registered, {len(payload['categories'])}"  # type: ignore[arg-type]
-        " categories"
-    )
+    print(f"connector-count OK — {count} registered, {len(payload['categories'])} categories")
     return 0
 
 

@@ -73,7 +73,41 @@ If you get stuck, [open a Q&A discussion](https://github.com/beenuar/AiSOC/discu
 
 ## Development Setup
 
-See [README.md](README.md#development) for detailed setup instructions.
+### Prerequisites
+
+These are the versions CI installs. A mismatch usually shows up as a test
+that passes locally and fails in the pipeline, which is an expensive way to
+discover it.
+
+| Tool   | Version  | Why this one                                            |
+|--------|----------|---------------------------------------------------------|
+| Python | 3.12     | The API and agent services; 3.11 also works locally      |
+| Node   | 22       | `apps/web`, `services/realtime`, `services/mcp`          |
+| pnpm   | 8.15.1   | Pinned in `package.json`; a different major resolves differently |
+| Go     | 1.26     | Every `go.mod`, gated by `scripts/check_toolchain_versions.py` |
+| Docker | 24+      | Compose v2 for the local stack and the integration gates |
+
+`scripts/check_toolchain_versions.py` asserts every `go.mod` agrees with
+itself and with what CI installs. Six modules previously declared five
+different Go versions while CI installed a sixth, so one module could not be
+built by the toolchain the pipeline provided.
+
+### Running the stack
+
+```bash
+pnpm install --frozen-lockfile
+docker compose up -d                 # Postgres, Redis, Kafka, ClickHouse, Neo4j
+(cd services/api && uv sync && uv run python -m app.scripts.run_migrations)
+```
+
+The API migration runner is forward-only and is **not** Alembic — there is no
+`alembic.ini` under `services/api`. Set `AISOC_MIGRATIONS_STRICT=1` so a
+failed migration aborts; without it the runner logs the failure, continues,
+and exits 0 with a partially-applied schema.
+
+For the fastest possible loop with no Docker at all, `aisoc-sandbox demo`
+runs the four-stage agent funnel offline in under five seconds. See
+[`packages/aisoc-sandbox/README.md`](packages/aisoc-sandbox/README.md).
 
 ## Making Changes
 
@@ -95,11 +129,127 @@ docs(readme): update deployment instructions
 test(agents): add unit tests for investigation agent
 ```
 
+### No tool attribution
+
+AiSOC does not attribute work to a development tool or AI assistant. That
+applies to code, comments, docs, commit messages, commit trailers, PR bodies,
+release notes and marketing copy alike — no "built with" or "generated with"
+footers, and no `Co-authored-by:` trailer naming a tool.
+
+Credit for human contributors is the opposite of this rule, not an exception to
+it: a `Co-authored-by:` line naming a real person is welcome and is never
+touched, and neither is `dependabot[bot]`.
+
+Some editors append such a trailer at commit time on their own. Install the
+repository's hooks once and the trailer is stripped before it reaches a commit:
+
+```bash
+sh scripts/setup_hooks.sh        # or: pnpm install, which runs it for you
+```
+
+This sets `core.hooksPath` to the tracked [`.githooks/`](.githooks) directory,
+so the hook arrives with the checkout instead of living in an untracked
+`.git/hooks/`. It rewrites the message and never blocks a commit.
+
+This matters beyond your own branch: the repository squash-merges, and GitHub
+composes a squash commit's body from the branch commits — so a trailer on any
+commit in your PR is copied onto `main` at merge time.
+
+CI enforces the same rule over commits, changed files and the PR body. To check
+before pushing:
+
+```bash
+python3 scripts/check_attribution.py --self-test
+python3 scripts/check_attribution.py --all
+python3 scripts/check_attribution.py --commits origin/main..HEAD
+```
+
+If it flags something legitimate — a contributor whose name collides with a
+vendor string, or prose naming a vendor neutrally rather than as an attribution
+— add a justified entry to
+[`.githooks/attribution-allowlist.txt`](.githooks/attribution-allowlist.txt) so
+a reviewer sees the exemption in the diff.
+
+### Naming competitors, and naming vendors we integrate with
+
+AiSOC does not name a competitor product — not in documentation, marketing copy,
+plan files, code comments or release notes. Where a competitor is the benchmark
+for a comparison, refer to it neutrally and keep the analytical content. "We lag
+the reference AI-SOC platform on recursive investigation depth" is useful; "we
+lag a competitor on some things" is not. In a comparison table that usually means
+the row or column labels become neutral capability descriptors while every cell
+survives intact.
+
+A vendor named as an **integration target is not a competitor reference**. This
+product ships 80+ connectors, and a connector module, plugin manifest, setup
+guide, normalizer profile or test naming its vendor is correct and necessary.
+Some names play both roles — `Torq` ships as a first-party SOAR connector and has
+also appeared in competitive framing — so judge each occurrence by its context
+rather than doing a global replace, which would break working connector code.
+
+```bash
+python3 scripts/check_competitor_names.py --self-test
+python3 scripts/check_competitor_names.py
+```
+
+The gate reads an explicit name list and a path allow-list from
+[`scripts/competitor_names.toml`](scripts/competitor_names.toml); it never infers
+intent from prose. If it flags an integration reference, add the path to
+`[[allow]]` with the names it excuses and a reason. Both lists are checked in
+both directions, so a stale exemption whose files no longer contain the name
+fails the build rather than outliving the code it excused.
+
 ### Testing
 
 - Write tests for all new features
 - Maintain or improve test coverage
 - Run the full test suite before submitting a PR
+
+### Writing a CI gate
+
+A gate under `scripts/` is only worth the tree it opened. The useful question
+to ask of one is not "does it flag the right things" but **"what does it
+credit as clean, and could it credit something it never actually opened?"**
+Running every wired check inside an empty git repository once found five
+reporting OK over a repository containing nothing — including the detection
+validator behind the rule count on the front page.
+
+Four properties are enforced by `scripts/check_gate_contract.py`, which runs
+in `ci.yml :: python-test`:
+
+1. **Resolve the root from git.** Use `gate_toolkit.repo_root()`.
+   `Path(__file__).resolve().parent.parent` is whatever happens to sit two
+   levels above the script, so a copy run from elsewhere scans that other
+   tree and prints a confident OK about a checkout nobody asked about.
+2. **Print what was scanned, including a count.** *Found nothing* and
+   *scanned nothing* are different results that print the same word.
+3. **Fail closed on an empty or unreadable read.** Zero files walked is not
+   zero violations found; it usually means a broken glob, a renamed package
+   or a wrong root. Exit non-zero and say which.
+4. **Carry a `--self-test`.** For a gate with nothing bespoke to prove, one
+   statement below the imports is enough:
+
+   ```python
+   from gate_toolkit import repo_root, self_test_if_requested
+
+   self_test_if_requested(__file__)
+   ```
+
+   Where the gate enforces a specific rule, inject a violation of that rule
+   and assert it is caught — a gate nobody has seen fail is indistinguishable
+   from one that cannot.
+
+Run both gates on the gates before pushing:
+
+```bash
+python3 scripts/check_gate_coverage.py   # every check is reachable from a workflow
+python3 scripts/check_gate_contract.py   # no check reports OK over an empty tree
+```
+
+Exceptions to the empty-tree rule are recorded in
+`EMPTY_TREE_EXCEPTIONS` with the disposition they are excused for, and are
+checked in both directions — an entry naming a check that no longer exists
+fails, and so does one whose gate has started behaving differently.
 
 ### Public eval harness
 
@@ -150,6 +300,21 @@ before/after delta in the PR body.
    CI also runs on `develop` for integration branches; both targets are
    accepted, but most contributors should target `main`.
 
+## Growing the strategy and action libraries
+
+Two libraries here are designed to grow — investigation strategies and
+response actions — and both are the same shape as things that have already
+gone wrong in this repository. The detection corpus reached ~6,000 rules of
+which 833 executed; the connector catalogue reached 84 connectors of which 35
+had no documentation. Both recovered by making the artifact derived and the
+count gated — and the detection gap then closed properly, to 2,603, once
+somebody asked *why* the other rules could not fire instead of treating the
+number as a backlog.
+
+The rule is one sentence: **a contribution that cannot fail a test is not a
+contribution.** What that means per library, and why each rule exists, is in
+[`docs/contributing/strategies-and-actions.md`](docs/contributing/strategies-and-actions.md).
+
 ## Adding New Connectors
 
 Connectors are runtime data. There is no Dockerfile to build, no
@@ -170,6 +335,7 @@ Implement four things:
 ```python
 from .base import BaseConnector, ConnectorSchema, Field, OAuthHints
 
+
 class MyConnector(BaseConnector):
     connector_category = "saas"  # one of: edr, siem, cloud, iam, saas, vcs, network
 
@@ -188,14 +354,11 @@ class MyConnector(BaseConnector):
             default_poll_interval_seconds=300,
         )
 
-    async def test_connection(self) -> dict:
-        ...  # one cheap auth-checking call; return {"ok": bool, "message": str, ...}
+    async def test_connection(self) -> dict: ...  # one cheap auth-checking call; return {"ok": bool, "message": str, ...}
 
-    async def fetch_alerts(self, since_seconds: int = 300) -> list[dict]:
-        ...  # raw vendor JSON, no normalization
+    async def fetch_alerts(self, since_seconds: int = 300) -> list[dict]: ...  # raw vendor JSON, no normalization
 
-    def normalize(self, raw_event: dict) -> dict:
-        ...  # OCSF-aligned shape; severity ∈ {"info","low","medium","high"}
+    def normalize(self, raw_event: dict) -> dict: ...  # OCSF-aligned shape; severity ∈ {"info","low","medium","high"}
 ```
 
 Field types are `text`, `secret`, `select` (with `options`), `textarea`,
@@ -210,6 +373,17 @@ Add your class to the `_CONNECTOR_CLASSES` tuple and `__all__` in
 [`services/connectors/app/connectors/__init__.py`](services/connectors/app/connectors/__init__.py).
 The registry powers `/connectors/schemas` and the wizard's catalog grid —
 no other wiring required.
+
+Then regenerate the two things derived from that tuple, and commit the result:
+
+```bash
+python3 scripts/generate_connector_count.py   # the "N connectors" claims
+python3 scripts/generate_connector_types.py   # the console's ConnectorType union
+```
+
+Both have a `--check` mode wired into CI, so forgetting is a red build rather
+than a quiet drift. The union used to be hand-written and ten of its members
+named nothing the platform could ingest.
 
 ### 3. Add a marketplace plugin manifest
 

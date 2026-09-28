@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import crypto from 'crypto';
 import http from 'http';
 import { WebSocketServer } from 'ws';
 import { Kafka } from 'kafkajs';
@@ -9,6 +10,7 @@ import rateLimit from 'express-rate-limit';
 
 import { PushManager } from './push';
 import { resolveTicketSecret, verifyRealtimeTicket } from './auth';
+import { setupTelemetry, type Shutdown } from './telemetry';
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 
@@ -35,7 +37,7 @@ const PUSH_REDIS = new Redis(REDIS_URL);
 // Mirror the shared Python helper in services/api/app/core/cors.py:
 //   1. AISOC_CORS_ORIGINS (canonical, comma-separated)
 //   2. CORS_ORIGINS (legacy alias kept for Helm charts / dev scripts)
-//   3. Default allow-list (local dev + tryaisoc.com)
+//   3. Default allow-list (local dev only — deployed origins set the env var)
 // SSE + WebSocket connections from the console carry the auth cookie, so
 // allow_credentials is effectively in play here. If an operator sets the
 // allow-list to "*" we refuse to start in production rather than silently
@@ -45,8 +47,6 @@ const DEFAULT_CORS_ORIGINS = [
   'http://localhost:3001',
   'http://127.0.0.1:3000',
   'http://127.0.0.1:3001',
-  'https://tryaisoc.com',
-  'https://www.tryaisoc.com',
 ];
 
 function resolveCorsOrigins(): string[] {
@@ -97,10 +97,6 @@ if (REALTIME_TICKET_SECRET === null) {
     'AISOC_REALTIME_JWT_SECRET is unset or insecure in a production environment — ' +
       'realtime WS/SSE connections will be rejected until a real secret is wired.',
   );
-} else if (
-  REALTIME_TICKET_SECRET === 'aisoc-dev-realtime-ticket-secret-not-for-production'
-) {
-  log.warn('Using the shared development realtime ticket secret — do NOT use in production.');
 }
 
 /**
@@ -291,7 +287,7 @@ function broadcastToTenant(tenantId: string, message: { type: string } & Record<
   const payload = JSON.stringify(message);
   for (const client of tenantClients) {
     if (client.readyState !== 1 /* OPEN */) continue;
-    const subscribed: Channel = (client as any)._aisocChannel ?? 'all';
+    const subscribed: Channel = client._aisocChannel ?? 'all';
     if (subscribed === 'all' || allowed.includes(subscribed)) {
       client.send(payload);
     }
@@ -386,9 +382,17 @@ app.get('/sse', sseRateLimit, (req, res) => {
     res.write('event: heartbeat\ndata: {}\n\n');
   }, 30000);
 
-  // Register as SSE client via Redis pub/sub
+  // Register as SSE client via Redis pub/sub.
+  //
+  // `subscribe()` returns a promise, and its rejection was unhandled: Redis
+  // being briefly unreachable when a client opened an SSE stream raised an
+  // unhandled rejection, which Node terminates the process on. One
+  // subscriber's bad luck took down the fan-out for every connected tenant.
+  // Log it and leave the stream open on heartbeats instead.
   const sub = new Redis(REDIS_URL);
-  sub.subscribe(`aisoc:events:${tenantId}`);
+  sub.subscribe(`aisoc:events:${tenantId}`).catch((err: unknown) => {
+    log.error({ err, tenantId }, 'SSE: Redis subscribe failed; stream will carry heartbeats only');
+  });
   sub.on('message', (_channel: string, message: string) => {
     res.write(`data: ${message}\n\n`);
   });
@@ -407,9 +411,89 @@ const kafka = new Kafka({
   retry: { retries: 5 },
 });
 
+// --- Subscription state, reported on /health ---
+//
+// `/health` returned a hardcoded `status: 'healthy'` with a client count and
+// nothing about Kafka, so a realtime service whose consumers had never
+// connected was indistinguishable from one fanning out every alert. The two
+// consumers below register here and `reportHealth` answers 503 while either
+// is detached — the same contract the Python services answer on /readyz.
+type SubscriptionState = {
+  attached: boolean;
+  lastError?: string;
+  attempts: number;
+};
+const subscriptions = new Map<string, SubscriptionState>();
+
+// Bounded backoff, capped. A detached consumer is retried because the usual
+// cause is a broker or topic that is not there *yet*, which a retry fixes;
+// the cap stops a permanently-broken cluster becoming a busy loop, and the
+// state above stops a permanent failure being silent while it retries.
+const RETRY_BASE_MS = 2_000;
+const RETRY_MAX_MS = 60_000;
+
+/**
+ * Keep `start` running, and record whether it is.
+ *
+ * The previous code called each starter inside a try/catch that logged
+ * "Kafka consumer failed to start (will retry)" and then returned. Nothing
+ * retried. The message described behaviour the code did not have, which is
+ * worse than no message: it tells a reader the gap is already handled.
+ */
+function superviseConsumer(
+  name: string,
+  start: (onCrash: (err: unknown) => void) => Promise<void>,
+): void {
+  subscriptions.set(name, { attached: false, attempts: 0 });
+
+  const run = async (): Promise<void> => {
+    const state = subscriptions.get(name)!;
+    for (;;) {
+      state.attempts += 1;
+      try {
+        let crashed = false;
+        await start((err: unknown) => {
+          // kafkajs surfaces a dead consumer loop through its CRASH event,
+          // not by rejecting the promise `run()` returned — so without this
+          // hook a consumer that died after a successful start stayed
+          // recorded as attached for the life of the process.
+          if (crashed) return;
+          crashed = true;
+          state.attached = false;
+          state.lastError = err instanceof Error ? err.message : String(err);
+          log.error({ err, name }, 'Kafka consumer crashed; reconnecting');
+        });
+        state.attached = true;
+        state.lastError = undefined;
+        log.info({ name, attempts: state.attempts }, 'Kafka consumer attached');
+        // Wait for a crash rather than returning: this function owns the
+        // retry, so it has to still be here when the consumer stops.
+        while (!crashed) {
+          await new Promise((resolve) => setTimeout(resolve, 5_000));
+        }
+      } catch (err) {
+        state.attached = false;
+        state.lastError = err instanceof Error ? err.message : String(err);
+        const delay = Math.min(
+          RETRY_BASE_MS * 2 ** Math.min(state.attempts - 1, 5),
+          RETRY_MAX_MS,
+        );
+        log.warn(
+          { err, name, attempts: state.attempts, retryInMs: delay },
+          'Kafka consumer not attached; retrying',
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+  };
+
+  void run();
+}
+
 // --- Kafka consumer: bridge fused alerts to WebSocket clients ---
-async function startKafkaConsumer() {
+async function startKafkaConsumer(onCrash: (err: unknown) => void) {
   const consumer = kafka.consumer({ groupId: 'aisoc-realtime-ws' });
+  consumer.on(consumer.events.CRASH, (event) => onCrash(event.payload.error));
 
   await consumer.connect();
   await consumer.subscribe({ topic: KAFKA_TOPIC_FUSED, fromBeginning: false });
@@ -455,7 +539,7 @@ async function startKafkaConsumer() {
                 url: `/responder/triage/${alertId}`,
                 tag: `alert-${alertId}`,
                 topic: 'p0_alert',
-                severity: severity as 'critical' | 'high',
+                severity,
                 alert_id: String(alertId),
               },
             )
@@ -479,13 +563,14 @@ async function startKafkaConsumer() {
 // versa. A failure to start (Kafka unreachable, topic missing, etc.) is
 // logged and surfaced via the outer retry wrapper; it does NOT crash the
 // process, because the alert fan-out path is the higher-priority surface.
-async function startGraphUpdateConsumer() {
+async function startGraphUpdateConsumer(onCrash: (err: unknown) => void) {
   if (!KAFKA_TOPIC_GRAPH_UPDATES) {
     log.info('Graph update consumer disabled (empty KAFKA_TOPIC_GRAPH_UPDATES)');
     return;
   }
 
   const consumer = kafka.consumer({ groupId: 'aisoc-realtime-graph' });
+  consumer.on(consumer.events.CRASH, (event) => onCrash(event.payload.error));
 
   await consumer.connect();
   await consumer.subscribe({
@@ -563,21 +648,59 @@ const pushRateLimit = rateLimit({
   message: { error: 'Rate limit exceeded' },
 });
 
+// Express 4 does not await a handler, so a rejected promise from an `async`
+// one never reaches the error middleware — it surfaces as an unhandled
+// rejection, which Node terminates the process on. Five routes were
+// registered that way, including the two internal fan-out endpoints the API
+// and agents services call. A single failed `webpush` send or Redis write
+// would have taken the whole realtime service down and dropped every open
+// WebSocket with it.
+//
+// The wrapper hands the rejection to `next()`, which is the contract Express
+// error handling is built on.
+function asyncRoute(
+  handler: (req: express.Request, res: express.Response) => Promise<void>,
+): express.RequestHandler {
+  return (req, res, next) => {
+    handler(req, res).catch(next);
+  };
+}
+
 app.get('/v1/push/public-key', pushManager.publicKeyHandler);
-app.post('/v1/push/subscribe', pushRateLimit, pushManager.subscribeHandler);
-app.post('/v1/push/unsubscribe', pushRateLimit, pushManager.unsubscribeHandler);
-app.post('/v1/push/test', pushRateLimit, pushManager.testNotifyHandler);
+app.post('/v1/push/subscribe', pushRateLimit, asyncRoute(pushManager.subscribeHandler));
+app.post('/v1/push/unsubscribe', pushRateLimit, asyncRoute(pushManager.unsubscribeHandler));
+app.post('/v1/push/test', pushRateLimit, asyncRoute(pushManager.testNotifyHandler));
 
 // --- Internal broadcast endpoint (called by other services) ---
 // POST /internal/agent-event
 // Body: { tenant_id?: string, run_id: string, kind: string, agent: string, summary: string, data?: unknown }
 // The realtime service re-broadcasts to all WebSocket clients on the `agents` channel.
-const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN || '';
+// `REALTIME_INTERNAL_TOKEN` is the name the API sends this under and the name
+// `make up` generates; `INTERNAL_TOKEN` is read second so an existing
+// deployment that set the older name keeps working.
+const INTERNAL_TOKEN = (process.env.REALTIME_INTERNAL_TOKEN || process.env.INTERNAL_TOKEN || '').trim();
 
 function requireInternal(req: express.Request, res: express.Response): boolean {
-  if (!INTERNAL_TOKEN) return true;
+  // Fails closed. This returned `true` — authorized — when the token was
+  // unset, and no shipped manifest set it, so the guard never ran: any caller
+  // who could reach the port could inject events into any tenant's live stream
+  // by naming the tenant in the body, and could push a notification with
+  // attacker-chosen title, body and URL to that tenant's devices
+  // (GHSA-mqjp-pcpr-7c37).
+  if (!INTERNAL_TOKEN) {
+    res.status(503).json({
+      error: 'realtime internal auth is not configured',
+      detail: 'set REALTIME_INTERNAL_TOKEN (run `make env`, which generates it, and restart)',
+    });
+    return false;
+  }
   const auth = req.headers['x-internal-token'];
-  if (auth !== INTERNAL_TOKEN) {
+  if (typeof auth !== 'string' || auth.length !== INTERNAL_TOKEN.length) {
+    res.status(401).json({ error: 'unauthorized' });
+    return false;
+  }
+  // Constant-time: a length-independent compare on a bearer is a timing oracle.
+  if (!crypto.timingSafeEqual(Buffer.from(auth), Buffer.from(INTERNAL_TOKEN))) {
     res.status(401).json({ error: 'unauthorized' });
     return false;
   }
@@ -587,11 +710,15 @@ function requireInternal(req: express.Request, res: express.Response): boolean {
 // Internal push fan-out used by the agents/api services to send a
 // notification to a tenant, user list, or topic. Same auth contract as
 // `internal/agent-event`.
-app.post('/internal/push', internalPushRateLimit, async (req, res) => {
-  if (!requireInternal(req, res)) return;
+app.post(
+  '/internal/push',
+  internalPushRateLimit,
+  asyncRoute(async (req, res) => {
+    if (!requireInternal(req, res)) return;
 
-  await pushManager.internalNotifyHandler(req, res);
-});
+    await pushManager.internalNotifyHandler(req, res);
+  }),
+);
 
 app.post('/internal/agent-event', internalEventRateLimit, (req, res) => {
   if (!requireInternal(req, res)) return;
@@ -679,10 +806,22 @@ app.post('/internal/agent-event', internalEventRateLimit, (req, res) => {
 // Expose both `/health` (canonical) and `/healthz` (k8s + frontend default) so
 // callers don't have to guess.
 const reportHealth = (_req: express.Request, res: express.Response) => {
-  res.json({
-    status: 'healthy',
+  const detached = [...subscriptions.entries()]
+    .filter(([, state]) => !state.attached)
+    .map(([name]) => name);
+
+  res.status(detached.length > 0 ? 503 : 200).json({
+    status: detached.length > 0 ? 'degraded' : 'healthy',
     service: 'aisoc-realtime',
     clients: wss.clients.size,
+    // Reported whether or not anything is wrong, so a healthy answer says
+    // which subscriptions were checked rather than only that none failed.
+    subscriptions: [...subscriptions.entries()].map(([name, state]) => ({
+      topic: name,
+      attached: state.attached,
+      attempts: state.attempts,
+      ...(state.lastError ? { last_error: state.lastError } : {}),
+    })),
   });
 };
 app.get('/health', reportHealth);
@@ -693,31 +832,55 @@ app.get('/healthz', reportHealth);
 // Node defaults to "::" when IPv6 is available, but be explicit to match the
 // other services and avoid surprises if a future Node release changes the
 // default or the container is launched with IPv6 disabled.
-server.listen(PORT, '::', async () => {
+// Tracing. `ingest` and `realtime` were the two uninstrumented ends of the
+// Kafka spine, so a trace started at the API stopped at the pipeline
+// boundary — exactly where the interesting latency is. No-ops unless
+// OTEL_EXPORTER_OTLP_ENDPOINT is set.
+let shutdownTelemetry: Shutdown = async () => {};
+
+server.listen(PORT, '::', () => {
   log.info({ port: PORT, host: '::' }, 'AiSOC Real-time service started');
 
-  // Start the two Kafka consumers concurrently. Each is wrapped in its own
-  // try/catch so a failure on the graph topic (e.g. it doesn't exist yet on
-  // a brand-new cluster) does NOT block the higher-priority fused-alerts
-  // fan-out. We deliberately fire them in parallel rather than awaiting
-  // sequentially so the HTTP/WS listener is fully up before either Kafka
-  // round-trip completes.
+  // The listen callback is declared to return void, so an `async` one hands
+  // Node a promise nobody awaits: a rejection here — an unreachable OTLP
+  // collector, say — ended the process rather than the tracing. Tracing is
+  // optional; serving is not.
   void (async () => {
     try {
-      await startKafkaConsumer();
+      shutdownTelemetry = await setupTelemetry(log);
     } catch (err) {
-      log.warn({ err }, 'Kafka consumer failed to start (will retry)');
+      log.warn({ err }, 'telemetry setup failed; continuing without tracing');
     }
   })();
 
-  void (async () => {
-    try {
-      await startGraphUpdateConsumer();
-    } catch (err) {
-      // T1.4 fan-out is best-effort: if the graph topic isn't available the
-      // alerts/cases/agents/insights channels still work, the graph panel
-      // just won't light up in real time.
-      log.warn({ err }, 'Graph update consumer failed to start (will retry)');
-    }
-  })();
+  // Start the two Kafka consumers under their own supervisors, so a failure
+  // on the graph topic (e.g. it doesn't exist yet on a brand-new cluster)
+  // does NOT block the higher-priority fused-alerts fan-out, and neither one
+  // stays silently detached. Fired rather than awaited so the HTTP/WS
+  // listener is fully up before either Kafka round-trip completes.
+  superviseConsumer(KAFKA_TOPIC_FUSED, startKafkaConsumer);
+
+  // Only supervised when it is configured. An empty KAFKA_TOPIC_GRAPH_UPDATES
+  // turns this fan-out off deliberately, and reporting a switched-off consumer
+  // as detached would make /health red for a supported configuration.
+  if (KAFKA_TOPIC_GRAPH_UPDATES) {
+    superviseConsumer(KAFKA_TOPIC_GRAPH_UPDATES, startGraphUpdateConsumer);
+  }
 });
+
+// Flush spans on the way out. Without this the exporter drops the spans
+// from the final seconds before a restart, which are disproportionately
+// the ones someone is looking for.
+for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+  process.once(signal, () => {
+    log.info({ signal }, 'shutting down');
+    void shutdownTelemetry().finally(() => {
+      server.close(() => process.exit(0));
+      // Do not wait forever on lingering WebSocket connections: a
+      // fan-out service always has open sockets, so close() alone may
+      // never resolve and the container would be SIGKILLed with spans
+      // still buffered.
+      setTimeout(() => process.exit(0), 5000).unref();
+    });
+  });
+}

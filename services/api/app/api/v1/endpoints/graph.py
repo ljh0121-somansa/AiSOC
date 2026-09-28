@@ -6,14 +6,20 @@ AiSOC — open-source AI Security Operations Center (MIT License)
 from __future__ import annotations
 
 import structlog
+import uuid
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
-from app.api.v1.deps import CurrentUser, DBSession, get_current_user
+from app.api.v1.deps import CurrentUser, DBSession, get_current_user, require_permission
+from app.api.v1.endpoints.alert_writeback import service_token_valid
 from app.services import graph_service
+from app.services.context_import import import_context
+from app.services.incident_context import get_identity_context_for_accounts, get_incident_context
+from app.services.investigation_tools import BACKED_TOOLS, TOOLS, dispatch
 
 logger = structlog.get_logger(__name__)
 
@@ -117,6 +123,160 @@ class MitreCoverageResponse(BaseModel):
     tactics: list[str]
     cells: list[MitreCoverageCell]
     generatedAt: str
+
+
+# ── Tenant-level overview payload ───────────────────────────────────────────
+# Matches `AttackGraph` in apps/web/src/lib/api.ts. `graphApi.getOverview()`
+# hands the body straight to the Cytoscape canvas with no key remapping, so
+# these field names are camelCase on purpose — the same reason
+# `MitreCoverageResponse` above is.
+
+
+class OverviewNode(BaseModel):
+    id: str
+    label: str
+    kind: str
+    riskScore: float | None = None
+    severity: str | None = None
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class OverviewEdge(BaseModel):
+    id: str
+    source: str
+    target: str
+    label: str
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class GraphOverviewResponse(BaseModel):
+    """The tenant's entity graph, bounded for one canvas render.
+
+    ``truncated`` is part of the contract rather than a diagnostic. A graph
+    cut at the node ceiling and a graph that is genuinely this size render
+    identically, and a viewer who cannot tell them apart reads a partial
+    picture as the whole estate.
+
+    ``nodeLimit`` and ``edgeLimit`` travel with it so the ceiling a caller
+    reports is the ceiling this service applied. They are the same two
+    constants the traversal is bounded by, read from
+    ``graph_service`` rather than restated: a console that hardcoded 400 and
+    900 would keep printing those numbers after someone moved them here, and
+    a client telling an analyst the wrong limit is a smaller version of the
+    bug ``truncated`` exists to fix.
+    """
+
+    nodes: list[OverviewNode]
+    edges: list[OverviewEdge]
+    generatedAt: str
+    truncated: bool = False
+    nodeLimit: int = graph_service.OVERVIEW_NODE_LIMIT
+    edgeLimit: int = graph_service.OVERVIEW_EDGE_LIMIT
+
+
+#: Neo4j label → the node kind the console has a colour and a glyph for.
+#:
+#: The console's `GraphNodeKind` union is ten members wide and the graph
+#: schema declares 29 labels, so this is a projection, not a rename. What it
+#: must not do is *lose* the distinction: every node carries its real labels
+#: in ``attributes.labels``, so a label that projects onto the generic
+#: ``asset`` glyph is still identifiable in the payload.
+_LABEL_KIND: dict[str, str] = {
+    "Host": "host",
+    "Endpoint": "host",
+    "User": "user",
+    "Identity": "user",
+    "ServiceAccount": "user",
+    "Employee": "user",
+    "Process": "process",
+    "Container": "process",
+    "Alert": "alert",
+    "Technique": "technique",
+    "Tactic": "tactic",
+}
+
+#: IOC nodes carry their own type, so they resolve more precisely than their
+#: label alone allows. Keys are matched against a lowercased ``ioc_type``.
+_IOC_KIND: dict[str, str] = {
+    "ip": "ip",
+    "ipv4": "ip",
+    "ipv6": "ip",
+    "ip_address": "ip",
+    "domain": "domain",
+    "fqdn": "domain",
+    "hostname": "domain",
+    "url": "domain",
+    "md5": "hash",
+    "sha1": "hash",
+    "sha256": "hash",
+    "hash": "hash",
+    "file_hash": "hash",
+}
+
+#: The five-tier ladder, and the only values allowed onto `severity`. A
+#: vendor-specific string is dropped rather than coerced: the console shades
+#: by severity, and guessing one would shade a node by a fact nobody
+#: established.
+_SEVERITY_TIERS = frozenset({"info", "low", "medium", "high", "critical"})
+
+#: Properties that can carry a human-readable name, most specific first.
+_LABEL_PROPS = ("hostname", "username", "name", "title", "value", "technique_id", "email", "natural_key", "id")
+
+
+def _node_kind(labels: list[str], properties: dict[str, Any]) -> str:
+    """Project a node's Neo4j labels onto a kind the canvas can draw."""
+    if "IOC" in labels:
+        ioc_type = str(properties.get("ioc_type") or "").strip().lower()
+        return _IOC_KIND.get(ioc_type, "asset")
+    for label in labels:
+        kind = _LABEL_KIND.get(label)
+        if kind:
+            return kind
+    return "asset"
+
+
+def _node_label(node_id: str, properties: dict[str, Any]) -> str:
+    """The name to draw on the node, falling back to its identifier."""
+    for prop in _LABEL_PROPS:
+        value = properties.get(prop)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return node_id
+
+
+def _risk_score(properties: dict[str, Any]) -> float | None:
+    """``risk_score`` when the node carries a usable number, else None.
+
+    None and 0.0 are different claims — "not scored" against "scored zero" —
+    and the console renders the first as an em dash.
+    """
+    raw = properties.get("risk_score")
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
+        return None
+    return round(max(0.0, min(100.0, float(raw))), 1)
+
+
+def _to_overview_node(record: dict[str, Any]) -> OverviewNode | None:
+    """Project one graph record onto the console's node shape.
+
+    Returns None for a node with no resolvable identifier: the canvas keys
+    elements by id, and a blank one would collapse every such node into a
+    single element that claims to be all of them.
+    """
+    node_id = record.get("id")
+    if not isinstance(node_id, str) or not node_id.strip():
+        return None
+    labels = [str(label) for label in (record.get("labels") or [])]
+    properties = dict(record.get("properties") or {})
+    severity = str(properties.get("severity") or "").strip().lower()
+    return OverviewNode(
+        id=node_id,
+        label=_node_label(node_id, properties),
+        kind=_node_kind(labels, properties),
+        riskScore=_risk_score(properties),
+        severity=severity if severity in _SEVERITY_TIERS else None,
+        attributes={"labels": labels},
+    )
 
 
 class UpsertHostRequest(BaseModel):
@@ -335,6 +495,7 @@ async def get_overview(
 async def _attack_path_from_relational(
     db: Any,
     case_id: str,
+    tenant_id: uuid.UUID | str,
 ) -> dict[str, Any] | None:
     """Reconstruct an attack path graph from the relational case row.
 
@@ -342,12 +503,19 @@ async def _attack_path_from_relational(
     Attack Path tab still renders something meaningful in demo deployments
     that don't ship a graph database. Returns ``None`` if the case can't be
     located so the caller can decide whether to 404.
+
+    The tenant predicate is not optional here even though the caller is
+    authenticated. The graph path above is tenant-scoped, but this fallback
+    runs precisely when that path failed, so it is the only filter standing
+    between two customers' cases — and ``aisoc_cases`` carries no RLS policy,
+    so nothing behind it would catch the omission.
     """
     row = (
         await db.execute(
-            text("SELECT id, title, severity, mitre_techniques, alert_ids FROM aisoc_cases WHERE id = CAST(:cid AS UUID)").bindparams(
-                cid=case_id
-            )
+            text(
+                "SELECT id, title, severity, mitre_techniques, alert_ids FROM aisoc_cases "
+                "WHERE id = CAST(:cid AS UUID) AND tenant_id = CAST(:tid AS UUID)"
+            ).bindparams(cid=case_id, tid=str(tenant_id))
         )
     ).fetchone()
     if not row:
@@ -414,6 +582,92 @@ async def _attack_path_from_relational(
 
 
 @router.get(
+    "",
+    response_model=GraphOverviewResponse,
+    summary="Tenant-level entity graph for the Attack Graph console",
+)
+async def get_graph_overview(
+    depth: Annotated[int, Query(ge=1, le=6)] = 3,
+    entity: Annotated[str | None, Query(max_length=256)] = None,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> GraphOverviewResponse:
+    """The caller's own entity graph, bounded for one canvas render.
+
+    Scoping is the whole of this endpoint's security surface. Every node of
+    every traversed path must satisfy the tenant predicate — not just the
+    node the walk started from — and a node with no ``tenant_id`` is not
+    readable, because an untagged node that *were* readable would bridge two
+    tenants through any entity they happen to share. The narrow exemption is
+    the global MITRE labels, which belong to no tenant by design.
+
+    Two failure modes that must not look alike:
+
+    ``empty``
+        200 with no nodes. The tenant really has no graph yet — nothing has
+        been ingested, or nothing ingested produced entities. The console
+        renders its empty state.
+    ``unavailable``
+        503. The graph backend could not be reached, so we do not know what
+        the tenant has. This deliberately does *not* degrade to an empty
+        graph the way ``/graph/mitre-coverage`` does: an empty attack graph
+        reads as "no attack relationships exist in your estate", which is a
+        security claim, and making it on evidence we never retrieved is the
+        failure this codebase keeps finding. The console's error state names
+        the endpoint and the status, which is the honest answer.
+    """
+    try:
+        data = await graph_service.get_graph_overview(
+            tenant_id=str(current_user.tenant_id),
+            depth=depth,
+            entity=entity,
+        )
+    except Exception as exc:
+        logger.warning(
+            "graph overview: backend unavailable (%s: %s)",
+            type(exc).__name__,
+            str(exc).replace("\r", "").replace("\n", " ")[:200],
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"graph backend unavailable: {type(exc).__name__}",
+        ) from exc
+
+    nodes = [n for n in (_to_overview_node(r) for r in data["nodes"]) if n is not None]
+    known_ids = {n.id for n in nodes}
+    ref_to_id = {r["ref"]: r["id"] for r in data["nodes"] if isinstance(r.get("id"), str)}
+
+    edges: list[OverviewEdge] = []
+    seen_edges: set[str] = set()
+    for record in data["edges"]:
+        source = ref_to_id.get(record["source"])
+        target = ref_to_id.get(record["target"])
+        # An edge to a node that was dropped (no identifier, or past the node
+        # ceiling) would render as a line into nothing.
+        if source not in known_ids or target not in known_ids:
+            continue
+        edge_id = f"{source}|{record['type']}|{target}"
+        if edge_id in seen_edges:
+            continue
+        seen_edges.add(edge_id)
+        edges.append(
+            OverviewEdge(
+                id=edge_id,
+                source=str(source),
+                target=str(target),
+                label=str(record["type"]),
+                attributes={},
+            )
+        )
+
+    return GraphOverviewResponse(
+        nodes=nodes,
+        edges=edges,
+        generatedAt=datetime.now(UTC).isoformat(),
+        truncated=bool(data.get("truncated")),
+    )
+
+
+@router.get(
     "/attack-path/{case_id}",
     response_model=AttackPathResponse,
     summary="Get attack path graph for a case",
@@ -454,7 +708,7 @@ async def get_attack_path(
         graph_offline = True
 
     if graph_offline or not data or not data.get("nodes"):
-        fallback = await _attack_path_from_relational(db, case_id)
+        fallback = await _attack_path_from_relational(db, case_id, current_user.tenant_id)
         if fallback is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -506,6 +760,142 @@ async def get_blast_radius(
         ) from exc
 
     return BlastRadiusResponse(**data)
+
+
+class IncidentContextResponse(BaseModel):
+    """The five context dimensions for one alert.
+
+    ``partial`` and ``errors`` are part of the contract, not diagnostics. An
+    empty bundle from an unreachable graph and an empty bundle from an alert
+    with genuinely no context look identical otherwise, and a consumer that
+    cannot tell them apart will treat "we could not look" as "there is
+    nothing to find".
+    """
+
+    alert_id: str
+    tenant_id: str
+    identities: list[dict[str, Any]] = Field(default_factory=list)
+    assets: list[dict[str, Any]] = Field(default_factory=list)
+    cloud: list[dict[str, Any]] = Field(default_factory=list)
+    business: list[dict[str, Any]] = Field(default_factory=list)
+    threat: list[dict[str, Any]] = Field(default_factory=list)
+    dimensions_resolved: int = 0
+    partial: bool = False
+    errors: list[str] = Field(default_factory=list)
+    narrative: list[str] = Field(default_factory=list)
+
+
+@router.get(
+    "/incident-context/{alert_id}",
+    response_model=IncidentContextResponse,
+    summary="Traverse an alert into identity, asset, cloud, business and threat context",
+)
+async def incident_context(
+    alert_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> IncidentContextResponse:
+    """Resolve one alert into the five dimensions an investigation needs.
+
+    Each dimension runs as its own bounded, tenant-scoped traversal, and they
+    run concurrently. A dimension that fails or times out names itself in
+    ``errors`` while the rest still return: this is on the hot path of every
+    escalated alert, so one slow leg must not take the bundle with it.
+
+    Returns 200 with ``partial: true`` rather than an error status when some
+    dimensions failed — the caller asked for context and got some.
+    """
+    context = await get_incident_context(alert_id, str(current_user.tenant_id))
+    payload = context.as_dict()
+    payload["narrative"] = context.narrative_lines()
+    return IncidentContextResponse(**payload)
+
+
+class InvestigationToolRequest(BaseModel):
+    """One typed investigation pivot.
+
+    ``tool`` names a primitive; ``args`` are its typed arguments. Deliberately
+    not SQL: handing a model the lake query endpoint puts prompt-injectable
+    text one step from the query planner, and the tenant predicate is the only
+    thing between two customers' data. ``tenant_id`` is taken from the
+    authenticated session and any value supplied here is discarded.
+    """
+
+    tool: str
+    args: dict[str, Any] = Field(default_factory=dict)
+
+
+@router.get(
+    "/investigate/tools",
+    summary="List the investigation primitives and which are backed by data",
+)
+async def list_investigation_tools(
+    current_user: CurrentUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Enumerate the toolset, separating what can answer from what cannot.
+
+    The split is part of the contract. A tool whose data class is not
+    ingested reports that rather than returning an empty result, because an
+    empty result reads as "I checked and found nothing" — which is how an
+    investigation concludes benign on evidence it never had.
+    """
+    return {
+        "tools": sorted(TOOLS),
+        "backed_by_data": sorted(BACKED_TOOLS),
+        "not_ingested": sorted(set(TOOLS) - BACKED_TOOLS),
+    }
+
+
+@router.post(
+    "/investigate/query",
+    summary="Run one typed investigation primitive against the event lake",
+)
+async def run_investigation_tool(
+    request: InvestigationToolRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Execute one pivot. Tenant comes from the session, never the request."""
+    result = await dispatch(request.tool, str(current_user.tenant_id), request.args)
+    return result.as_dict()
+
+
+class ContextImportRequest(BaseModel):
+    """Directory, HR and CMDB context the event stream cannot carry.
+
+    An event can say an account authenticated. It cannot say which person
+    holds that account, whether they still work here, which business
+    application the host serves, or what an outage of it costs. That is the
+    difference between "unusual login for svc_deploy" and "unusual login for
+    svc_deploy, owned by a contractor whose last day was Friday, on the host
+    running the tier-1 payments service".
+    """
+
+    departments: list[dict[str, Any]] = Field(default_factory=list)
+    employees: list[dict[str, Any]] = Field(default_factory=list)
+    applications: list[dict[str, Any]] = Field(default_factory=list)
+    cloud_accounts: list[dict[str, Any]] = Field(default_factory=list)
+
+
+@router.post(
+    "/context/import",
+    summary="Import identity, organisational and business context into the graph",
+)
+async def import_graph_context(
+    request: ContextImportRequest,
+    current_user: Annotated[CurrentUser, Depends(require_permission("settings:write"))],
+) -> dict[str, Any]:
+    """Upsert context records. Safe to run repeatedly on a schedule.
+
+    Records are merged rather than replaced: an import runs against a source
+    of record that may be partial, and replacing the tenant's context with
+    whatever one run produced would delete a department because an HR export
+    timed out.
+
+    Every rejected record is returned with its reason. A partially-applied
+    import reporting success is worse than a rejected one, because afterwards
+    the gaps are invisible.
+    """
+    report = await import_context(str(current_user.tenant_id), request.model_dump())
+    return report.as_dict()
 
 
 @router.get(
@@ -591,9 +981,6 @@ async def get_mitre_coverage_compat(
     ``/graph/mitre-coverage`` and degrade gracefully (empty set) when the
     knowledge graph is offline, mirroring that endpoint's behaviour.
     """
-    from datetime import UTC as _UTC
-    from datetime import datetime as _dt
-
     try:
         records = await graph_service.get_mitre_coverage(
             tenant_id=str(current_user.tenant_id),
@@ -607,7 +994,7 @@ async def get_mitre_coverage_compat(
             return MitreCoverageResponse(
                 tactics=[],
                 cells=[],
-                generatedAt=_dt.now(_UTC).isoformat(),
+                generatedAt=datetime.now(UTC).isoformat(),
             )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -646,7 +1033,7 @@ async def get_mitre_coverage_compat(
     return MitreCoverageResponse(
         tactics=sorted(tactics),
         cells=cells,
-        generatedAt=_dt.now(_UTC).isoformat(),
+        generatedAt=datetime.now(UTC).isoformat(),
     )
 
 
@@ -739,3 +1126,118 @@ async def upsert_case_graph(
         alert_ids=payload.alert_ids,
     )
     return {"status": "ok", "case_id": payload.case_id}
+
+
+# ---------------------------------------------------------------------------
+# Internal route: identity context for the agents service
+# ---------------------------------------------------------------------------
+
+
+class IdentityContextResponse(BaseModel):
+    tenant_id: str
+    as_of: datetime | None
+    identities: list[dict[str, Any]]
+    #: Rows refused for carrying an import stamp later than the cutoff.
+    excluded_after_cutoff: int
+    #: Rows served whose age the cutoff could not meaningfully test. For this
+    #: source that is **every row served**, and the reason is in the route's
+    #: docstring: an ``Employee`` node carries when it was imported, never
+    #: when the fact it records became true.
+    without_timestamp: int
+
+
+@router.get(
+    "/identity-context",
+    response_model=IdentityContextResponse,
+    include_in_schema=False,
+    summary="Who is behind these accounts, for the agents service, as of a point in time",
+)
+async def identity_context_for_triage(
+    tenant_id: uuid.UUID,
+    accounts: Annotated[list[str], Query()],
+    as_of: datetime | None = None,
+    limit: Annotated[int, Query(ge=1, le=25)] = 5,
+    x_aisoc_service_token: Annotated[str | None, Header()] = None,
+) -> IdentityContextResponse:
+    """HR and directory context for the principals an alert names.
+
+    Gap-closure Phase 6.3. Distinct from ``/incident-context/{alert_id}``
+    above, which traverses from an ``Alert`` node: triage runs before that node
+    exists, and a replayed historical finding never has one, so the only
+    version of this question triage can ask is keyed on the account names.
+
+    **The cutoff here is weaker than the other two, and that is published
+    rather than smoothed over.** An ``Employee`` node carries ``updated_at``,
+    which ``context_import`` sets when a directory or CMDB snapshot was
+    loaded. That is an *import* stamp, not a business-effective one. A record
+    imported yesterday may describe an employee who left last year, and a
+    record imported before the split may since have been updated in place to
+    reflect a change that happened after it.
+
+    So both things are done and both are reported. Rows whose import stamp is
+    provably later than the cutoff are refused, because that much can be
+    established. Every row that survives is counted as
+    ``without_timestamp``, because surviving an import-time cutoff is not
+    evidence that the fact predates the split. Claiming a tighter freeze than
+    the data supports is the failure this programme keeps recording; the
+    precedent is ``statements_without_timestamp``, published for a store where
+    the count is always the whole set.
+
+    Service-token only, and ``tenant_id`` is the scope rather than a narrowing
+    of one, for the same reasons as the sibling internal routes.
+    """
+    if not service_token_valid(x_aisoc_service_token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="this route is reachable only by an AiSOC service holding the shared service token",
+        )
+
+    rows = await get_identity_context_for_accounts(str(tenant_id), list(accounts), limit=limit)
+
+    kept: list[dict[str, Any]] = []
+    excluded = 0
+    for row in rows:
+        imported = _imported_at(row.get("imported_at"))
+        if as_of is not None and imported is not None and imported > as_of:
+            excluded += 1
+            continue
+        kept.append(row)
+
+    return IdentityContextResponse(
+        tenant_id=str(tenant_id),
+        as_of=as_of,
+        identities=kept,
+        excluded_after_cutoff=excluded,
+        # Every served row, not just the ones with no stamp at all. See the
+        # docstring: the stamp that exists does not answer the question the
+        # cutoff is asking.
+        without_timestamp=len(kept),
+    )
+
+
+def _imported_at(value: Any) -> datetime | None:
+    """The import stamp as a comparable instant, or ``None``.
+
+    The driver returns a Neo4j ``DateTime`` for ``datetime()`` properties and
+    a string for anything a loader wrote as text, so both are read. A value
+    that parses as neither is treated as absent, which lands the row in the
+    kept set and therefore in the untestable count, which is the conservative
+    direction for a freeze that already declares itself partial.
+    """
+    if value is None:
+        return None
+    to_native = getattr(value, "to_native", None)
+    if callable(to_native):
+        try:
+            value = to_native()
+        except Exception:  # noqa: BLE001 - a driver type that will not convert is an absent stamp
+            return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    return None

@@ -39,11 +39,11 @@ type OcsfBaseEvent struct {
 
 // OcsfMetadata contains event metadata
 type OcsfMetadata struct {
-	Version     string      `json:"version"`
-	Product     OcsfProduct `json:"product"`
-	TenantUID   string      `json:"tenant_uid,omitempty"`
-	IngestedAt  string      `json:"ingested_time"`
-	OriginalAt  string      `json:"original_time,omitempty"`
+	Version    string      `json:"version"`
+	Product    OcsfProduct `json:"product"`
+	TenantUID  string      `json:"tenant_uid,omitempty"`
+	IngestedAt string      `json:"ingested_time"`
+	OriginalAt string      `json:"original_time,omitempty"`
 }
 
 // OcsfProduct identifies the source product
@@ -87,10 +87,10 @@ type Normalizer struct {
 
 // connectorProfile defines normalization rules for a connector type
 type connectorProfile struct {
-	product    OcsfProduct
-	classUID   int
-	className  string
-	fieldMap   map[string]string
+	product     OcsfProduct
+	classUID    int
+	className   string
+	fieldMap    map[string]string
 	severityMap map[string]int
 }
 
@@ -115,20 +115,57 @@ var connectorProfiles = map[string]connectorProfile{
 		classUID:  2002,
 		className: "Security Finding",
 		fieldMap: map[string]string{
-			"TimeGenerated":  "time",
-			"AlertName":      "message",
+			"TimeGenerated":     "time",
+			"AlertName":         "message",
 			"CompromisedEntity": "device.name",
-			"Severity":       "severity",
+			"Severity":          "severity",
 		},
 		severityMap: map[string]int{
 			"High": 4, "Medium": 3, "Low": 2, "Informational": 1,
 		},
 	},
-	// splunk — connector type emitted by SplunkConnector (#528).
-	// Supports canonical envelope fields (external_id / title / severity / src_ip / hostname / created_at)
-	// as well as raw Splunk fields.
-	// Class 2001 (Security Finding, category 2) means the fusion promoter promotes a notable as a vendor-asserted
-	// finding regardless of severity, so a Medium notable is never silently dropped.
+	// splunk_enterprise — raw Splunk *search result rows* (`_time`, `src`,
+	// `dst`, `user`), not notables. It stays at 4001 Network Activity, which
+	// means the fusion promoter does not promote it on class, and that is the
+	// correct outcome rather than an oversight: a saved search can return any
+	// rows at all, and promoting each one would turn a search result set into
+	// an alert queue. A Splunk finding that has already passed Splunk's own
+	// correlation arrives as connector type `splunk` at 2001 below, and is
+	// always promoted.
+	//
+	// The severity map was literally empty. That changed nothing at runtime —
+	// severity mapping already falls through to `_canonicalSeverityMap`, so a
+	// row carrying `severity: "critical"` scores 5 and promotes on the
+	// severity branch — but an empty map reads as an omission, and it was
+	// diagnosed as one. Naming the shared ladder makes the profile state what
+	// it does.
+	//
+	// What remains true: a row with **no** severity field at all scores
+	// severity_id 0, and category 4 with severity 0 satisfies neither
+	// promotion branch. Such an event is archived to the lake and never
+	// alerts. That is intended, and it is no longer silent — the event
+	// carries a `normalization_warnings` entry saying so (see
+	// `unpromotableWarning`), and fusion logs the first occurrence of each
+	// shape (`promoter.not_promoted`).
+	"splunk_enterprise": {
+		product:   OcsfProduct{Name: "Splunk Enterprise", VendorName: "Splunk"},
+		classUID:  4001,
+		className: "Network Activity",
+		fieldMap: map[string]string{
+			"_time": "time",
+			"src":   "src_endpoint.ip",
+			"dst":   "dst_endpoint.ip",
+			"user":  "actor.user.name",
+		},
+		severityMap: _canonicalSeverityMap,
+	},
+	// splunk — connector type emitted by SplunkConnector (#528). Its
+	// fetch_alerts already returns a canonical envelope (external_id / title /
+	// severity / src_ip / hostname / created_at + the original row under
+	// raw_event), so the field map reads those lowercase canonical keys, NOT
+	// raw Splunk fields. Class 2001 (Security Finding, category 2) means the
+	// fusion promoter promotes a notable as a vendor-asserted finding
+	// regardless of severity, so a Medium notable is never silently dropped.
 	"splunk": {
 		product:   OcsfProduct{Name: "Splunk", VendorName: "Splunk"},
 		classUID:  2001,
@@ -191,11 +228,11 @@ var connectorProfiles = map[string]connectorProfile{
 		classUID:  3002,
 		className: "Authentication",
 		fieldMap: map[string]string{
-			"published":           "time",
-			"actor.alternateId":   "actor.user.email_addr",
-			"actor.displayName":   "actor.user.name",
-			"client.ipAddress":    "src_endpoint.ip",
-			"outcome.result":      "status",
+			"published":         "time",
+			"actor.alternateId": "actor.user.email_addr",
+			"actor.displayName": "actor.user.name",
+			"client.ipAddress":  "src_endpoint.ip",
+			"outcome.result":    "status",
 		},
 		severityMap: map[string]int{
 			"ERROR": 4, "WARN": 3, "INFO": 1, "DEBUG": 1,
@@ -206,13 +243,72 @@ var connectorProfiles = map[string]connectorProfile{
 		classUID:  2001,
 		className: "Security Finding",
 		fieldMap: map[string]string{
-			"UpdatedAt":   "time",
-			"Title":       "message",
-			"Description": "raw_data",
+			"UpdatedAt":      "time",
+			"Title":          "message",
+			"Description":    "raw_data",
 			"Severity.Label": "severity",
 		},
 		severityMap: map[string]int{
 			"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFORMATIONAL": 1,
+		},
+	},
+	// ai_runtime / ai_guardrail — the customer's AI estate.
+	//
+	// Two profiles rather than one, and the split is load-bearing. Routine AI
+	// activity (a tool call, a model invocation, an MCP request) is 6003 API
+	// Activity: category 6, so should_promote() leaves it in the lake unless
+	// severity reaches high, and analysts hunt it. A guardrail finding is 2001
+	// Security Finding: category 2, which the promoter always promotes,
+	// because something has already judged it worth a human's attention.
+	//
+	// Collapsing them would fail in one of two ways. All-2001 means a chatty
+	// agent floods the alert queue with its own normal operation. All-6003
+	// means a detected prompt injection sits silently in the lake.
+	//
+	// Field names match the ai-runtime.yaml / ai-finding.yaml webhook
+	// templates so the pull and push paths produce the same OCSF shape.
+	"ai_runtime": {
+		product:   OcsfProduct{Name: "AI Runtime", VendorName: "AiSOC"},
+		classUID:  6003,
+		className: "API Activity",
+		fieldMap: map[string]string{
+			"agent_id":     "actor.process.name",
+			"agent_name":   "actor.process.path",
+			"on_behalf_of": "actor.user.name",
+			"tool_name":    "activity_name",
+			"model":        "metadata.product.feature.name",
+			"provider":     "cloud.provider",
+			"server_name":  "resource.name",
+			"source_ip":    "src_endpoint.ip",
+			"hostname":     "src_endpoint.hostname",
+			"outcome":      "status_detail",
+			"latency_ms":   "duration",
+			"timestamp":    "time",
+		},
+		severityMap: map[string]int{
+			"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "informational": 1,
+		},
+	},
+	"ai_guardrail": {
+		product:   OcsfProduct{Name: "AI Guardrail", VendorName: "AiSOC"},
+		classUID:  2001,
+		className: "Security Finding",
+		fieldMap: map[string]string{
+			"finding_id":   "finding.uid",
+			"finding_type": "activity_name",
+			"title":        "message",
+			"description":  "finding.desc",
+			"agent_id":     "actor.process.name",
+			"on_behalf_of": "actor.user.name",
+			"model":        "metadata.product.feature.name",
+			"provider":     "cloud.provider",
+			"server_name":  "resource.name",
+			"source_ip":    "src_endpoint.ip",
+			"hostname":     "src_endpoint.hostname",
+			"timestamp":    "time",
+		},
+		severityMap: map[string]int{
+			"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "informational": 1,
 		},
 	},
 	// kubernetes_audit — Track D, v7.1.0.
@@ -226,22 +322,49 @@ var connectorProfiles = map[string]connectorProfile{
 	// as a lowercase string; the map below mirrors KubernetesAuditConnector
 	// so on-prem file_tail and webhook events end up with the same
 	// severity_id.
+	// email_inbox — the pull side of the forwarded-email path.
+	//
+	// EmailInboxConnector.normalize() deliberately returns the message
+	// envelope unchanged, because it is shaped for the email-forwarded.yaml
+	// template rather than for the canonical connector envelope. That left it
+	// as the one registered connector whose events reach neither a profile nor
+	// the canonical branch, so strict mode rejected them outright and lenient
+	// mode resolved a title and nothing else.
+	//
+	// The field map mirrors email-forwarded.yaml so the pull and push paths
+	// produce the same OCSF shape, the same way ai_runtime mirrors
+	// ai-runtime.yaml. Keep the two aligned.
+	"email_inbox": {
+		product:   OcsfProduct{Name: "Forwarded Email", VendorName: "Email"},
+		classUID:  2001,
+		className: "Security Finding",
+		fieldMap: map[string]string{
+			"subject":    "finding.title",
+			"body":       "finding.desc",
+			"message_id": "finding.uid",
+			"from":       "actor.user.email_addr",
+			"to":         "target_user.email_addr",
+		},
+		severityMap: map[string]int{
+			"critical": 5, "high": 4, "medium": 3, "normal": 3, "low": 2, "info": 1, "informational": 1,
+		},
+	},
 	"kubernetes_audit": {
 		product:   OcsfProduct{Name: "Kubernetes Audit", VendorName: "Kubernetes"},
 		classUID:  6003,
 		className: "API Activity",
 		fieldMap: map[string]string{
-			"auditID":              "finding.uid",
-			"verb":                 "activity_name",
-			"user.username":        "actor.user.name",
-			"objectRef.resource":   "finding.title",
-			"objectRef.namespace":  "cloud.account.uid",
-			"objectRef.name":       "resource.name",
-			"sourceIPs.0":          "src_endpoint.ip",
-			"userAgent":            "http_request.user_agent",
-			"responseStatus.code":  "status_code",
-			"stage":                "status_detail",
-			"stageTimestamp":       "time",
+			"auditID":             "finding.uid",
+			"verb":                "activity_name",
+			"user.username":       "actor.user.name",
+			"objectRef.resource":  "finding.title",
+			"objectRef.namespace": "cloud.account.uid",
+			"objectRef.name":      "resource.name",
+			"sourceIPs.0":         "src_endpoint.ip",
+			"userAgent":           "http_request.user_agent",
+			"responseStatus.code": "status_code",
+			"stage":               "status_detail",
+			"stageTimestamp":      "time",
 		},
 		severityMap: map[string]int{
 			"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "informational": 1,
@@ -308,9 +431,123 @@ var _canonicalSeverityMap = map[string]int{
 var _canonicalFieldMap = map[string]string{
 	"title":       "message",
 	"external_id": "finding.uid",
-	"src_ip":      "src_endpoint.ip",
-	"hostname":    "device.name",
-	"actor":       "actor.user.name",
+}
+
+// _canonicalAliases fills one OCSF destination from the first connector field
+// that carries a value, in declared order.
+//
+// This is a slice and not more fieldMap entries because Go randomises map
+// iteration: three entries pointing at actor.user.name would resolve to a
+// different one of them per process, which is a correctness bug that only
+// shows up as flakiness. Declared order is the precedence.
+//
+// The aliases exist because the canonical map recognised only `actor`, and a
+// count across the 68 canonical-envelope connectors found 40 using `actor`
+// but 11 using `username` or `user`. Those eleven lost their identity on the
+// way through, and the fusion correlation key is {tenant}:{entity}:{tactic},
+// so a missing actor does not merely blank a column — it collapses the
+// entity segment to "unknown" and every one of that connector's alerts
+// correlates into the same bucket.
+//
+// The dotted sources dig one level for a scalar. Replaying the registry's 84
+// connectors through normalize() found 14 emitting `actor`, and four of those
+// emit it as the vendor's nested object rather than a name. A bare key alone
+// would hand that object to setNestedField and write a map into a slot the
+// entity extractor reads as a name, so each bare key is followed by the
+// scalar-bearing paths underneath it.
+var _canonicalAliases = []struct {
+	dst     string
+	sources []string
+}{
+	{"actor.user.name", []string{"actor", "actor.name", "actor.displayName", "actor.username", "username", "user", "user.name", "user.username", "user_name"}},
+	{"device.name", []string{"hostname", "host", "host.name", "device_name", "device", "device.name", "device.hostname"}},
+	{"src_endpoint.ip", []string{"src_ip", "source_ip", "client_ip", "src_endpoint.ip", "client.ipAddress"}},
+	// Not identity, but the same fill-the-blank rule and the same reason to
+	// run everywhere. A vendor profile names the field its vendor's rows use
+	// — crowdstrike_falcon reads event_simpleName, not title — so a pushed
+	// payload that reaches a vendor profile left `message` empty and the
+	// promoter fell back to generating "Security Finding from <product>",
+	// discarding the title the caller actually sent. These two are the same
+	// pair _canonicalFieldMap declares; listing them here extends their reach
+	// to the vendor profiles without giving them a second mechanism.
+	{"message", []string{"title"}},
+	{"finding.uid", []string{"external_id"}},
+}
+
+// connectorTypeAliases maps a connector identifier the connectors service
+// actually declares onto the profile key that carries its vendor field map.
+//
+// Two vocabularies grew up either side of the wire. services/connectors
+// declares `crowdstrike` and `okta`; this file keyed their profiles
+// `crowdstrike_falcon` and `okta_system_log`, and so does the rest of the
+// platform — packages/types' ConnectorType union, the CLI's default, the
+// graph extractor and the actions credential resolver all use the longer
+// names. Renaming either side breaks the other, so both resolve instead.
+//
+// Without this an event whose connector_type is the name the product itself
+// advertises — including the one the README tells a new user to paste — missed
+// the profile lookup and fell to the generic fallback, taking generic vendor
+// attribution with it.
+//
+// `splunk` is deliberately absent: it has its own profile for the canonical
+// envelope SplunkConnector emits, which is a different shape from the raw
+// rows `splunk_enterprise` maps.
+var connectorTypeAliases = map[string]string{
+	"crowdstrike": "crowdstrike_falcon",
+	"okta":        "okta_system_log",
+}
+
+// connectorTypeCanonical folds an alternate spelling of a connector type onto
+// the identifier services/connectors declares, before anything keys off it.
+//
+// connectorTypeAliases above solves the opposite direction: a declared id that
+// needs to reach a longer-named profile. This map exists because a third name
+// space — packages/types' ConnectorType union, the console's older vocabulary —
+// spells several sources differently from the connector that ingests them, and
+// those spellings reached nothing at all. `ibm_qradar` is not a profile key and
+// no connector declares it, so in strict mode the normalizer rejected it and in
+// lenient mode it produced a vendor named "ibm_qradar" — a second, parallel
+// alert source for the same QRadar deployment that `qradar` already feeds.
+//
+// Each entry names the same product on both sides, which is what makes folding
+// them safe: the connector's own connector_name is the long form (`qradar` is
+// "IBM QRadar", `chronicle` is "Google Chronicle", `syslog_cef` is
+// "Syslog / CEF"). Resolution happens once, at the top of Normalize, so the
+// profile lookup, the alias map, canonicalClassByConnector and the product
+// identity on the canonical path all agree on one name.
+//
+// `palo_alto_cortex` was the one entry that named a vendor rather than a
+// product, and Palo Alto ships two the platform can ingest: `cortex_xdr` and
+// `cortex_xsiam`. It folds onto Cortex XDR, and the record is:
+//
+//   - the spelling entered packages/types in the initial-release commit
+//     (2026-05-01), before either connector existed — `cortex_xsiam` landed
+//     2026-05-07 and `cortex_xdr` 2026-05-08 — so it was aspirational vendor
+//     vocabulary, not a reference to a connector somebody had wired;
+//   - outside this map, the union and the changelog, the string appears
+//     nowhere in the tree and never has: no console code, no saved connector
+//     instance, no seed row, no API catalog entry, no fixture. Nothing
+//     emitting it can be misrouted, because nothing emits it;
+//   - where the console does name the product it says "Cortex XDR" (the
+//     landing catalog lists it under EDR and lists no XSIAM), which matches
+//     CortexXDRConnector's own description, "Palo Alto Cortex XDR incidents
+//     via the public REST API";
+//   - XSIAM is a SIEM reachable under its own id, so nothing is lost: a
+//     deployment that means XSIAM says `cortex_xsiam` and always could.
+var connectorTypeCanonical = map[string]string{
+	"google_chronicle": "chronicle",
+	"ibm_qradar":       "qradar",
+	"palo_alto_cortex": "cortex_xdr",
+	"slack":            "slack_audit",
+	"syslog":           "syslog_cef",
+}
+
+// canonicalConnectorType resolves an alternate spelling to the declared id.
+func canonicalConnectorType(connectorType string) string {
+	if canonical, ok := connectorTypeCanonical[connectorType]; ok {
+		return canonical
+	}
+	return connectorType
 }
 
 // canonicalClassByConnector overrides the default Security Finding class for
@@ -334,6 +571,81 @@ func isCanonicalEnvelope(p map[string]interface{}) bool {
 	_, hasRaw := p["raw_event"]
 	_, hasSource := p["source"]
 	return hasRaw && hasSource
+}
+
+// genericProfile is the fallback for a connector type with no declared
+// profile. It replaces a borrow of the splunk_enterprise profile, which was
+// wrong in two compounding ways.
+//
+// First, attribution: splunk_enterprise stamps
+// OcsfProduct{Name: "Splunk Enterprise", VendorName: "Splunk"}, and the
+// promoter derives alert.source from metadata.product. Every profile-less
+// connector's alerts therefore read as coming from Splunk. Only eight profiles
+// are declared, so that was the majority of the catalogue.
+//
+// Second, and worse, promotion: splunk_enterprise is classUID 4001 (Network
+// Activity) with an EMPTY severityMap. should_promote() requires OCSF category
+// 2 or severity_id >= 4, and an empty map yields severity_id 0 — so category 4
+// with severity 0 can satisfy neither branch. Those events were archived to the
+// lake and could never become alerts, silently, for any connector without a
+// profile.
+//
+// The generic profile uses 2001 Security Finding because a connector's
+// fetch_alerts() contract is to return findings rather than raw telemetry, and
+// carries the five-tier severity ladder so a vendor severity string maps.
+// Product identity is derived from the connector type, so attribution is at
+// worst uninformative rather than actively wrong.
+func genericProfile(connectorType string) connectorProfile {
+	name := connectorType
+	if name == "" {
+		name = "Connector"
+	}
+	return connectorProfile{
+		product:     OcsfProduct{Name: name, VendorName: name},
+		classUID:    2001,
+		className:   "Security Finding",
+		fieldMap:    _canonicalFieldMap,
+		severityMap: _canonicalSeverityMap,
+	}
+}
+
+// Mirrors the fusion promotion policy in
+// services/fusion/app/services/promoter.py: OCSF category 2 (Findings) is
+// always promoted, and anything else needs severity_id >= 4.
+//
+// Duplicated rather than shared because the two services do not share a
+// runtime, and kept honest by TestUnpromotableWarningMatchesFusionPolicy,
+// which walks the same table the Python constants describe.
+const (
+	findingsCategory     = 2
+	promoteSeverityFloor = 4
+)
+
+// unpromotableWarning describes, on the event itself, why this event can never
+// become an alert — or returns "" when it can.
+//
+// The gap this closes: an operator connects a source, telemetry flows into the
+// lake, no alert ever appears, and nothing anywhere says why. The fusion
+// promoter now logs the first event of each shape, but that is one service
+// away from the person reading their connector's output; this rides on the
+// envelope, lands in the lake beside the event, and survives in storage rather
+// than scrolling past in a log.
+//
+// Deliberately narrow: only events failing **both** promotion branches get a
+// warning, so routine informational telemetry that is *meant* to stay in the
+// lake and has a severity does not acquire one.
+func unpromotableWarning(classUID int, severityID interface{}) string {
+	if classUID/1000 == findingsCategory {
+		return ""
+	}
+	sev, ok := severityID.(int)
+	if ok && sev >= promoteSeverityFloor {
+		return ""
+	}
+	return fmt.Sprintf(
+		"not promotable to an alert: OCSF class %d is category %d, not %d (Findings), and severity_id %d is below the promote floor of %d; this event is archived to the event lake only",
+		classUID, classUID/1000, findingsCategory, sev, promoteSeverityFloor,
+	)
 }
 
 func canonicalProfile(connectorType string) connectorProfile {
@@ -360,19 +672,33 @@ func (n *Normalizer) Normalize(raw *RawEvent) (*NormalizedEvent, error) {
 		return nil, fmt.Errorf("tenant_id is required")
 	}
 
+	// One name from here down. An alternate spelling that reached nothing is
+	// folded onto the declared id before the profile lookup, the alias map or
+	// the canonical class override get to disagree about which source this is.
+	connectorType := canonicalConnectorType(raw.ConnectorType)
+
 	var profile connectorProfile
-	if isCanonicalEnvelope(raw.Payload) {
+	isCanonical := isCanonicalEnvelope(raw.Payload)
+	if isCanonical {
 		// Connector-normalized envelope: map its canonical fields directly.
-		profile = canonicalProfile(raw.ConnectorType)
+		profile = canonicalProfile(connectorType)
 	} else {
 		var ok bool
-		profile, ok = connectorProfiles[raw.ConnectorType]
+		profile, ok = connectorProfiles[connectorType]
+		if !ok {
+			if aliased, isAlias := connectorTypeAliases[connectorType]; isAlias {
+				profile, ok = connectorProfiles[aliased]
+			}
+		}
 		if !ok {
 			if n.cfg.NormalizerMode == "strict" {
 				return nil, fmt.Errorf("unknown connector type: %s", raw.ConnectorType)
 			}
-			// Lenient: use generic profile
-			profile = connectorProfiles["splunk"]
+			// Lenient: a vendor-neutral generic profile. This used to borrow
+			// splunk_enterprise, which mis-attributed every profile-less
+			// connector to Splunk and — because that profile is category 4
+			// with an empty severity map — made its events unpromotable.
+			profile = genericProfile(connectorType)
 			log.Warn().Str("connector_type", raw.ConnectorType).Msg("Using generic profile for unknown connector")
 		}
 	}
@@ -454,38 +780,45 @@ func (n *Normalizer) Normalize(raw *RawEvent) (*NormalizedEvent, error) {
 		}
 	}
 
-	// Map severity
-	var sevField string
-	if val, ok := raw.Payload["severity"].(string); ok && val != "" {
-		sevField = val
-	} else if val := getNestedField(raw.Payload, "raw_event.severity"); val != nil {
-		if s, ok := val.(string); ok && s != "" {
-			sevField = s
+	// Resolve identity aliases in declared order for every profile, filling
+	// only destinations the field map left empty.
+	//
+	// This used to run for canonical envelopes alone, which left the generic
+	// fallback resolving nothing but title and external_id. Everything
+	// downstream is keyed on identity — entity extraction, the Investigation
+	// Rail's pivots, the {tenant}:{entity}:{tactic} correlation key, the
+	// entity graph, UEBA — so an event that arrives through the fallback
+	// became an alert with no host, no user and no IP, and nobody could pivot
+	// from it. The alert appears, which is what makes it look like it worked.
+	//
+	// Filling only empty destinations is what keeps this safe to run over the
+	// hand-written vendor profiles too: a profile that names its own field for
+	// a slot always wins, and the aliases reach only the slots it left blank.
+	for _, alias := range _canonicalAliases {
+		if getNestedField(ocsf, alias.dst) != nil {
+			continue
 		}
-	} else if val := getNestedField(raw.Payload, "raw_event.raw_event.severity"); val != nil {
-		if s, ok := val.(string); ok && s != "" {
-			sevField = s
-		}
-	}
-
-	// Fallback to Splunk _raw parsing
-	var splunkRaw string
-	if val := getNestedField(raw.Payload, "raw_event.raw_event._raw"); val != nil {
-		if s, ok := val.(string); ok {
-			splunkRaw = s
-		}
-	} else if val := getNestedField(raw.Payload, "raw_event._raw"); val != nil {
-		if s, ok := val.(string); ok {
-			splunkRaw = s
+		if val, found := firstIdentityString(raw.Payload, alias.sources); found {
+			setNestedField(ocsf, alias.dst, val)
 		}
 	}
 
-	if sevField == "" && splunkRaw != "" {
-		sevField = extractFromSplunkRaw(splunkRaw, "severity")
-	}
-
-	if sevField != "" {
-		if sevID, found := profile.severityMap[sevField]; found {
+	// Map severity. A vendor profile's own ladder wins; the shared five-tier
+	// ladder is consulted only when that ladder has no entry for the value.
+	//
+	// The fallback matters because a profile's ladder is spelled the way its
+	// vendor spells it — crowdstrike_falcon's is capitalised — while a pushed
+	// payload is written by whoever is pushing, and the README's is lowercase.
+	// Without the fallback a "high" that the ladder spells "High" scores 0 and
+	// renders as Unknown. Case folding alone would not do: the shared ladder
+	// keeps `critical` a distinct fifth tier, so a vendor-native critical maps
+	// to critical rather than collapsing into high.
+	if sevField, ok := raw.Payload["severity"].(string); ok {
+		sevID, found := profile.severityMap[sevField]
+		if !found {
+			sevID, found = _canonicalSeverityMap[strings.ToLower(strings.TrimSpace(sevField))]
+		}
+		if found {
 			ocsf["severity_id"] = sevID
 			ocsf["severity"] = sevField
 		} else {
@@ -498,11 +831,16 @@ func (n *Normalizer) Normalize(raw *RawEvent) (*NormalizedEvent, error) {
 		ocsf["severity"] = "Unknown"
 	}
 
+	// An event that provably cannot become an alert says so, on the event.
+	if w := unpromotableWarning(profile.classUID, ocsf["severity_id"]); w != "" {
+		warnings = append(warnings, w)
+	}
+
 	// Set metadata
 	ocsf["metadata"] = map[string]interface{}{
-		"version": n.version,
-		"product": profile.product,
-		"tenant_uid": raw.TenantID,
+		"version":       n.version,
+		"product":       profile.product,
+		"tenant_uid":    raw.TenantID,
 		"ingested_time": time.Now().UTC().Format(time.RFC3339),
 	}
 
@@ -714,6 +1052,27 @@ func setNestedField(m map[string]interface{}, path string, val interface{}) {
 		m[parts[0]] = nested
 	}
 	setNestedField(nested, parts[1], val)
+}
+
+// firstIdentityString returns the first non-empty string among the given dotted
+// payload paths, in the order given, and whether one was found.
+//
+// The string requirement is the point. An identity destination — actor.user.name,
+// device.name, src_endpoint.ip — is a scalar the entity extractor turns into a
+// pivotable chip and the correlator folds into {tenant}:{entity}:{tactic}.
+// Several connectors pass the vendor's nested actor object through under the
+// same key a scalar would use, and writing that object into the slot produces
+// an entity that renders as a map and correlates as garbage. Skipping it lets
+// the next path in the list — the scalar one underneath — resolve instead.
+func firstIdentityString(payload map[string]interface{}, paths []string) (string, bool) {
+	for _, p := range paths {
+		if s, ok := getNestedField(payload, p).(string); ok {
+			if trimmed := strings.TrimSpace(s); trimmed != "" {
+				return trimmed, true
+			}
+		}
+	}
+	return "", false
 }
 
 // firstString returns the first non-empty string value among the given payload

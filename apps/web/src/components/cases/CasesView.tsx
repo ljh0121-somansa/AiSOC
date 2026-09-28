@@ -9,7 +9,7 @@ import { clsx } from 'clsx';
 import { format } from 'date-fns';
 import { EmptyState, EmptyStateIcons } from '@/components/ui/EmptyState';
 import { SavedViewsBar } from '@/components/saved-views/SavedViewsBar';
-import { isDemoMode } from '@/lib/demoMode';
+import { demoFallback } from '@/lib/demoFallback';
 
 // WS-F3 — the saved-views API stores an opaque filter blob per view, so we
 // flatten the three filter slices Cases tracks today into a single shape the
@@ -127,15 +127,29 @@ export function CasesView({ initialCases }: CasesViewProps = {}) {
   const [severityFilter, setSeverityFilter] = useState<Case['severity'] | 'all'>('all');
   const [search, setSearch] = useState('');
 
-  const demo = isDemoMode();
-
-  const fallback: CasesResponse | undefined = initialCases;
+  // Real server-rendered cases are not sample data, and the gate that
+  // withholds one must not withhold the other. Folding both into a single
+  // `fallback` and passing that through `demoFallback` returned `undefined`
+  // outside the hosted demo *regardless of whether SSR data was supplied* —
+  // so the server fetch in `cases/page.tsx` was made, awaited and discarded
+  // on every non-demo deployment, which is the flash of empty content the
+  // prop exists to prevent.
+  const sampleCases = demoFallback<CasesResponse>({
+    cases: MOCK_CASES,
+    total: MOCK_CASES.length,
+    page: 1,
+    pageSize: MOCK_CASES.length,
+  });
 
   const { data: casesData, isLoading } = useSWR(
     ['cases', statusFilter, severityFilter],
     () => casesApi.list({ status: statusFilter !== 'all' ? statusFilter : undefined }),
     {
-      fallbackData: fallback,
+      fallbackData: initialCases ?? sampleCases,
+      // Supplying `fallbackData` is enough to stop SWR revalidating on mount,
+      // which would turn the SSR snapshot into what the view permanently
+      // shows rather than its first paint.
+      revalidateOnMount: true,
     }
   );
 
@@ -145,6 +159,8 @@ export function CasesView({ initialCases }: CasesViewProps = {}) {
     return true;
   });
 
+  // The list above already falls back to `[]`; this counted MOCK_CASES, so a
+  // failed request rendered an empty table under stat cards claiming 18 cases.
   const allCases = casesData?.cases ?? [];
   const statCounts = {
     all: allCases.length,

@@ -34,66 +34,23 @@ from datetime import datetime
 
 import structlog
 
-from app.clients.cortex_xdr_client import CortexXdrClient
-from app.clients.crowdstrike_rtr import CrowdStrikeRTRClient
-from app.clients.defender_client import DefenderClient
-from app.clients.sentinelone_client import SentinelOneClient
+from app.clients.crowdstrike_rtr import CrowdStrikeRTRClient, quote_rtr_argument
+
+# Re-exported from app.clients.factories, which is where these now live so
+# app.services.rollback can import them without creating a cycle back into
+# this module. Imported here because rollback and verification import them
+# from this path, and tests monkeypatch them here.
+from app.clients.factories import (  # noqa: F401
+    _cortex_client,
+    _cs_client,
+    _mde_client,
+    _s1_client,
+)
 from app.executors.base import _SIM_FUNNEL_CTA, BaseExecutor
-from app.models.action import ActionRequest, ActionResult, ActionStatus, BlastRadius
+from app.models.action import ActionRequest, ActionResult, ActionStatus, ActionType, BlastRadius
+from app.services.rollback import reverse_via_rollback_service
 
 logger = structlog.get_logger()
-
-
-def _cs_client(params: dict) -> CrowdStrikeRTRClient | None:
-    client_id = params.get("cs_client_id")
-    client_secret = params.get("cs_client_secret")
-    if not (client_id and client_secret):
-        return None
-    return CrowdStrikeRTRClient(
-        client_id=client_id,
-        client_secret=client_secret,
-        base_url=params.get("cs_base_url", "https://api.crowdstrike.com"),
-    )
-
-
-def _mde_client(params: dict) -> DefenderClient | None:
-    tenant_id = params.get("mde_tenant_id")
-    client_id = params.get("mde_client_id")
-    client_secret = params.get("mde_client_secret")
-    if not (tenant_id and client_id and client_secret):
-        return None
-    return DefenderClient(tenant_id=tenant_id, client_id=client_id, client_secret=client_secret)
-
-
-def _s1_client(params: dict) -> SentinelOneClient | None:
-    """Build a SentinelOne client from ``ActionRequest.parameters``.
-
-    Returns ``None`` when either field is missing so the executor
-    can cleanly fall through to the next vendor / simulation. We
-    don't pull the API token out of an env var here — the dispatcher
-    intentionally treats every credential as request-scoped so that
-    multi-tenant deployments can route different tenants to
-    different S1 consoles in the same process.
-    """
-    console_url = params.get("s1_console_url")
-    api_token = params.get("s1_api_token")
-    if not (console_url and api_token):
-        return None
-    return SentinelOneClient(console_url=console_url, api_token=api_token)
-
-
-def _cortex_client(params: dict) -> CortexXdrClient | None:
-    """Build a Cortex XDR client from request-scoped credentials.
-
-    Returns ``None`` when any field is missing so the executor falls through to
-    the next vendor / simulation.
-    """
-    api_key_id = params.get("cortex_api_key_id")
-    api_key = params.get("cortex_api_key")
-    fqdn = params.get("cortex_fqdn")
-    if not (api_key_id and api_key and fqdn):
-        return None
-    return CortexXdrClient(api_key_id=api_key_id, api_key=api_key, fqdn=fqdn)
 
 
 async def _cs_contain_host_by_hostname(cs: CrowdStrikeRTRClient, hostname: str) -> dict:
@@ -249,10 +206,22 @@ class IsolateHostExecutor(BaseExecutor):
         )
 
     async def rollback(self, result: ActionResult) -> bool:
+        """De-isolate the host by actually calling the EDR.
+
+        This used to log "Rolling back isolate_host (de-isolating)" and return
+        True without contacting any vendor, so an operator who clicked rollback
+        was told the host was released while it stayed contained.
+        `reverse_action` holds the real lift-containment calls for CrowdStrike,
+        Defender and SentinelOne; it reports `simulated` when credentials are
+        absent rather than claiming success.
+        """
         hostname = result.rollback_data.get("hostname")
-        vendor = result.rollback_data.get("vendor")
-        logger.info("Rolling back isolate_host (de-isolating)", hostname=hostname, vendor=vendor)
-        return True
+        return await reverse_via_rollback_service(
+            ActionType.ISOLATE_HOST,
+            hostname,
+            result.rollback_data,
+            logger,
+        )
 
 
 class QuarantineFileExecutor(BaseExecutor):
@@ -470,7 +439,18 @@ class RunScriptExecutor(BaseExecutor):
                 # PowerShell body, not a registered script_name +
                 # args. We accept either shape from the playbook
                 # layer and prefer raw content when supplied.
-                body = script_content or f"runscript -CloudFile='{script_name}' -CommandLine='{script_args}'"
+                #
+                # Both halves are quoted or refused. `script_content` is not:
+                # it is a script body by definition, its contract is
+                # MANDATORY_HUMAN approval, and there is no subset of
+                # PowerShell that is safe to allow and useful to run.
+                # `script_name` and `script_args` are different — they name a
+                # pre-staged script and its arguments, so a quote in either is
+                # an attempt to reach past the argument, not a legitimate value.
+                body = script_content or (
+                    f"runscript -CloudFile={quote_rtr_argument(script_name, field='script_name')} "
+                    f"-CommandLine={quote_rtr_argument(script_args, field='script_args')}"
+                )
                 result = await cs.run_script(device_id, body)
                 return ActionResult(
                     action_id=request.id,
@@ -536,6 +516,115 @@ class RunScriptExecutor(BaseExecutor):
                 "hostname": hostname,
                 "script_name": script_name,
                 "note": ("Simulation mode — provide cs_client_id/cs_client_secret to enable live execution." + _SIM_FUNNEL_CTA),
+            },
+            rollback_data={},
+            completed_at=datetime.utcnow(),
+        )
+
+
+#: The MDE machine-action type a forensic acquisition produces. Named once so
+#: the executor and the verification probe cannot look for different things.
+INVESTIGATION_PACKAGE_ACTION = "CollectInvestigationPackage"
+
+#: The MDE machine-action type an antivirus sweep produces, for the same
+#: reason. ``DefenderClient.run_av_scan`` posts to ``/runAntiVirusScan`` and
+#: returns the queued action's id; this is what that action is called when
+#: the verification probe has to find it by type instead.
+AV_SCAN_ACTION = "RunAntiVirusScan"
+
+
+class CaptureForensicsExecutor(BaseExecutor):
+    """Acquire a forensic evidence package from a host.
+
+    ``capture_forensics`` was an ``ActionType`` with no executor behind it,
+    and ``services/agents`` proposes it by name whenever an investigation maps
+    to the C2 or exfiltration stage. So on the one class of incident where
+    preserving evidence matters most, the product recommended an acquisition
+    it could not perform and an analyst who approved it got "No executor found
+    for action type" — which reads as a broken deployment rather than a verb
+    nobody built.
+
+    Defender only, deliberately
+    ---------------------------
+    Microsoft Defender's investigation package is the one broad acquisition in
+    this service's vendor set: the agent bundles processes, network
+    connections, registry, prefetch, scheduled tasks and event logs, and MDE
+    exposes both the collection's completion state and a download URI, so the
+    claim "evidence exists" is checkable rather than inferred from a 202.
+
+    CrowdStrike RTR's ``get`` retrieves one *named file*, which is a different
+    verb with a different blast radius. Wiring it here would make
+    ``capture_forensics`` mean "collect the host's forensic package" on one
+    vendor and "fetch this path" on another — the per-vendor drift the
+    capability contract exists to prevent. A tenant without MDE credentials
+    gets an honest simulation naming what to configure, not a fabricated
+    acquisition.
+
+    Reports ``RUNNING``, not ``COMPLETED``
+    --------------------------------------
+    Collection is asynchronous: MDE queues a machine action and the package
+    appears minutes later. Reporting the queued request as completed is the
+    same gap as reporting an accepted isolate call as a contained host — an
+    analyst reads "done" and stops looking for the evidence. ``RUNNING`` says
+    what is true: the acquisition started and the package is not there yet.
+    """
+
+    async def execute(self, request: ActionRequest) -> ActionResult:
+        hostname = request.target
+        logger.info("Executing capture_forensics", hostname=hostname)
+
+        mde = _mde_client(request.parameters)
+        if mde:
+            try:
+                result = await mde.collect_investigation_package(
+                    hostname,
+                    comment=request.rationale or "AiSOC forensic acquisition",
+                )
+                return ActionResult(
+                    action_id=request.id,
+                    status=ActionStatus.RUNNING,
+                    blast_radius=BlastRadius.LOW,
+                    output={
+                        **result,
+                        # `executed` is the single field meaning a vendor was
+                        # actually touched. The acquisition being unfinished is
+                        # carried by `package_ready`, not by pretending nothing
+                        # ran.
+                        "executed": True,
+                        "package_ready": False,
+                        "vendor": "defender",
+                    },
+                    rollback_data={"hostname": hostname, "vendor": "defender"},
+                )
+            except Exception as exc:
+                logger.error("capture_forensics.defender.failed", hostname=hostname, error=str(exc))
+                return ActionResult(
+                    action_id=request.id,
+                    status=ActionStatus.FAILED,
+                    blast_radius=BlastRadius.LOW,
+                    error=str(exc),
+                    completed_at=datetime.utcnow(),
+                )
+
+        logger.warning(
+            "capture_forensics.simulation",
+            hostname=hostname,
+            reason="no Defender credentials provided",
+            funnel="plugin-sdk",
+        )
+        return ActionResult(
+            action_id=request.id,
+            status=ActionStatus.COMPLETED,
+            blast_radius=BlastRadius.LOW,
+            output={
+                "action": "capture_forensics",
+                "hostname": hostname,
+                "executed": False,
+                "package_ready": False,
+                "note": (
+                    "Simulation mode — provide mde_tenant_id/mde_client_id/mde_client_secret "
+                    "to collect a Defender investigation package." + _SIM_FUNNEL_CTA
+                ),
             },
             rollback_data={},
             completed_at=datetime.utcnow(),

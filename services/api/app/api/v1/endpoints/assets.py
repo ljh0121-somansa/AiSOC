@@ -10,10 +10,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.v1.deps import CurrentUser
 from app.api.v1.endpoints.auth import get_current_user
 from app.db.database import get_db
 from app.models.asset import Asset, AssetVulnerability
-from app.models.tenant import User
 
 router = APIRouter(prefix="/assets", tags=["assets"])
 
@@ -104,7 +104,7 @@ async def list_assets(
     limit: int = Query(50, le=500),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> list[Asset]:
     q = select(Asset).where(Asset.tenant_id == current_user.tenant_id)
     if asset_type:
@@ -120,7 +120,7 @@ async def list_assets(
 async def create_asset(
     body: AssetCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> Asset:
     data = body.model_dump()
     asset = Asset(
@@ -134,11 +134,30 @@ async def create_asset(
     return asset
 
 
+@router.get("/vulnerabilities", response_model=list[VulnerabilityOut])
+async def list_vulnerabilities(
+    severity: str | None = Query(None),
+    is_exploited: bool | None = Query(None),
+    limit: int = Query(50, le=500),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> list[AssetVulnerability]:
+    q = select(AssetVulnerability).where(AssetVulnerability.tenant_id == current_user.tenant_id)
+    if severity:
+        q = q.where(AssetVulnerability.severity == severity)
+    if is_exploited is not None:
+        q = q.where(AssetVulnerability.is_exploited == is_exploited)
+    q = q.order_by(AssetVulnerability.last_found.desc()).offset(offset).limit(limit)
+    result = await db.execute(q)
+    return list(result.scalars().all())
+
+
 @router.get("/{asset_id}", response_model=AssetOut)
 async def get_asset(
     asset_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> Asset:
     asset = await db.get(Asset, asset_id)
     if not asset or asset.tenant_id != current_user.tenant_id:
@@ -151,7 +170,7 @@ async def update_asset(
     asset_id: uuid.UUID,
     body: AssetUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> Asset:
     asset = await db.get(Asset, asset_id)
     if not asset or asset.tenant_id != current_user.tenant_id:
@@ -170,7 +189,7 @@ async def update_asset(
 async def delete_asset(
     asset_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> None:
     asset = await db.get(Asset, asset_id)
     if not asset or asset.tenant_id != current_user.tenant_id:
@@ -184,30 +203,11 @@ async def delete_asset(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/vulnerabilities", response_model=list[VulnerabilityOut])
-async def list_vulnerabilities(
-    severity: str | None = Query(None),
-    is_exploited: bool | None = Query(None),
-    limit: int = Query(50, le=500),
-    offset: int = Query(0, ge=0),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-) -> list[AssetVulnerability]:
-    q = select(AssetVulnerability).where(AssetVulnerability.tenant_id == current_user.tenant_id)
-    if severity:
-        q = q.where(AssetVulnerability.severity == severity)
-    if is_exploited is not None:
-        q = q.where(AssetVulnerability.is_exploited == is_exploited)
-    q = q.order_by(AssetVulnerability.last_found.desc()).offset(offset).limit(limit)
-    result = await db.execute(q)
-    return list(result.scalars().all())
-
-
 @router.post("/vulnerabilities", response_model=VulnerabilityOut, status_code=status.HTTP_201_CREATED)
 async def create_vulnerability(
     body: VulnerabilityCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> AssetVulnerability:
     # ensure asset belongs to this tenant
     asset = await db.get(Asset, body.asset_id)
@@ -229,14 +229,14 @@ async def create_vulnerability(
 async def list_asset_vulnerabilities(
     asset_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> list[AssetVulnerability]:
     asset = await db.get(Asset, asset_id)
     if not asset or asset.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=404, detail="Asset not found")
     q = (
         select(AssetVulnerability)
-        .where(AssetVulnerability.asset_id == asset_id)
+        .where(AssetVulnerability.asset_id == asset_id, AssetVulnerability.tenant_id == current_user.tenant_id)
         .order_by(AssetVulnerability.severity, AssetVulnerability.last_found.desc())
     )
     result = await db.execute(q)

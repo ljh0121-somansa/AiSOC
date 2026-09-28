@@ -37,12 +37,20 @@ from typing import Any
 import structlog
 
 from app.models.alert import AlertSeverity, RawAlert
+from app.services.derived_fields import enrich, requested_derived_fields
 from app.services.detection_matcher import matches
 from app.services.provenance import extract_provenance
 
 logger = structlog.get_logger()
 
-_RULESET_PATH = Path(__file__).resolve().parent.parent / "data" / "detection_ruleset.json"
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_RULESET_PATH = _DATA_DIR / "detection_ruleset.json"
+#: Imported rules translated into `match_when` by `scripts/compile_sigma_ruleset.py`.
+#: Held in a second file rather than merged into the one above so that the
+#: exporter's drift check keeps comparing the hand-authored specs against
+#: exactly what they generate. Both are loaded here, so "executable" still
+#: means "the engine loads it".
+_IMPORTED_RULESET_PATH = _DATA_DIR / "detection_ruleset_imported.json"
 
 _SEVERITY_MAP = {
     "critical": AlertSeverity.CRITICAL,
@@ -60,6 +68,12 @@ class DetectionHit:
     severity: str
     category: str
     mitre: list[str]
+    #: Upstream credit for a rule translated from an imported corpus, empty for
+    #: AiSOC's own. DRL-1.1 — which the imported Sigma corpus is licensed under
+    #: — requires not only that redistribution keep attribution, but that
+    #: *messages produced by a match* identify the rule's author. An alert is
+    #: such a message, so the attribution has to reach it.
+    attribution: str = ""
 
 
 def _get(obj: Any, *path: str) -> Any:
@@ -76,6 +90,10 @@ class DetectionEngine:
 
     def __init__(self, rules: list[dict[str, Any]] | None = None) -> None:
         self._rules: list[dict[str, Any]] = rules if rules is not None else _load_ruleset()
+        # Computed once at load, not per event: the set changes when rules
+        # change, not when traffic arrives. Doing it per event would mean a
+        # regex over every rule's clauses for every ingested event.
+        self._derived_wanted: set[str] = requested_derived_fields(self._rules)
 
     @property
     def rule_count(self) -> int:
@@ -93,7 +111,44 @@ class DetectionEngine:
 
     @staticmethod
     def _raw_fields(ocsf: dict[str, Any]) -> dict[str, Any]:
-        """Recover the connector-normalized flat fields the specs match on."""
+        """Recover the flat field namespace the specs match on.
+
+        `raw_data` carries the connector's own normalized dict, and connectors
+        put the untouched vendor payload under `raw_event`. The matcher does a
+        plain `event.get(field)` with no path traversal, so a rule naming a
+        vendor field — `request_uri`, `target_image`, `call_trace` — read
+        `None` and could never fire, however correct the rule was.
+
+        The scale of that was not obvious: 663 of the 825 loaded rules
+        referenced at least one field that was not visible, and fixture replay
+        could not catch any of them because fixtures are synthesized from the
+        rule rather than from real telemetry.
+
+        The workaround in use was per-field hoisting inside individual
+        connectors, e.g. in `llm_usage.normalize()`:
+
+            # Emit the dotted event_type at the TOP LEVEL so the llm-*
+            # detection rules (which match on `event_type`) fire
+
+        which only ever fixed the one field someone noticed. Merging the nested
+        payload once, here, fixes the class.
+
+        Connector-normalized keys win on collision. The connector has already
+        made a deliberate decision about `severity` or `title`, and a vendor
+        field of the same name must not silently override it.
+        """
+        fields = DetectionEngine._decode_raw_data(ocsf)
+
+        nested = fields.get("raw_event")
+        if isinstance(nested, dict):
+            merged = {k: v for k, v in nested.items() if isinstance(k, str)}
+            merged.update(fields)
+            return merged
+        return fields
+
+    @staticmethod
+    def _decode_raw_data(ocsf: dict[str, Any]) -> dict[str, Any]:
+        """The connector's normalized dict, or the OCSF top level as fallback."""
         raw = ocsf.get("raw_data")
         if isinstance(raw, str) and raw.strip():
             try:
@@ -112,6 +167,11 @@ class DetectionEngine:
         if not isinstance(ocsf, dict):
             return []
         fields = self._raw_fields(ocsf)
+        # 17 rules match on comparisons between two fields of the same event
+        # (actor_eq_target, actor_uid_neq_owner_uid) or on time of day. Both
+        # values were already present and nothing was computing the answer,
+        # so those rules could never fire.
+        fields = enrich(fields, self._derived_wanted)
         hits: list[DetectionHit] = []
         for rule in self._candidates(""):
             try:
@@ -123,6 +183,7 @@ class DetectionEngine:
                             severity=rule["severity"],
                             category=rule["category"],
                             mitre=list(rule.get("mitre") or []),
+                            attribution=_attribution(rule),
                         )
                     )
             except Exception as exc:  # noqa: BLE001 — one bad rule must not wedge detection
@@ -142,7 +203,10 @@ class DetectionEngine:
             tenant_id=tenant_id,
             source=f"detection:{hit.rule_id}",
             title=hit.name,
-            description=f"Detection rule {hit.rule_id} ({hit.category}) fired on ingested telemetry.",
+            description=(
+                f"Detection rule {hit.rule_id} ({hit.category}) fired on ingested telemetry."
+                + (f" {hit.attribution}" if hit.attribution else "")
+            ),
             severity=_SEVERITY_MAP.get(hit.severity, AlertSeverity.MEDIUM),
             src_ip=_get(ocsf, "src_endpoint", "ip"),
             dst_ip=_get(ocsf, "dst_endpoint", "ip"),
@@ -158,16 +222,48 @@ class DetectionEngine:
         )
 
 
-@lru_cache(maxsize=1)
-def _load_ruleset() -> list[dict[str, Any]]:
-    if not _RULESET_PATH.exists():
-        logger.warning("detection_engine.ruleset_missing", path=str(_RULESET_PATH))
+def _attribution(rule: dict[str, Any]) -> str:
+    """One sentence crediting an imported rule's upstream, or empty.
+
+    Built from whatever the provenance block actually holds rather than from a
+    template with blanks, so a missing author reads as a shorter sentence
+    instead of as an author called "".
+    """
+    prov = rule.get("provenance")
+    if not isinstance(prov, dict) or not prov.get("source"):
+        return ""
+    parts = [f"Translated from {prov['source']}"]
+    if prov.get("author"):
+        parts.append(f"by {prov['author']}")
+    if prov.get("upstream_path"):
+        parts.append(f"({prov['upstream_path']})")
+    licence = prov.get("license")
+    tail = f", licensed under {licence}" if licence else ""
+    url = prov.get("license_url")
+    return " ".join(parts) + tail + (f" <{url}>" if url else "") + "."
+
+
+def _read_ruleset(path: Path, *, required: bool) -> list[dict[str, Any]]:
+    if not path.exists():
+        if required:
+            logger.warning("detection_engine.ruleset_missing", path=str(path))
         return []
     try:
-        data = json.loads(_RULESET_PATH.read_text(encoding="utf-8"))
-        rules = data.get("rules") or []
-        logger.info("detection_engine.ruleset_loaded", count=len(rules))
-        return rules
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data.get("rules") or []
     except (ValueError, OSError) as exc:
-        logger.error("detection_engine.ruleset_load_failed", error=str(exc))
+        logger.error("detection_engine.ruleset_load_failed", path=str(path), error=str(exc))
         return []
+
+
+@lru_cache(maxsize=1)
+def _load_ruleset() -> list[dict[str, Any]]:
+    native = _read_ruleset(_RULESET_PATH, required=True)
+    imported = _read_ruleset(_IMPORTED_RULESET_PATH, required=False)
+    logger.info(
+        "detection_engine.ruleset_loaded",
+        count=len(native) + len(imported),
+        native=len(native),
+        imported=len(imported),
+    )
+    return native + imported

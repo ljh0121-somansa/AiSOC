@@ -38,16 +38,17 @@ import os
 import re
 import uuid
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import quote
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query, Response, status, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi.responses import HTMLResponse
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
-from app.api.v1.deps import AuthUser, DBSession
+from app.api.v1.deps import AuthUser, DBSession, require_permission
 from app.core.logging import safe_log_value
 from app.services.case_fanout import (
     FanoutResult,
@@ -436,7 +437,9 @@ async def list_cases(
 
 
 @router.post("", response_model=CaseResponse, status_code=status.HTTP_201_CREATED, summary="Create case")
-async def create_case(body: CreateCaseRequest, db: DBSession, user: AuthUser) -> CaseResponse:
+async def create_case(
+    body: CreateCaseRequest, db: DBSession, user: Annotated[AuthUser, Depends(require_permission("cases:write"))]
+) -> CaseResponse:
     import json as _json
 
     case_id = uuid.uuid4()
@@ -522,7 +525,9 @@ async def get_case(case_id: str, db: DBSession, user: AuthUser) -> CaseResponse:
 
 
 @router.patch("/{case_id}", response_model=CaseResponse, summary="Update case")
-async def update_case(case_id: str, body: UpdateCaseRequest, db: DBSession, user: AuthUser) -> CaseResponse:
+async def update_case(
+    case_id: str, body: UpdateCaseRequest, db: DBSession, user: Annotated[AuthUser, Depends(require_permission("cases:write"))]
+) -> CaseResponse:
     import json as _json
 
     cid = await _resolve_case_id(case_id, db, user.tenant_id)
@@ -638,7 +643,9 @@ async def update_case(case_id: str, body: UpdateCaseRequest, db: DBSession, user
 
 
 @router.post("/{case_id}/alerts", response_model=CaseResponse, summary="Link alerts to a case")
-async def add_alerts(case_id: str, body: AddAlertsRequest, db: DBSession, user: AuthUser) -> CaseResponse:
+async def add_alerts(
+    case_id: str, body: AddAlertsRequest, db: DBSession, user: Annotated[AuthUser, Depends(require_permission("cases:write"))]
+) -> CaseResponse:
     cid = await _resolve_case_id(case_id, db, user.tenant_id)
     ids_str = [str(a) for a in body.alert_ids]
     q = text("""
@@ -663,7 +670,9 @@ async def add_alerts(case_id: str, body: AddAlertsRequest, db: DBSession, user: 
 
 
 @router.post("/{case_id}/observables", response_model=CaseResponse, summary="Update observable graph")
-async def update_observables(case_id: str, body: UpdateObservablesRequest, db: DBSession, user: AuthUser) -> CaseResponse:
+async def update_observables(
+    case_id: str, body: UpdateObservablesRequest, db: DBSession, user: Annotated[AuthUser, Depends(require_permission("cases:write"))]
+) -> CaseResponse:
     import json as _json
 
     cid = await _resolve_case_id(case_id, db, user.tenant_id)
@@ -709,7 +718,9 @@ async def update_observables(case_id: str, body: UpdateObservablesRequest, db: D
 
 
 @router.post("/{case_id}/comments", response_model=CommentResponse, status_code=201, summary="Add comment")
-async def add_comment(case_id: str, body: AddCommentRequest, db: DBSession, user: AuthUser) -> CommentResponse:
+async def add_comment(
+    case_id: str, body: AddCommentRequest, db: DBSession, user: Annotated[AuthUser, Depends(require_permission("cases:write"))]
+) -> CommentResponse:
     cid = await _resolve_case_id(case_id, db, user.tenant_id)
     exists = (
         await db.execute(
@@ -783,7 +794,9 @@ async def list_notes(case_id: str, db: DBSession, user: AuthUser) -> list[Commen
 
 
 @router.post("/{case_id}/notes", response_model=CommentResponse, status_code=201, summary="Add case note (alias of /comments)")
-async def add_note(case_id: str, body: AddCommentRequest, db: DBSession, user: AuthUser) -> CommentResponse:
+async def add_note(
+    case_id: str, body: AddCommentRequest, db: DBSession, user: Annotated[AuthUser, Depends(require_permission("cases:write"))]
+) -> CommentResponse:
     return await add_comment(case_id, body, db, user)
 
 
@@ -886,7 +899,16 @@ async def case_timeline(case_id: str, db: DBSession, user: AuthUser) -> Timeline
     for alert_id in list(case_row.alert_ids or [])[:25]:
         try:
             a = (
-                await db.execute(text("SELECT id, title, severity, created_at FROM aisoc_alerts WHERE id = :id").bindparams(id=alert_id))
+                # Tenant-scoped as defence in depth. Reaching this loop already
+                # required a tenant-scoped case, but the predicate costs
+                # nothing and a poisoned ``alert_ids`` array would otherwise
+                # hydrate another tenant's alert title into this timeline.
+                await db.execute(
+                    text("SELECT id, title, severity, created_at FROM aisoc_alerts WHERE id = :id AND tenant_id = :tenant_id").bindparams(
+                        id=alert_id,
+                        tenant_id=str(user.tenant_id),
+                    )
+                )
             ).fetchone()
             if a:
                 events.append(
@@ -965,7 +987,7 @@ async def create_task(
     case_id: str,
     body: CreateTaskRequest,
     db: DBSession,
-    user: AuthUser,
+    user: Annotated[AuthUser, Depends(require_permission("cases:write"))],
 ) -> TaskResponse:
     cid = await _resolve_case_id(case_id, db, user.tenant_id)
     exists = (
@@ -1016,7 +1038,7 @@ async def update_task(
     task_id: uuid.UUID,
     body: UpdateTaskRequest,
     db: DBSession,
-    user: AuthUser,
+    user: Annotated[AuthUser, Depends(require_permission("cases:write"))],
 ) -> TaskResponse:
     cid = await _resolve_case_id(case_id, db, user.tenant_id)
     sets: list[str] = []
@@ -1102,7 +1124,7 @@ async def case_investigate(
     case_id: str,
     body: InvestigateRequest,
     db: DBSession,
-    user: AuthUser,
+    user: Annotated[AuthUser, Depends(require_permission("cases:write"))],
 ) -> dict[str, Any]:
     cid = await _resolve_case_id(case_id, db, user.tenant_id)
     case_row = (
@@ -1117,10 +1139,14 @@ async def case_investigate(
     if not alert_summary:
         alert_summary = case_row.description or case_row.title or ""
 
+    # Forward the authenticated tenant so the agents service attributes the run
+    # to the real tenant instead of falling back to the "default" placeholder,
+    # which the demo seed no longer maps to any tenant. The ledger is scoped by
+    # tenant_id, so without this the whole run is never persisted.
     resp = await _agents_proxy(
         "POST",
         f"/api/v1/cases/{cid}/investigate",
-        json={"alert_summary": alert_summary},
+        json={"alert_summary": alert_summary, "tenant_id": str(user.tenant_id)},
     )
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
@@ -1155,15 +1181,38 @@ async def list_case_investigations(
 async def case_investigation_run(
     case_id: str,
     run_id: str,
+    db: DBSession,
     user: AuthUser,
 ) -> dict[str, Any]:
+    """One investigation run belonging to this case, in the caller's tenant."""
+    # Scoping kept out of the docstring because FastAPI publishes that verbatim
+    # in docs/openapi.yaml, and the rationale is for the next maintainer rather
+    # than for API consumers.
+    #
+    # This handler took no database session and never read `user.tenant_id`:
+    # `case_id` was declared and never used, and `run_id` alone was proxied to
+    # the agents service, so any authenticated user could read any run by id
+    # across tenants (GHSA-x2gf-3p79-wvgm). The sibling list route two
+    # functions up already resolved the case against the caller's tenant.
+    #
+    # Both halves below are needed. Resolving the case proves the caller may
+    # see *this case*; checking the run belongs to it proves the id in the path
+    # is not somebody else's run smuggled under a case the caller does own.
+    cid = await _resolve_case_id(case_id, db, user.tenant_id)
     # URL-encode the user-supplied run_id so it cannot inject `/`, `?`, `#`,
     # CR/LF, or other URL syntax into the proxied path.
     safe_run_id = quote(run_id, safe="")
     resp = await _agents_proxy("GET", f"/api/v1/investigations/{safe_run_id}")
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
+    run = resp.json()
+
+    # A run that names a different case is not this case's run. Compared as
+    # strings because the agents service echoes whatever case id it was given.
+    run_case_id = run.get("case_id")
+    if run_case_id is not None and str(run_case_id) != str(cid):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Investigation run not found for this case")
+    return run
 
 
 # Filename sanitiser for Content-Disposition: keep only safe ASCII so the
@@ -1245,7 +1294,7 @@ async def case_auto_summary(
     ),
 ) -> Any:
     cid = await _resolve_case_id(case_id, db, user.tenant_id)
-    summary = await build_case_summary(db, cid)
+    summary = await build_case_summary(db, cid, user.tenant_id)
     if summary is None:
         raise HTTPException(status_code=404, detail="Case not found.")
 
@@ -1287,7 +1336,7 @@ async def case_auto_postmortem(
     change*. Both are deterministic — same case state in, same artefact out.
     """
     cid = await _resolve_case_id(case_id, db, user.tenant_id)
-    postmortem = await build_case_postmortem(db, cid)
+    postmortem = await build_case_postmortem(db, cid, user.tenant_id)
     if postmortem is None:
         raise HTTPException(status_code=404, detail="Case not found.")
 

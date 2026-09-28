@@ -29,9 +29,11 @@ import { motion, AnimatePresence } from 'framer-motion';
 import toast from 'react-hot-toast';
 import {
   autonomyPolicyApi,
+  type AgreementResponse,
   type AutonomyActionPolicy,
   type AutonomyBlastRadius,
   type AutonomyPolicyResponse,
+  type GrantListResponse,
   type AutonomyThresholdTriple,
 } from '@/lib/api';
 import { Skeleton } from '@/components/ui/Skeleton';
@@ -98,6 +100,26 @@ export function AutonomyPolicyPanel() {
 
   const actions = data?.actions ?? [];
 
+  // Phase 2.2 — the measured track record beside the configured posture. Its
+  // own SWR key, so an agreement endpoint that is unreachable blanks that half
+  // of the card rather than taking the guardrail editor down with it. The
+  // scorecard treats `undefined` as "not measured" and says so.
+  const { data: agreement } = useSWR<AgreementResponse>(
+    'settings:autonomy-agreement',
+    () => autonomyPolicyApi.agreement(),
+    { revalidateOnFocus: false, shouldRetryOnError: false },
+  );
+
+  // Phase 2.3. Reading this also re-checks every standing grant against its
+  // current evidence, so a capability whose track record has slipped is
+  // demoted here rather than being listed as current while failing at
+  // dispatch, which would leave this page disagreeing with the product.
+  const { data: grantList } = useSWR<GrantListResponse>(
+    'settings:autonomy-grants',
+    () => autonomyPolicyApi.grants(),
+    { revalidateOnFocus: false, shouldRetryOnError: false },
+  );
+
   return (
     <div>
       <PanelHeader
@@ -110,7 +132,7 @@ export function AutonomyPolicyPanel() {
             copilot). Rendered once the policy loads so the CISO sees the
             whole-SOC autonomy posture before drilling into per-action rows. */}
         {!isLoading && !error && actions.length > 0 ? (
-          <AutonomyScorecard actions={actions} />
+          <AutonomyScorecard actions={actions} agreement={agreement} grants={grantList?.grants} />
         ) : null}
 
         {/* Legend */}

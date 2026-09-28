@@ -39,6 +39,8 @@ import cytoscape, { type Core, type ElementDefinition } from 'cytoscape';
 import fcose from 'cytoscape-fcose';
 import { clsx } from 'clsx';
 import { safeFetcher } from '@/lib/fetcher';
+import { demoFallback } from '@/lib/demoFallback';
+import { describeApiFailure } from '@/lib/failure';
 
 if (typeof window !== 'undefined') {
   try {
@@ -345,7 +347,7 @@ export function EffectivePermissionsView() {
   const { data: providerInfo } = useSWR<{ providers: ProviderInfo[] }>(
     '/api/v1/identity/effective-permissions/providers',
     safeFetcher,
-    { fallbackData: { providers: DEMO_PROVIDERS } },
+    { fallbackData: demoFallback({ providers: DEMO_PROVIDERS }) },
   );
   const providers = providerInfo?.providers ?? DEMO_PROVIDERS;
   const selectedProviderInfo = providers.find((p) => p.name === provider);
@@ -355,14 +357,21 @@ export function EffectivePermissionsView() {
     principalId && !isScaffoldProvider
       ? `/api/v1/identity/${encodeURIComponent(principalId)}/effective-permissions?provider=${provider}`
       : null;
-  const { data, error, isLoading } = useSWR<ResolverResult>(
+  const { data, error, isLoading, mutate } = useSWR<ResolverResult>(
     apiUrl,
     safeFetcher,
     {
-      fallbackData: provider === 'aws' && !isScaffoldProvider ? DEMO_RESULT : undefined,
+      fallbackData:
+        provider === 'aws' && !isScaffoldProvider ? demoFallback(DEMO_RESULT) : undefined,
       shouldRetryOnError: false,
     },
   );
+
+  // A resolver failure is not a scaffold gap and not an empty result. The
+  // sidebar used to call it "falling back to demo data" — `demoFallback` is
+  // `undefined` outside the hosted demo, so there was no fallback and the
+  // graph pane rendered an empty Cytoscape canvas with no explanation at all.
+  const resolveFailed = !!error && !isScaffold501(error);
 
   const result = data;
   const denyCount = useMemo(
@@ -552,6 +561,25 @@ export function EffectivePermissionsView() {
                 for the next provider rollout.
               </p>
             </div>
+          ) : resolveFailed ? (
+            <div className="flex h-full flex-col items-center justify-center px-8 text-center text-gray-400">
+              <p className="text-base font-semibold text-gray-200">
+                Effective permissions could not be resolved
+              </p>
+              <p className="mt-2 max-w-md text-sm">
+                {describeApiFailure(error, {
+                  subject: 'effective-permission graph for this principal',
+                  service: 'identity resolver',
+                })}
+              </p>
+              <button
+                type="button"
+                onClick={() => void mutate()}
+                className="mt-4 rounded border border-gray-700 px-3 py-1.5 text-sm text-gray-200 transition-colors hover:bg-gray-800"
+              >
+                Retry
+              </button>
+            </div>
           ) : showEmptyState ? (
             <div className="flex h-full flex-col items-center justify-center px-8 text-center text-gray-400">
               <p className="text-base font-semibold text-gray-200">
@@ -578,7 +606,10 @@ export function EffectivePermissionsView() {
             </p>
           ) : error ? (
             <p className="text-red-400">
-              Failed to resolve — falling back to demo data.
+              {describeApiFailure(error, {
+                subject: 'effective-permission graph for this principal',
+                service: 'identity resolver',
+              })}
             </p>
           ) : result ? (
             <dl className="space-y-1 text-gray-300">

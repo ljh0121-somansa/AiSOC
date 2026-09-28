@@ -7,28 +7,62 @@ license = "MIT"
 
 [tool.poetry.dependencies]
 python = "^3.11"
-fastapi = ">=0.109,<0.142"
+# Floor 0.117: below it a `-> None` handler under PEP 563 trips FastAPI's
+# "204 must not have a response body" assert at import. One range for
+# every service — see services/api/pyproject.toml for the measurement.
+fastapi = ">=0.117,<0.142"
 uvicorn = {extras = ["standard"], version = ">=0.27,<0.53"}
 pydantic = "^2.5.0"
 pydantic-settings = "^2.1.0"
-langchain = ">=0.3.0,<0.4.0"
-langchain-core = ">=0.3.0,<0.4.0"
-langchain-openai = ">=0.2.0,<0.4.0"
+langchain = ">=1.3.9,<2.0.0"
+langchain-core = ">=1.2.22,<2.0.0"
+langchain-openai = ">=0.2.0,<2.0.0"
+# langchain-core is floored at 1.2.22, which patches the high-severity
+# advisory that kept the 0.3.x line unpatchable. The 0.3 cap was the
+# reason this could not be fixed: the patch only exists on the 1.x line,
+# so the pin had to move before the advisory could close.
+#
 # langgraph >=0.2 exposes the public ``START`` sentinel that
 # ``app.investigator.orchestrator`` imports. The previous ``^0.0.30`` pin
 # resolved to <0.1.0 which silently broke the import at runtime.
-langgraph = ">=0.2.40,<1.1.0"
-langchain-community = ">=0.3.0,<0.4.0"
+langgraph = ">=1.0.10,<2.0.0"
+langchain-community = ">=0.3.0,<2.0.0"
+# Transitive through langchain-community, floored explicitly: the
+# resolver picked 3.14.1, which is inside the advisory range
+# (<= 3.14.2). A transitive dependency with a known fix is still a
+# known fix nobody applied.
+aiohttp = ">=3.14.3"
+# Transitive through langgraph, floored explicitly for the same reason as
+# aiohttp: widening the top-level cap let the resolver reach a patched
+# version, and it chose one inside the advisory range anyway. A range that
+# permits the fix is not the same as a lock that takes it.
+langgraph-checkpoint = ">=4.1.1"
+langgraph-sdk = ">=0.3.15"
 openai = ">=1.12,<3.0"
 redis = {extras = ["hiredis"], version = ">=5.0.1,<9.0.0"}
 httpx = ">=0.26,<0.29"
+# The official MCP Python SDK, exact-pinned. Gap-closure Phase 5.
+#
+# Exact because the version is the behaviour: this library parses replies from
+# third-party servers straight into the prompt that decides what the agent
+# does next, so "whatever the resolver picked" is not a thing to be relaxed
+# about, and a protocol or annotation change between two patch releases would
+# move what `readOnlyHint` and `destructiveHint` mean to `app/mcp/policy.py`.
+#
+# The 1.x line rather than 2.x: mcp 2.x depends on `httpx2`, a second HTTP
+# client alongside the `httpx` this service already pins. Two TLS and HTTP
+# stacks inside the one service that reaches third-party servers is a cost
+# with no return here. 1.30.0 requires httpx >=0.27.1,<1.0.0, which is inside
+# the range above, so the MCP client and everything else share one stack.
+mcp = "1.30.0"
 structlog = ">=24.1,<27.0"
 prometheus-client = ">=0.19,<0.27"
 python-dateutil = "^2.8.2"
 aiokafka = ">=0.10,<0.15"
 qdrant-client = {extras = ["fastembed"], version = "^1.9.0"}
 markdown = "^3.5"
-weasyprint = {version = ">=62,<70", optional = true}
+# `<70` held this at 69.0, which carries PYSEC-2026-3940 (fixed in 70.0).
+weasyprint = {version = ">=62,<71", optional = true}
 opentelemetry-sdk = "^1.24.0"
 opentelemetry-instrumentation-fastapi = "^0.45b0"
 opentelemetry-instrumentation-httpx = "^0.45b0"
@@ -39,7 +73,7 @@ pyyaml = "^6.0.1"
 cffi = ">=1.16.0,<2"
 # Imported by app.security.credential_vault. This must be a direct runtime
 # dependency rather than an accidental dependency of Poetry itself.
-cryptography = ">=46,<50"
+cryptography = ">=46,<51"
 # jsonschema is consumed by the NL → playbook drafter (T3.7) to validate
 # every drafted playbook against schemas/playbook.schema.json before the
 # editor loads it, and by scripts/lint_playbooks.py. Pinned to the
@@ -47,8 +81,11 @@ cryptography = ">=46,<50"
 jsonschema = ">=4.21,<5.0"
 
 [tool.poetry.group.dev.dependencies]
-pytest = ">=7.4,<10.0"
-pytest-asyncio = ">=0.23,<1.5"
+# Floored at 9.0.3 for GHSA advisory coverage; the caret pins excluded it.
+# pytest-asyncio is widened to match — 0.23 predates pytest 9 and the two
+# resolve together or not at all.
+pytest = ">=9.0.3,<10.0"
+pytest-asyncio = ">=1.0,<2.0"
 respx = ">=0.22,<0.24"
 
 [tool.pytest.ini_options]
@@ -59,7 +96,16 @@ asyncio_mode = "auto"
 # Postgres). Unit-only CI runs ``pytest -m "not integration"``.
 markers = [
     "integration: mark a test as requiring external infrastructure (Kafka, Neo4j, Postgres). Run with `pytest -m integration`.",
+    "touches_database: the test drives a real database client against a DSN it sets itself (typically an unreachable one, to prove a fail-soft path). Exempt from the no-ambient-database guard in tests/conftest.py; it needs no infrastructure, so it is not `integration`.",
 ]
+
+# Same shape as services/api and services/osquery-tls rather than a third
+# strictness level. `python_version` is pinned so the finding set does not
+# move with whatever interpreter mypy happens to run on.
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true
 
 [build-system]
 requires = ["poetry-core"]

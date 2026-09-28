@@ -46,14 +46,22 @@ Usage
     # Real preflight:
     python scripts/wet_eval_check.py --status-out /tmp/wet-eval-check.json
 """
+
 from __future__ import annotations
 
 import argparse
 import json
 import os
 import sys
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
+
+# `scripts/` is on sys.path when this file is run as a program, but not when a
+# test loads it by path with importlib. gate_toolkit sits beside it either way.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from gate_toolkit import SELF_TEST_FLAG
 
 # Secrets the workflow needs. Names match what's documented in
 # ``apps/docs/docs/operations/secrets.md`` so docs and code stay in step.
@@ -90,10 +98,7 @@ def main(argv: list[str] | None = None) -> int:
         "--status-out",
         type=Path,
         default=None,
-        help=(
-            "Write a JSON status file to this path so the workflow can "
-            "branch on ``should_run``. If omitted, only stdout is used."
-        ),
+        help=("Write a JSON status file to this path so the workflow can branch on ``should_run``. If omitted, only stdout is used."),
     )
     args = parser.parse_args(argv)
 
@@ -102,23 +107,15 @@ def main(argv: list[str] | None = None) -> int:
     is_live = has_all and not args.dry_run
 
     if args.dry_run:
-        reason = (
-            "dry-run mode: status reported as no-op. The workflow will "
-            "not dispatch the live wet eval."
-        )
+        reason = "dry-run mode: status reported as no-op. The workflow will not dispatch the live wet eval."
     elif missing:
         reason = (
-            "Missing required secret(s): "
-            + ", ".join(missing)
-            + ". This is expected on forks and first-run CI; configure them "
-              "in the repo settings to enable the weekly wet eval. See "
-              "`apps/docs/docs/operations/secrets.md`."
+            "Missing required secret(s): " + ", ".join(missing) + ". This is expected on forks and first-run CI; configure them "
+            "in the repo settings to enable the weekly wet eval. See "
+            "`apps/docs/docs/operations/secrets.md`."
         )
     else:
-        reason = (
-            "All required secrets are present. Proceeding to the live "
-            "wet-eval run."
-        )
+        reason = "All required secrets are present. Proceeding to the live wet-eval run."
 
     status = {
         "should_run": bool(is_live),
@@ -127,10 +124,7 @@ def main(argv: list[str] | None = None) -> int:
         "reason": reason,
         # Each secret keyed by name so the workflow can render a checklist
         # without revealing values. Booleans only — never the secret itself.
-        "secrets_present": {
-            name: bool(os.environ.get(name))
-            for name in _REQUIRED_SECRETS_FOR_LIVE_RUN
-        },
+        "secrets_present": {name: bool(os.environ.get(name)) for name in _REQUIRED_SECRETS_FOR_LIVE_RUN},
         "checked_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
@@ -163,5 +157,53 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _self_test() -> int:
+    """Prove the verdict this preflight actually renders.
+
+    The shared empty-tree self-test does not apply here: this script reads two
+    environment variables and no repository content, and exits 0 by design so
+    a fork with no secrets does not look like a broken build. Its verdict is
+    ``should_run`` in the status file, and that is what has to be checked —
+    otherwise a preflight that answered "yes, dispatch" unconditionally would
+    look identical from the outside, and the weekly workflow would proceed to
+    call a provider with no key.
+    """
+    cases = [
+        ("no secrets configured: the workflow must not dispatch", {}, False, False),
+        ("both secrets present: the workflow dispatches", dict.fromkeys(_REQUIRED_SECRETS_FOR_LIVE_RUN, "x"), False, True),
+        ("one secret missing: still no dispatch", {_REQUIRED_SECRETS_FOR_LIVE_RUN[0]: "x"}, False, False),
+        ("dry-run overrides present secrets", dict.fromkeys(_REQUIRED_SECRETS_FOR_LIVE_RUN, "x"), True, False),
+    ]
+    ok = True
+    saved = {name: os.environ.get(name) for name in _REQUIRED_SECRETS_FOR_LIVE_RUN}
+    with tempfile.TemporaryDirectory(prefix="wet_eval_check_") as tmp:
+        out = Path(tmp) / "status.json"
+        for description, environment, dry_run, expected in cases:
+            for name in _REQUIRED_SECRETS_FOR_LIVE_RUN:
+                os.environ.pop(name, None)
+            os.environ.update(environment)
+            argv = ["--status-out", str(out)] + (["--dry-run"] if dry_run else [])
+            status = main(argv)
+            should_run = json.loads(out.read_text())["should_run"]
+            passed = status == 0 and should_run is expected
+            ok &= passed
+            print(f"  {'PASS' if passed else 'FAIL'}  {description}")
+            print(f"        exit {status}, should_run={should_run} (want {expected})")
+    for name, value in saved.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+    print()
+    if not ok:
+        print("wet_eval_check.py: self-test FAILED")
+        return 1
+    print("wet_eval_check.py: self-test OK")
+    return 0
+
+
 if __name__ == "__main__":
+    if SELF_TEST_FLAG in sys.argv[1:]:
+        sys.exit(_self_test())
     sys.exit(main())

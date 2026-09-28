@@ -4,6 +4,9 @@ import { useState } from 'react';
 import useSWR, { mutate } from 'swr';
 import { EmptyState, EmptyStateIcons } from '@/components/ui/EmptyState';
 import { request, authApi } from '@/lib/api';
+import { demoFallback } from '@/lib/demoFallback';
+import { FailureBanner } from '@/components/ui/FailureBanner';
+import { describeApiFailure, jsonFetcher } from '@/lib/failure';
 
 interface Permission {
   id: string;
@@ -21,7 +24,7 @@ interface Role {
   permissions: Permission[];
 }
 
-const fetcher = (url: string) => request<any>(url);
+const fetcher = jsonFetcher;
 
 const CATEGORY_COLORS: Record<string, string> = {
   cases: 'bg-blue-500/20 text-blue-300',
@@ -232,11 +235,15 @@ export function RBACView() {
   const currentUser = authApi.currentUser();
   const canWriteRoles = currentUser?.role === 'admin' || currentUser?.role === 'platform_admin' || currentUser?.role === 'tenant_admin' || currentUser?.role === 'soc_lead';
 
-  const { data: roles, error: rolesError } = useSWR<Role[]>('/api/v1/rbac/roles', fetcher, {
-    fallbackData: undefined,
+  const {
+    data: roles,
+    error: rolesError,
+    mutate: reloadRoles,
+  } = useSWR<Role[]>('/api/v1/rbac/roles', fetcher, {
+    fallbackData: demoFallback(MOCK_ROLES),
   });
   const { data: permissions } = useSWR<Permission[]>('/api/v1/rbac/permissions', fetcher, {
-    fallbackData: undefined,
+    fallbackData: demoFallback(MOCK_PERMISSIONS),
   });
 
   const [showCreate, setShowCreate] = useState(false);
@@ -269,10 +276,23 @@ export function RBACView() {
         )}
       </div>
 
+      {/* `roles` is `undefined` on failure outside the hosted demo, which
+          suppressed both the skeleton below and the empty state under it — so
+          "showing demo roles" was, literally, the only thing on the page. */}
       {rolesError && (
-        <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-4 py-2 text-xs text-amber-200">
-          RBAC API unreachable
-        </div>
+        <>
+          <FailureBanner
+            title="Roles unavailable"
+            message={describeApiFailure(rolesError, { subject: 'role list' })}
+            onRetry={() => reloadRoles()}
+          />
+          <div className="flex flex-col items-center justify-center gap-1 rounded-xl border border-gray-800/60 bg-gray-900/40 px-4 py-12 text-center">
+            <p className="text-sm text-amber-200/80">The role list could not be loaded.</p>
+            <p className="text-[11px] text-gray-600">
+              Treat this as unknown rather than as a tenant with no roles defined.
+            </p>
+          </div>
+        </>
       )}
 
       {!roles && !rolesError && (

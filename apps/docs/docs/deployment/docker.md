@@ -70,6 +70,7 @@ or compose override if you need LAN access.
 | `realtime` (Node WS + Web Push) | 8086 | 4000 | |
 | `connectors` (50-vendor poller) | 8088 | 8003 | `profiles: [connectors]` |
 | `osquery-tls` (host telemetry server) | 8091 | 8007 | `profiles: [osquery]` |
+| `litellm` (LLM gateway) | 4000 | 4000 | CORE — resolves every `aisoc-<role>` alias |
 | `web` (Next.js console + Responder PWA) | 3000 | 3000 | |
 
 `mcp` (the Model Context Protocol stdio server) runs without a port — it is
@@ -131,7 +132,7 @@ docker compose build agents
 For releases, prebuilt and signed images are published to GHCR:
 
 ```
-ghcr.io/beenuar/aisoc-api:<version>
+ghcr.io/beenuar/aisoc-core-api:<version>
 ghcr.io/beenuar/aisoc-agents:<version>
 ghcr.io/beenuar/aisoc-actions:<version>
 ghcr.io/beenuar/aisoc-fusion:<version>
@@ -143,11 +144,30 @@ ghcr.io/beenuar/aisoc-connectors:<version>
 ghcr.io/beenuar/aisoc-osquery-tls:<version>
 ghcr.io/beenuar/aisoc-slack-bot:<version>
 ghcr.io/beenuar/aisoc-realtime:<version>
-ghcr.io/beenuar/aisoc-mcp:<version>
 ghcr.io/beenuar/aisoc-ingest:<version>
 ghcr.io/beenuar/aisoc-enrichment:<version>
 ghcr.io/beenuar/aisoc-web:<version>
 ```
+
+### Image tags
+
+| Tag | What it is | Who pulls it |
+|---|---|---|
+| `vX.Y.Z` | A pinned release. | `AISOC_VERSION` in `.env`, the Helm chart |
+| `latest` | The newest release. | `docker-compose.yml`, so `make up` |
+| `main` | The newest commit on `main`. | Anyone tracking the tip |
+| `vX.Y.Z-demo`, `demo` | `aisoc-web` only: the console built for a public demo. | `infra/compose/docker-compose.demo.yml` |
+
+The demo tags exist because the console's demo mode is a **build-time** choice,
+not a runtime one: Next.js inlines `NEXT_PUBLIC_*` values into the client
+bundle during `next build`, so an image built for a demo cannot be turned back
+into a product image by changing an environment variable.
+
+`latest` used to be that demo build, which meant a self-hosted console
+announced that its data was demo data, disabled every write control and
+offered a link to self-host an install that was already self-hosted, with no
+way out short of rebuilding the image. Only `aisoc-web` is affected — the
+other services gate demo behaviour at runtime through `AISOC_DEMO_MODE`.
 
 ### Image provenance
 
@@ -159,7 +179,7 @@ release artifact before deploying it into a sensitive environment:
 cosign verify \
   --certificate-identity-regexp '^https://github.com/beenuar/AiSOC' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/beenuar/aisoc-api:<version>
+  ghcr.io/beenuar/aisoc-core-api:<version>
 ```
 
 The certificate identity is bound to this repository's workflow, so a

@@ -31,7 +31,15 @@ import shutil
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+# `scripts/` is on sys.path when this file is run as a program, but not when a
+# test loads it by path with importlib. gate_toolkit sits beside it either way.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from gate_toolkit import repo_root, self_test_if_requested
+
+self_test_if_requested(__file__)
+
+REPO_ROOT = repo_root()
 SOURCE_FILE = REPO_ROOT / "services" / "fusion" / "app" / "services" / "narrative.py"
 VENDORED_FILE = REPO_ROOT / "services" / "api" / "app" / "_vendor" / "narrative.py"
 
@@ -62,10 +70,7 @@ def _sync() -> int:
         return 1
     VENDORED_FILE.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(SOURCE_FILE, VENDORED_FILE)
-    print(
-        f"copied {SOURCE_FILE.relative_to(REPO_ROOT)} → "
-        f"{VENDORED_FILE.relative_to(REPO_ROOT)}"
-    )
+    print(f"copied {SOURCE_FILE.relative_to(REPO_ROOT)} → {VENDORED_FILE.relative_to(REPO_ROOT)}")
     print("\nDone. Don't forget to commit services/api/app/_vendor/narrative.py.")
     return 0
 

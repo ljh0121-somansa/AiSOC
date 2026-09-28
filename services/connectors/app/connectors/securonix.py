@@ -113,13 +113,11 @@ class SecuronixConnector(BaseConnector):
             "category": self.connector_category,
             "severity": _PRIORITY_MAP.get(priority, "medium"),
             "title": raw.get("incidentType") or f"Securonix incident {raw.get('incidentId')}",
-            "description": (
-                f"priority={raw.get('priority')}; " f"status={raw.get('status')}; " f"reason={raw.get('reason')}; " f"entity={entity}"
-            ),
+            "description": (f"priority={raw.get('priority')}; status={raw.get('status')}; reason={raw.get('reason')}; entity={entity}"),
             "external_id": str(raw.get("incidentId") or ""),
             "username": entity if raw.get("entityType") == "Users" else None,
             "actor": entity,
             "event_type": "securonix.incident",
             "created_at": raw.get("lastUpdateDate"),
-            "raw": raw,
+            "raw_event": raw,
         }

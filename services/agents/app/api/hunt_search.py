@@ -13,16 +13,22 @@ import os
 import time
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import structlog
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
+
+from app.security.tenant_scope import require_console_or_service_auth
 
 logger = structlog.get_logger(__name__)
 
-router = APIRouter(prefix="/api/v1/hunt", tags=["hunt-search"])
+#: Default-deny. The console reaches this router directly through a Next
+#: rewrite carrying the first-party access token, so the guard resolves
+#: either that session or a trusted service declaring the tenant it acts
+#: for — a bearer-token-only scheme would lock the browser out.
+router = APIRouter(prefix="/api/v1/hunt", tags=["hunt-search"], dependencies=[Depends(require_console_or_service_auth)])
 
 # Centralized ClickHouse integration path
 _CLICKHOUSE_URL = os.getenv(
@@ -58,6 +64,18 @@ class HuntResponse(BaseModel):
     total: int
     took_ms: int
     hits: list[HuntHit]
+    #: Where the hits came from. ``sample`` means this handler generated
+    #: illustrative telemetry rather than querying anything.
+    #:
+    #: This field exists because the endpoint returns synthetic hits
+    #: unconditionally and used to say nothing about it. A 200 with no marker
+    #: read to the console as a successful live query, so the hunt workbench
+    #: rendered a green "Live backend" pill over fabricated CrowdStrike process
+    #: events. A caller must be able to tell the difference without reading
+    #: this file.
+    source: Literal["sample", "live"] = "sample"
+    #: Human-readable reason, surfaced in the UI banner.
+    notice: str | None = None
 
 
 class SavedSearchCreate(BaseModel):

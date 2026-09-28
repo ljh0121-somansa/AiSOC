@@ -121,11 +121,11 @@ Then run individual services on the host where iteration is fastest.
 ```bash
 cd services/api
 poetry install
-poetry run alembic upgrade head            # apply DB migrations
+poetry run python -m app.scripts.run_migrations   # apply DB migrations (forward-only)
 poetry run uvicorn app.main:app --reload --port 8000
 ```
 
-Browse `http://localhost:8000/docs`.
+Browse `http://localhost:8000/api/docs`.
 
 ### 4.2 Fusion (`services/fusion`)
 
@@ -201,10 +201,12 @@ Browse `http://localhost:3000`.
 ## 5. Smoke-test path (≈ 5 minutes)
 
 ```bash
-# 1. Get a token
+# 1. Get a token. AISOC_ADMIN_PASSWORD is the password `make bootstrap` printed
+#    — there is no default credential; each deployment generates its own.
 TOKEN=$(curl -s -X POST http://localhost:8000/v1/auth/login \
   -H 'content-type: application/json' \
-  -d '{"email":"admin@aisoc.local","password":"changeme"}' | jq -r .access_token)
+  -d "{\"email\":\"admin@aisoc.internal\",\"password\":\"$AISOC_ADMIN_PASSWORD\"}" \
+  | jq -r .access_token)
 
 # 2. Send a synthetic event into Kafka
 docker exec -i aisoc-kafka kafka-console-producer \
@@ -289,7 +291,7 @@ docker exec -it aisoc-neo4j cypher-shell -u neo4j -p neo4j_dev_secret
 
 ```bash
 cd services/api
-poetry run alembic upgrade head
+poetry run python -m app.scripts.run_migrations
 ```
 
 ---
@@ -298,7 +300,7 @@ poetry run alembic upgrade head
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
-| `api` container restarts | Postgres not ready or migrations failed | `docker compose logs api` and run `alembic upgrade head` |
+| `api` container restarts | Postgres not ready or migrations failed | `docker compose logs api` and run `python -m app.scripts.run_migrations` |
 | `fusion` 500 on `/ml/feedback` | DB schema missing | Run migrations (above) |
 | `agents` boot loop | No `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` | Set one in `.env`, `docker compose up -d agents` |
 | OpenSearch refuses connection | Memory ulimit | Run `sysctl -w vm.max_map_count=262144` (Linux) |

@@ -23,7 +23,9 @@ from fastapi import FastAPI
 
 from app._health import install_health_routes
 from app.api.live_actions_router import router as live_actions_router
+from app.api.replay_history_router import router as replay_history_router
 from app.api.router import router as legacy_router
+from app.api.shadow_reconcile_router import router as shadow_reconcile_router
 from app.live_actions import register_builtin_executors
 
 logger = structlog.get_logger(__name__)
@@ -47,6 +49,13 @@ app.state.mark_not_ready = _mark_not_ready
 
 app.include_router(legacy_router, prefix="/api/v1")
 app.include_router(live_actions_router, prefix="/api/v1")
+# Gap-closure Phase 1.4: the read half of the SIEM relationship. Phase 1.1 put
+# five closed-finding readers on the clients here and nothing called them.
+app.include_router(replay_history_router, prefix="/api/v1")
+# Gap-closure Phase 2.1 (D15): the same five readers, driven on a schedule by
+# the sweep in services/api, with the matcher that was previously a library
+# nothing called.
+app.include_router(shadow_reconcile_router, prefix="/api/v1")
 
 
 @app.on_event("startup")

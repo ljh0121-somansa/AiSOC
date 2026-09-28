@@ -19,9 +19,11 @@ import (
 	"github.com/beenuar/aisoc/services/ingest/internal/graph_ws"
 	"github.com/beenuar/aisoc/services/ingest/internal/handler"
 	"github.com/beenuar/aisoc/services/ingest/internal/inbox"
+	"github.com/beenuar/aisoc/services/ingest/internal/ingestauth"
 	"github.com/beenuar/aisoc/services/ingest/internal/normalizer"
 	"github.com/beenuar/aisoc/services/ingest/internal/publisher"
 	"github.com/beenuar/aisoc/services/ingest/internal/server"
+	"github.com/beenuar/aisoc/services/ingest/internal/telemetry"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -30,8 +32,8 @@ import (
 func main() {
 	// Configure structured logging. Use the human-friendly console writer
 	// in any dev-class environment (development, dev, local, demo, test) —
-	// previously this exact-matched ``ENV == "development"`` only, so
-	// ``ENVIRONMENT=development`` (the alias the Python API treats as
+	// previously this exact-matched ENV == "development" only, so
+	// ENVIRONMENT=development (the alias the Python API treats as
 	// equivalent) silently flipped this service to JSON logs and made
 	// local debugging confusing. envmode.IsDevRuntime keeps both layers
 	// in lock-step.
@@ -41,6 +43,24 @@ func main() {
 	}
 
 	log.Info().Str("service", "ingest").Msg("Starting AiSOC Ingest Service")
+
+	// Tracing. `ingest` and `realtime` were the two uninstrumented ends of
+	// the Kafka spine, so a trace started at the API stopped at the
+	// pipeline boundary — exactly where the interesting latency is. No-ops
+	// unless OTEL_EXPORTER_OTLP_ENDPOINT is set, because emitting spans
+	// into a connection error is worse than emitting none.
+	tracingCtx := context.Background()
+	shutdownTracing, err := telemetry.Setup(tracingCtx)
+	if err != nil {
+		// Degraded, not fatal: ingest is the pipeline's front door and
+		// must not refuse traffic because a collector is unreachable.
+		log.Warn().Err(err).Msg("tracing disabled — exporter could not start")
+	}
+	defer func() {
+		if err := shutdownTracing(tracingCtx); err != nil {
+			log.Warn().Err(err).Msg("tracing shutdown incomplete; recent spans may be lost")
+		}
+	}()
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -144,27 +164,81 @@ func main() {
 	// to find the matching template. Both are optional in dev (no
 	// DATABASE_DSN means /v1/inbox/* is disabled but /v1/ingest still
 	// works, so the connector path keeps running).
-	var inboxHandler *inbox.Handler
-	if cfg.InboxEnabled && cfg.DatabaseDSN != "" {
+	// One Postgres pool serves two consumers: the inbox token resolver and
+	// the /v1/ingest credential check. It is opened whenever DATABASE_DSN
+	// is set rather than only when the inbox is enabled, because turning
+	// the inbox off must not also remove the ability to authenticate a
+	// connector push.
+	var dbPool *pgxpool.Pool
+	if cfg.DatabaseDSN != "" {
 		poolCtx, poolCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		pool, err := pgxpool.New(poolCtx, cfg.DatabaseDSN)
 		poolCancel()
 		if err != nil {
-			log.Warn().Err(err).Msg("Failed to connect to Postgres for inbox; /v1/inbox/* disabled")
+			log.Error().Err(err).
+				Msg("Failed to connect to Postgres; minted ingest tokens cannot be resolved and /v1/inbox/* is disabled")
 		} else {
 			defer pool.Close()
-			store := inbox.NewStore(pool)
-			registry := inbox.NewRegistry()
-			if err := registry.Load(cfg.InboxTemplatesDir); err != nil {
-				log.Warn().Err(err).Str("dir", cfg.InboxTemplatesDir).
-					Msg("Failed to load inbox templates; /v1/inbox/* will return 503 for unknown templates")
-			}
-			log.Info().
-				Strs("templates", registry.IDs()).
-				Int64("max_body_bytes", cfg.InboxMaxBodyBytes).
-				Msg("inbox: universal-capture push paths enabled")
-			inboxHandler = inbox.NewHandler(store, registry, pub, cfg.InboxMaxBodyBytes)
+			dbPool = pool
 		}
+	}
+
+	// /v1/ingest credential check. Before this the endpoint read a tenant
+	// out of a header and authenticated nothing, so anyone who could reach
+	// the port could write alerts into any tenant.
+	var (
+		tokenStore      *inbox.Store
+		tokenResolver   ingestauth.TokenResolver
+		tenantDirectory ingestauth.TenantDirectory
+	)
+	if dbPool != nil {
+		tokenStore = inbox.NewStore(dbPool)
+		tokenResolver = tokenStore
+		tenantDirectory = ingestauth.NewTenantDirectory(dbPool)
+	}
+	auth := ingestauth.New(tokenResolver, tenantDirectory, cfg.ServiceToken, cfg.TenantHeaderKey)
+	h.SetAuthenticator(auth)
+	if auth.Configured() {
+		log.Info().
+			Bool("minted_tokens", tokenResolver != nil).
+			Bool("service_token", cfg.ServiceToken != "").
+			Msg("ingest: /v1/ingest requires an authenticated, tenant-scoped credential")
+	} else {
+		// Loud, and at error: this deployment will refuse every push. A
+		// warning here would be indistinguishable from the ordinary
+		// startup chatter an operator scrolls past.
+		log.Error().
+			Msg("ingest: no credential source configured — /v1/ingest will refuse every request. " +
+				"Set DATABASE_DSN so minted push tokens resolve, or AISOC_SERVICE_TOKEN for service-to-service pushes")
+	}
+
+	var inboxHandler *inbox.Handler
+	if cfg.InboxEnabled && tokenStore != nil {
+		registry := inbox.NewRegistry()
+		// Embedded first — these ship in the binary and are the set the
+		// service is tested against. The on-disk directory is an operator
+		// override layered on top, and is allowed to be absent.
+		if err := registry.LoadEmbedded(); err != nil {
+			log.Error().Err(err).
+				Msg("Failed to load embedded inbox templates; /v1/inbox/* will return 503 for every template")
+		}
+		if err := registry.Load(cfg.InboxTemplatesDir); err != nil {
+			log.Warn().Err(err).Str("dir", cfg.InboxTemplatesDir).
+				Msg("Failed to load inbox template overrides from disk")
+		}
+		log.Info().
+			Strs("templates", registry.IDs()).
+			Int64("max_body_bytes", cfg.InboxMaxBodyBytes).
+			Float64("rate_requests_per_second", cfg.InboxRateRequestsPerSecond).
+			Float64("rate_events_per_second", cfg.InboxRateEventsPerSecond).
+			Msg("inbox: universal-capture push paths enabled")
+		inboxHandler = inbox.NewHandler(tokenStore, registry, pub, cfg.InboxMaxBodyBytes).
+			WithLimiter(inbox.NewLimiter(
+				cfg.InboxRateRequestsPerSecond,
+				cfg.InboxRateRequestBurst,
+				cfg.InboxRateEventsPerSecond,
+				cfg.InboxRateEventBurst,
+			))
 	} else if !cfg.InboxEnabled {
 		log.Info().Msg("inbox: disabled via INBOX_ENABLED=false")
 	} else {
@@ -180,16 +254,36 @@ func main() {
 	var graphWSServer *graph_ws.Server
 	var graphWSBroker *graph_ws.Broadcaster
 	if cfg.GraphWSEnabled {
+		// One state object shared by the source and the broadcaster: the
+		// errors kafka-go reports to its own logger and the ones the consume
+		// loop sees are the same subscription failing, and splitting them
+		// across two records is how half of them stay invisible.
+		graphWSHealth := graph_ws.NewSourceState(cfg.GraphUpdatesTopic, 0)
 		src, err := graph_ws.NewKafkaSource(graph_ws.KafkaSourceConfig{
 			Brokers: cfg.KafkaBrokers,
 			Topic:   cfg.GraphUpdatesTopic,
 			GroupID: cfg.GraphWSGroupID,
+			Health:  graphWSHealth,
 		})
 		if err != nil {
 			log.Warn().Err(err).Msg("graph_ws: disabled (Kafka source init failed)")
 		} else {
-			graphWSBroker = graph_ws.New(src, graph_ws.Options{BufferSize: cfg.GraphWSSubscriberBuffer})
+			graphWSBroker = graph_ws.New(src, graph_ws.Options{
+				BufferSize: cfg.GraphWSSubscriberBuffer,
+				Health:     graphWSHealth,
+			})
 			graphWSServer = graph_ws.NewServer(graphWSBroker)
+			// /readyz names this subscription and its state. A consumer
+			// detached from its topic behind a 200 that never mentions it is
+			// indistinguishable from an idle one.
+			h.RegisterSubscription("graph_ws", func() handler.SubscriptionStatus {
+				health := graphWSBroker.Health()
+				return handler.SubscriptionStatus{
+					Attached:     health.Attached,
+					NotResolving: health.NotResolving,
+					Detail:       health.Reason(),
+				}
+			})
 			log.Info().
 				Str("topic", cfg.GraphUpdatesTopic).
 				Int("buffer", cfg.GraphWSSubscriberBuffer).

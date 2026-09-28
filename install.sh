@@ -10,7 +10,7 @@
 #   2.  Installs (idempotently) the four prerequisites AiSOC needs:
 #         - git
 #         - Docker Engine + Docker Compose v2 plugin
-#         - Node.js 20 LTS
+#         - Node.js 22 LTS
 #         - pnpm 8+ (via corepack)
 #   3.  Clones the AiSOC repo (if you ran the script as a one-liner) or
 #       reuses it (if you ran ./install.sh from inside a clone).
@@ -561,39 +561,40 @@ ensure_docker_daemon() {
   exit 2
 }
 
-# ─── Step 3: Node.js 20 LTS ──────────────────────────────────────────────────
+# ─── Step 3: Node.js 22 LTS ──────────────────────────────────────────────────
 
 ensure_node() {
-  # We need Node >= 20 because tsx 4 + the workspace's "engines" field both
-  # require it. Node 18 reaches LTS end-of-life in April 2025 so we don't
-  # support it.
-  if version_at_least node 20 "node --version"; then
+  # Node 22, the version every workflow tests on and both Node images ship.
+  # Installing 20 here handed a self-hoster a different runtime from the one
+  # the project builds and tests against, and Node 20 left security support
+  # in April 2026.
+  if version_at_least node 22 "node --version"; then
     ok "node already installed: $(node --version)"
     return 0
   fi
-  info "Installing Node.js 20 LTS via $PKG_MGR..."
+  info "Installing Node.js 22 LTS via $PKG_MGR..."
   case "$PKG_MGR" in
     apt)
       # NodeSource is the upstream-blessed apt repo for current Node releases.
-      curl -fsSL https://deb.nodesource.com/setup_20.x | $SUDO bash -
+      curl -fsSL https://deb.nodesource.com/setup_22.x | $SUDO bash -
       $SUDO apt-get install -y nodejs
       ;;
     dnf|yum)
-      curl -fsSL https://rpm.nodesource.com/setup_20.x | $SUDO bash -
+      curl -fsSL https://rpm.nodesource.com/setup_22.x | $SUDO bash -
       $SUDO "$PKG_MGR" install -y nodejs
       ;;
     pacman) $SUDO pacman -Sy --noconfirm --needed nodejs npm ;;
     zypper)
-      $SUDO zypper -n install -y nodejs20 npm20 \
+      $SUDO zypper -n install -y nodejs22 npm22 \
         || $SUDO zypper -n install -y nodejs npm
       ;;
     apk)    $SUDO apk add --no-cache nodejs npm ;;
-    brew)   brew install node@20 && brew link --overwrite --force node@20 ;;
+    brew)   brew install node@22 && brew link --overwrite --force node@22 ;;
     *) die "don't know how to install Node on PKG_MGR=$PKG_MGR" ;;
   esac
   have node || die "node install reported success but node is still not on PATH."
-  if ! version_at_least node 20 "node --version"; then
-    warn "Installed Node version ($(node --version)) is older than 20; AiSOC may misbehave."
+  if ! version_at_least node 22 "node --version"; then
+    warn "Installed Node version ($(node --version)) is older than 22; AiSOC may misbehave."
   else
     ok "node installed: $(node --version)"
   fi
@@ -731,6 +732,22 @@ ensure_env_file() {
   # in that file), so .env isn't actually load-bearing for the demo. But
   # several apps and scripts do read .env, so we make sure it exists with
   # the example defaults to avoid spurious "key not found" warnings.
+  #
+  # A plain `cp` is what this used to do, and a plain `cp` is what broke the
+  # vault: `.env.example` shipped a non-empty placeholder for
+  # AISOC_CREDENTIAL_KEY, which fails Fernet validation and turns every
+  # connector save into an HTTP 500. scripts/ensure_env.py does the copy *and*
+  # writes real random values for the secrets that need generating. It is
+  # idempotent, so it is safe to run over an existing .env.
+  if [ -x "$(command -v python3 || true)" ] && [ -f "$REPO_ROOT/scripts/ensure_env.py" ]; then
+    if python3 "$REPO_ROOT/scripts/ensure_env.py" --env "$REPO_ROOT/.env" --example "$REPO_ROOT/.env.example"; then
+      ok "$REPO_ROOT/.env is configured"
+      info "  (Optional: set OPENAI_API_KEY in $REPO_ROOT/.env to upgrade from the bundled local model.)"
+      return 0
+    fi
+    warn "scripts/ensure_env.py failed; falling back to a plain copy."
+  fi
+
   if [ -f "$REPO_ROOT/.env" ]; then
     ok ".env already exists at $REPO_ROOT/.env"
     return 0
@@ -738,7 +755,7 @@ ensure_env_file() {
   if [ -f "$REPO_ROOT/.env.example" ]; then
     cp "$REPO_ROOT/.env.example" "$REPO_ROOT/.env"
     ok "Created $REPO_ROOT/.env from .env.example"
-    info "  (Optional: edit $REPO_ROOT/.env to add your OpenAI/Anthropic API key for richer agent runs.)"
+    warn "Generated secrets were not filled in (no python3). Run: make env"
   else
     warn "No .env.example found in repo; skipping .env creation."
   fi
@@ -748,8 +765,12 @@ ensure_env_file() {
 
 run_pnpm_install() {
   info "Installing JS workspace deps (pnpm install)..."
-  ( cd "$REPO_ROOT" && pnpm install --prefer-offline --no-frozen-lockfile ) \
-    || die "pnpm install failed."
+  # `--frozen-lockfile`, the same flag CI and the web image use. Without it a
+  # self-hoster's install is free to resolve a dependency set nobody tested,
+  # which is the one thing an installer must not do quietly.
+  ( cd "$REPO_ROOT" && pnpm install --prefer-offline --frozen-lockfile ) \
+    || die "pnpm install failed. If it reported a lockfile mismatch, your checkout's
+package.json and pnpm-lock.yaml disagree — re-clone or 'git checkout pnpm-lock.yaml'."
   ok "pnpm dependencies installed."
 }
 
@@ -759,9 +780,14 @@ run_demo() {
     info "  cd $REPO_ROOT && pnpm aisoc:demo"
     return 0
   fi
-  section "Launching AiSOC demo stack"
-  info "Handing off to 'pnpm aisoc:demo' — this will pull images, start the"
-  info "stack, seed the showcase ransomware case, and open your browser."
+  section "Starting AiSOC (CORE profile)"
+  info "Starting the 10-service CORE stack: postgres, redis, kafka, ingest,"
+  info "fusion, api, agents, realtime and the web console."
+  info ""
+  info "This is the same stack 'make up' starts and the same one CI tests."
+  info "It runs the real pipeline: an event you send is normalized, placed on"
+  info "the event spine, evaluated against the detection corpus, correlated"
+  info "and written as an alert."
   echo
 
   # In non-interactive / headless contexts (CI, ssh without DISPLAY, --non-interactive),
@@ -781,36 +807,93 @@ run_demo() {
   # script. Run docker via `sg docker` if the user was just added to the
   # group and hasn't logged out — otherwise pnpm aisoc:demo will explode on
   # its very first `docker compose` call.
+  # One architecture, one command. This used to hand off to
+  # `pnpm aisoc:demo`, which started a *different* nine-service compose file
+  # with no ingest service, no fusion service and Kafka disabled — its only
+  # content came from a seed script writing rows straight into Postgres. A
+  # user followed the README, saw a populated console and concluded the
+  # platform worked, having never run the platform.
+  #
+  # `make up` is now the only path, so what the installer starts, what the
+  # README documents and what CI tests are the same stack.
   if [ "$DOCKER_NEEDS_NEWGRP" = "1" ] && have sg; then
-    # `sg` spawns a fresh shell that wipes our env, so re-export AISOC_NO_BROWSER
-    # inline if we set it.
-    local pre=""
-    [ "$need_no_browser" = "1" ] && pre="AISOC_NO_BROWSER=1 "
-    sg docker -c "cd '$REPO_ROOT' && ${pre}pnpm aisoc:demo ${DEMO_FLAGS[*]:-}" \
-      || { err "pnpm aisoc:demo exited non-zero."; exit 3; }
+    sg docker -c "cd '$REPO_ROOT' && make up" \
+      || { err "'make up' exited non-zero."; exit 3; }
   else
-    ( cd "$REPO_ROOT" && pnpm aisoc:demo "${DEMO_FLAGS[@]}" ) \
-      || { err "pnpm aisoc:demo exited non-zero."; exit 3; }
+    ( cd "$REPO_ROOT" && make up ) \
+      || { err "'make up' exited non-zero."; exit 3; }
   fi
 }
 
 # ─── Final banner ────────────────────────────────────────────────────────────
 
+# ─── Post-install verification ───────────────────────────────────────────────
+#
+# "The containers started" is not "the application works", and this installer
+# used to print a success banner purely because `pnpm aisoc:demo` exited 0.
+# A user whose pipeline was broken was told everything was fine.
+#
+# The golden pipeline posts one real event and follows it through Kafka,
+# fusion, detection and Postgres, then reads the alert back from the API. If
+# that fails, the install has failed, whatever the containers say.
+run_smoke_test() {
+  if [ "$NO_LAUNCH" = "1" ]; then
+    return 0
+  fi
+  section "Verifying the pipeline end to end"
+  local runner="$REPO_ROOT/tests/e2e/golden_pipeline/run_golden_pipeline.py"
+  if [ ! -f "$runner" ]; then
+    warn "Golden pipeline runner not found at $runner — skipping verification."
+    return 0
+  fi
+  if ! have python3; then
+    warn "python3 not on PATH — skipping pipeline verification."
+    warn "Verify manually once python3 is available:  make smoke"
+    return 0
+  fi
+
+  if ( cd "$REPO_ROOT" && python3 "$runner" ); then
+    ok "Pipeline verified: a real event became a retrievable alert."
+    return 0
+  fi
+
+  err ""
+  err "The stack started, but a real event did not become an alert."
+  err "This is a genuine failure, not a warning: AiSOC is not working yet."
+  err ""
+  err "Diagnose it with:"
+  err "    cd $REPO_ROOT && make doctor"
+  err ""
+  err "Then re-run the check:"
+  err "    make smoke"
+  exit 5
+}
+
 print_success() {
   cat <<EOF
 
-${C_BOLD}${C_GREEN}AiSOC is up and running.${C_RESET}
+${C_BOLD}${C_GREEN}AiSOC is up and running${C_RESET}${C_GREEN}, and a real event reached the API.${C_RESET}
 
   ${C_BOLD}Web console:${C_RESET}     http://localhost:3000
-  ${C_BOLD}Showcase case:${C_RESET}   http://localhost:3000/cases/INC-RT-001?tab=ledger
-  ${C_BOLD}API + Swagger:${C_RESET}   http://localhost:8000/docs
+  ${C_BOLD}API + Swagger:${C_RESET}   http://localhost:8000/api/docs
   ${C_BOLD}Realtime WS:${C_RESET}     ws://localhost:8086
 
+  ${C_BOLD}Sign in as:${C_RESET}      ${AISOC_ADMIN_EMAIL:-admin@aisoc.internal}
+  The password was printed above, once, when the administrator was created.
+  It is not stored anywhere. Lost it?  make bootstrap ARGS=--reset-password
+
 ${C_DIM}Useful commands (run from $REPO_ROOT):${C_RESET}
-  pnpm aisoc:doctor                          # health-check the stack
-  pnpm aisoc:demo:logs                       # tail logs
-  pnpm aisoc:demo:down                       # stop everything and wipe demo data
-  ./scripts/install/uninstall.sh             # full uninstall (containers + images + repo)
+  make doctor          # diagnose every dependency, with the fix for each
+  make smoke           # re-run the end-to-end pipeline check
+  make status          # every service and its health
+  make logs            # follow logs (SERVICE=fusion to narrow)
+  make demo            # load clearly-labelled synthetic data
+  make down            # stop the stack, keep your data
+  make clean           # stop the stack and delete all volumes
+  ./uninstall.sh       # full uninstall (containers + images + repo)
+
+${C_DIM}The demo dataset is synthetic. Every row is marked is_synthetic=true and
+labelled in the console. See "Real vs synthetic data" in README.md.${C_RESET}
 
 EOF
   if [ "$DOCKER_NEEDS_NEWGRP" = "1" ]; then
@@ -861,6 +944,7 @@ main() {
   ensure_env_file
   run_pnpm_install
   run_demo
+  run_smoke_test
   print_success
 }
 

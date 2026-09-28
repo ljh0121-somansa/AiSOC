@@ -7,7 +7,10 @@ license = "MIT"
 
 [tool.poetry.dependencies]
 python = "^3.11"
-fastapi = "^0.109.0"
+# Floor 0.117: below it a `-> None` handler under PEP 563 trips FastAPI's
+# "204 must not have a response body" assert at import. One range for
+# every service — see services/api/pyproject.toml for the measurement.
+fastapi = ">=0.117,<0.142"
 uvicorn = {extras = ["standard"], version = "^0.27.0"}
 pydantic = "^2.5.0"
 pydantic-settings = "^2.1.0"
@@ -26,8 +29,19 @@ aiokafka = "^0.10.0"
 mmh3 = "^4.1.0"
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^7.4.0"
-pytest-asyncio = "^0.23.0"
+# Floored at 9.0.3 for GHSA advisory coverage; the caret pins excluded it.
+# pytest-asyncio is widened to match — 0.23 predates pytest 9 and the two
+# resolve together or not at all.
+pytest = ">=9.0.3,<10.0"
+pytest-asyncio = ">=1.0,<2.0"
+
+# Same shape as services/api and services/osquery-tls rather than a third
+# strictness level. `python_version` is pinned so the finding set does not
+# move with whatever interpreter mypy happens to run on.
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true
 
 [build-system]
 requires = ["poetry-core"]

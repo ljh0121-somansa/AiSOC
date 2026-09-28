@@ -41,7 +41,15 @@ import argparse
 import pathlib
 import sys
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+# `scripts/` is on sys.path when this file is run as a program, but not when a
+# test loads it by path with importlib. gate_toolkit sits beside it either way.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+from gate_toolkit import repo_root, self_test_if_requested
+
+self_test_if_requested(__file__)
+
+REPO_ROOT = repo_root()
 PROMETHEUS = REPO_ROOT / "infra" / "docker" / "prometheus.yml"
 SERVICES_DIR = REPO_ROOT / "services"
 
@@ -87,6 +95,7 @@ THIRD_PARTY_HOSTS: set[str] = {
 # kept out of the default observability surface for cost reasons).
 # Currently empty — every instrumented service is in-scope.
 SCRAPE_EXEMPT: set[str] = set()
+
 
 def parse_prometheus() -> list[tuple[str, str, int]]:
     """Return ``[(job, host, port), ...]`` from prometheus.yml.
@@ -171,9 +180,7 @@ def main() -> int:
     args = parser.parse_args()
 
     scrape_jobs = parse_prometheus()
-    scraped_dirs = {
-        HOSTNAME_TO_SVC_DIR.get(host, host) for _, host, _ in scrape_jobs
-    }
+    scraped_dirs = {HOSTNAME_TO_SVC_DIR.get(host, host) for _, host, _ in scrape_jobs}
 
     print(f"Audit of {PROMETHEUS.relative_to(REPO_ROOT)}\n")
     print(f"{'job':<20} {'host':<18} {'port':>6}  service tree has /metrics?")
@@ -198,10 +205,7 @@ def main() -> int:
         marker = "yes" if has else "NO  <-- broken scrape"
         print(f"{job:<20} {host:<18} {port:>6}  {marker}")
         if not has:
-            drift.append(
-                f"prometheus.yml scrapes {host}:{port} but "
-                f"services/{svc_dir}/ has no /metrics handler"
-            )
+            drift.append(f"prometheus.yml scrapes {host}:{port} but services/{svc_dir}/ has no /metrics handler")
 
     print()
 
@@ -218,6 +222,24 @@ def main() -> int:
                 f"in prometheus.yml targets it (add a job_name or list "
                 f"the service in SCRAPE_EXEMPT with a written reason)"
             )
+
+    # Neither side of the invariant above says how much of the platform is
+    # instrumented at all, and that is the number people assume. Nineteen
+    # services exist; a handful expose /metrics. A scrape config that
+    # "matches reality" reads as full coverage unless reality is stated.
+    #
+    # Reported, not enforced: a worker with no HTTP surface has nothing to
+    # scrape, and failing the build over it would push someone to add an
+    # endpoint that emits nothing just to clear the gate.
+    all_services = sorted(p.name for p in SERVICES_DIR.iterdir() if p.is_dir() and not p.name.startswith("."))
+    instrumented = [s for s in all_services if has_metrics_endpoint(s)]
+    uninstrumented = [s for s in all_services if s not in instrumented]
+
+    print(f"Coverage: {len(instrumented)}/{len(all_services)} services expose /metrics.")
+    if uninstrumented:
+        print(f"  No metrics endpoint: {', '.join(uninstrumented)}")
+        print("  These emit nothing for Prometheus to scrape. That is a real gap in platform observability, not a gap in this config.")
+    print()
 
     if args.check and drift:
         print("DRIFT DETECTED:", file=sys.stderr)

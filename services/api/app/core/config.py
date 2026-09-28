@@ -23,6 +23,11 @@ INSECURE_SECRET_KEY_DEFAULTS: frozenset[str] = frozenset(
         "dev_secret_key_change_in_production",
         "changeme",
         "secret",
+        # The former realtime dev fallback. Published in this repository's
+        # history, so it is refused rather than forgotten: copying it out of an
+        # older checkout into .env must not produce a working deployment keyed
+        # on a value anyone can read.
+        "aisoc-dev-realtime-ticket-secret-not-for-production",
     }
 )
 
@@ -167,6 +172,25 @@ class Settings(BaseSettings):
     AISOC_CREDENTIAL_KEY: str = ""
     AISOC_CREDENTIAL_KEY_ROTATION_FROM: str = ""
 
+    # Envelope encryption (``vault:v2``). When enabled each secret gets its own
+    # data-encryption key, and only the *wrapped* DEK is stored alongside the
+    # ciphertext — so a database dump is useless without the ability to unwrap,
+    # and one leaked DEK exposes one secret rather than the whole vault.
+    #
+    #   off   — Fernet under AISOC_CREDENTIAL_KEY (default; ``vault:v1``)
+    #   local — DEKs wrapped by a KEK held in AISOC_CREDENTIAL_KEK. Better blast
+    #           radius than v1, but the KEK is still on the host.
+    #   aws   — DEKs wrapped by AWS KMS; the KEK never leaves the HSM.
+    #
+    # Reads are always backward compatible: a ``vault:v1`` token written before
+    # this was enabled still decrypts under AISOC_CREDENTIAL_KEY. Turning it on
+    # is therefore safe without a migration; existing rows upgrade to v2 the
+    # next time they are written.
+    AISOC_CREDENTIAL_ENVELOPE: str = "off"
+    AISOC_CREDENTIAL_KEK: str = ""
+    AISOC_CREDENTIAL_KEK_ROTATION_FROM: str = ""
+    AISOC_KMS_KEY_ID: str = ""
+
     # Internal URL for the connectors microservice. The API service proxies
     # catalog lookups (``GET /connectors``) and stateless connection tests
     # (``POST /connectors/{type}/test``) to this URL so the wizard UI can
@@ -178,25 +202,44 @@ class Settings(BaseSettings):
     CONNECTORS_SERVICE_URL: str = "http://connectors:8003"
     CONNECTORS_SERVICE_TIMEOUT_SECONDS: float = 15.0
 
+    # Internal URL of ``services/threatintel``, which polls the public feeds
+    # (CISA KEV needs no key) and holds what they collected. The console's
+    # /threat-intel page reads through ``GET /threat-intel/indicators`` here;
+    # empty disables the proxy and that route reports it rather than rendering
+    # an empty list, because an empty list and an absent service look the same
+    # to a reader and call for different things.
+    THREATINTEL_SERVICE_URL: str = "http://threatintel:8005"
+    THREATINTEL_SERVICE_TIMEOUT_SECONDS: float = 10.0
+
     # Public ingest base URL — surfaced in the wizard's "Reveal push URL"
     # response so operators get a copy-pasteable curl example. Empty
     # falls back to a relative path; production deployments should
-    # always set this (e.g. https://ingest.tryaisoc.com).
+    # always set this (e.g. https://ingest.example.com).
     INGEST_PUBLIC_URL: str = ""
 
     # Public base URL for the API service, used to build the OAuth
     # ``redirect_uri`` advertised to upstream identity providers. Must be
     # registered verbatim in each tenant's OAuth app. In production this
-    # is e.g. ``https://api.tryaisoc.com``; the callback path
+    # is e.g. ``https://api.example.com``; the callback path
     # ``/api/v1/oauth/callback`` is appended automatically. Empty
     # disables the hosted OAuth flow (start endpoint returns 503).
     OAUTH_PUBLIC_BASE_URL: str = ""
 
-    # Public base URL of the analyst console — used as the default
-    # ``return_to`` after a successful OAuth callback so the operator
-    # lands back on /onboarding with the verify-data-flowing screen
-    # already polling. Empty falls back to a relative path.
+    # Public base URL of the analyst console (e.g. https://soc.example.com) —
+    # used as the default ``return_to`` after a successful OAuth callback so
+    # the operator lands back on /onboarding with the verify-data-flowing
+    # screen already polling, and as the origin of published replay share
+    # links. Empty falls back to this install's own local console rather than
+    # to any particular deployment's hostname.
     CONSOLE_PUBLIC_BASE_URL: str = ""
+
+    # Deployment-neutral fallback for operator-facing absolute URLs
+    # (published replay links, tenant invite links) when
+    # ``CONSOLE_PUBLIC_BASE_URL`` is unset. Never hard-code a specific
+    # deployment's hostname here: a self-hosted install that emits share or
+    # invite links pointing at somebody else's console is a real leak, not a
+    # cosmetic one.
+    DEFAULT_CONSOLE_BASE_URL: str = "http://localhost:3000"
 
     # Workstream 5 (self-healing) — auto OAuth refresh worker. The
     # background loop runs inside the API process (``lifespan`` hook in
@@ -259,6 +302,92 @@ class Settings(BaseSettings):
     )
     HUNT_SCHEDULER_POLL_INTERVAL_SECONDS: int = 30
 
+    # ------------------------------------------------------------------
+    # Intel-driven retro-hunts (gap-closure Phase 8.1).
+    #
+    # Off by default at the deployment level *and* per tenant. Two switches
+    # rather than one because they answer different questions: this one is the
+    # operator's ("may this deployment consume the intel topic at all"), and
+    # ``retro_hunt_settings.enabled`` is the customer's ("may AiSOC sweep my
+    # history"). A sweep costs warehouse time and, where it reaches a
+    # connected SIEM, possibly money, so neither answer may be assumed.
+    #
+    # The topic default is the one the *producer* actually uses.
+    # ``ThreatIntelPipeline.__init__`` carries a ``threat-intel-events``
+    # default that nothing reaches, because ``services/threatintel``'s
+    # lifespan overrides it with ``KAFKA_TOPIC_THREAT_INTEL``. A consumer that
+    # subscribed to the constructor default would read an empty topic forever
+    # and report healthy while doing so, so ``scripts/check_ioc_lake_mapping.py``
+    # compares this value against that service's setting.
+    # ------------------------------------------------------------------
+    RETRO_HUNT_ENABLED: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("RETRO_HUNT_ENABLED", "AISOC_RETRO_HUNT_ENABLED"),
+    )
+    KAFKA_TOPIC_THREAT_INTEL: str = "aisoc.threat_intel"
+    RETRO_HUNT_CONSUMER_GROUP: str = "aisoc-retro-hunt"
+
+    # Retention purge worker. Applies each tenant's configured retention
+    # window by deleting aged rows from the ClickHouse lake and the Postgres
+    # alerts table.
+    #
+    # Default **off**, and dry-run when first switched on. Retention policies
+    # have been storable (and described as enforced) for several releases
+    # while nothing deleted anything, so arming this on upgrade would turn a
+    # version bump into unannounced data loss. Enable it deliberately, read
+    # the dry-run counts, then set RETENTION_WORKER_DRY_RUN=false.
+    #
+    # Only tenants with an explicit `retention_policies` row are purged; the
+    # defaults in app.services.retention pre-fill a form, they are not an
+    # instruction to delete. `audit_days` is stored but not purged — the audit
+    # log is an append-only hash chain and truncating it invalidates every
+    # subsequent verification.
+    RETENTION_WORKER_ENABLED: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("RETENTION_WORKER_ENABLED", "AISOC_RETENTION_WORKER_ENABLED"),
+    )
+    RETENTION_WORKER_DRY_RUN: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("RETENTION_WORKER_DRY_RUN", "AISOC_RETENTION_WORKER_DRY_RUN"),
+    )
+    RETENTION_WORKER_INTERVAL_SECONDS: int = 21600  # 6h
+
+    # Shadow-reconciliation sweep (gap-closure Phase 2.1, D15). Polls each
+    # measuring tenant's own SIEM for the closures their analysts made there,
+    # so a tenant whose queue lives in Splunk ES still accumulates the track
+    # record autonomy is earned on.
+    #
+    # Default **off**, per the standing rule that a feature which calls out
+    # ships off by default. Two different people are involved: a tenant
+    # enabling shadow mode has asked to be measured, and the operator of the
+    # deployment is the one who decides whether the platform may reach a
+    # third-party API on a timer. `GET /api/v1/health/shadow-reconciliation`
+    # reports "disabled" in those words rather than looking like a healthy
+    # idle sweep.
+    #
+    # Every other value here bounds what this deployment does to somebody
+    # else's SIEM: the tick cadence, a per-connector floor so a short cadence
+    # cannot become a poll storm, a cap on connectors per pass so a large
+    # estate is spread across passes, and a cap on one window so a connector
+    # that was blocked for a month catches up in steps rather than asking for
+    # the month in a single search.
+    SHADOW_RECONCILE_ENABLED: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("SHADOW_RECONCILE_ENABLED", "AISOC_SHADOW_RECONCILE_ENABLED"),
+    )
+    SHADOW_RECONCILE_INTERVAL_SECONDS: int = 900  # 15m
+    SHADOW_RECONCILE_MIN_CONNECTOR_INTERVAL_SECONDS: int = 3600  # 1h
+    SHADOW_RECONCILE_MAX_CONNECTORS_PER_TICK: int = 10
+    # Re-read this much of the previous window. A vendor's search index lags
+    # its own close events, so a window starting exactly where the last one
+    # ended steps over anything indexed late. Re-reading is free of
+    # consequence: an already-graded finding comes back as already_resolved.
+    SHADOW_RECONCILE_OVERLAP_SECONDS: int = 900  # 15m
+    # How far a first pass may reach back when a connector has no watermark.
+    SHADOW_RECONCILE_MAX_LOOKBACK_HOURS: int = 168  # 7d
+    SHADOW_RECONCILE_MAX_WINDOW_HOURS: int = 24
+    SHADOW_RECONCILE_LIMIT: int = 1000
+
     # Database
     # The default points at the bundled compose Postgres with its dev password.
     # In docker-compose.yml and .env.example the password is parameterised via
@@ -266,6 +395,20 @@ class Settings(BaseSettings):
     # this default mirrors the compose default so ``aisoc serve`` works on a
     # fresh clone with zero configuration.
     DATABASE_URL: PostgresDsn = "postgresql+asyncpg://aisoc:aisoc_dev_secret@localhost:5432/aisoc"  # type: ignore[assignment]
+
+    # The role that applies the migration chain, which is *not* the role that
+    # serves requests. ``DATABASE_URL`` points at `aisoc_app`, which holds DML
+    # only and is subject to row-level security; DDL needs the table owner.
+    #
+    # Falls back to ``DATABASE_URL`` when unset, so a deployment that has not
+    # split the roles yet behaves exactly as it did before. Where they are
+    # split and this is left unset, the migration run fails on the first
+    # ``CREATE TABLE`` with "permission denied for schema public" — a loud
+    # failure at deploy time, which is the right place for it.
+    DATABASE_MIGRATION_URL: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("DATABASE_MIGRATION_URL", "AISOC_DATABASE_MIGRATION_URL"),
+    )
     DATABASE_POOL_SIZE: int = 20
     DATABASE_MAX_OVERFLOW: int = 10
     # Recycle pooled connections before managed Postgres idle-closes them.
@@ -294,8 +437,29 @@ class Settings(BaseSettings):
     KAFKA_TOPIC_EVENTS: str = "aisoc.normalized_events"
     KAFKA_TOPIC_ALERTS: str = "aisoc.alerts"
 
-    # OpenSearch
+    # OpenSearch. This service constructs no OpenSearch client; the value is
+    # read only by esql_runner's SSRF allow-list, as the host an operator is
+    # permitted to point ES|QL at. `services/threatintel` is the only service
+    # that actually stores anything in OpenSearch.
     OPENSEARCH_URL: str = "http://localhost:9200"
+
+    # Elasticsearch fallback for single-cluster self-hosted deployments.
+    #
+    # The primary source of warehouse credentials is the tenant's own
+    # connector row, configured from the console and encrypted by the
+    # credential vault — see `app/services/event_warehouse/credentials.py`.
+    # These two settings are the deployment-wide fallback for an operator
+    # who runs one cluster shared by every tenant and does not want to
+    # register a connector.
+    #
+    # They are declared here because `esql_runner` has always read them via
+    # `getattr(settings, "ES_URL", None)` and they were never fields, so the
+    # lookup returned None on every deployment. `Settings` sets
+    # `extra="ignore"`, so exporting ES_URL did not help either: the value
+    # was discarded and the "set them in environment variables" message
+    # repeated. Declaring them makes that message true.
+    ES_URL: str | None = None
+    ES_API_KEY: str | None = None
 
     # Neo4j
     NEO4J_URI: str = "bolt://localhost:7687"
@@ -309,8 +473,6 @@ class Settings(BaseSettings):
     CORS_ORIGINS: list[str] = [
         "http://localhost:3000",
         "http://localhost:3001",
-        "https://tryaisoc.com",
-        "https://www.tryaisoc.com",
     ]
 
     # Observability
@@ -320,6 +482,18 @@ class Settings(BaseSettings):
     # Multi-tenancy
     MAX_TENANTS: int = 1000
     DEFAULT_TENANT_PLAN: str = "starter"
+
+    # Deployment-wide per-tenant ceilings, e.g.
+    # `{"connectors": 25, "seats": 50}`. Empty by default: AiSOC ships
+    # uncapped, and `app/services/entitlements.py` reports `unlimited`
+    # rather than drawing headroom against a ceiling nobody set. A
+    # tenant's own `tenants.limits` JSONB overrides anything here, in
+    # either direction.
+    #
+    # Declared as a real field rather than read with `getattr`: an
+    # undeclared setting is silently dropped by `extra="ignore"`, so an
+    # operator who exports it gets no limits and no explanation.
+    AISOC_DEFAULT_TENANT_LIMITS: dict = {}
 
     # Plugin system
     AISOC_PLUGINS_DIR: str = "/opt/aisoc/plugins"
@@ -350,6 +524,14 @@ class Settings(BaseSettings):
     REALTIME_BASE_URL: str = "http://realtime:8086"
     REALTIME_INTERNAL_TOKEN: str = ""
 
+    # services/actions — where a governed response action is actually
+    # executed. These were read inline with os.environ.get from one endpoint,
+    # which is why the default was wrong: `aisoc-actions` is the compose
+    # container_name, and the DNS name on the network is the service name,
+    # `actions`. Nothing noticed because the only caller was a fallback path.
+    AISOC_ACTIONS_BASE_URL: str = "http://actions:8085"
+    AISOC_ACTIONS_SERVICE_TOKEN: str = ""
+
     # SAML/OIDC session token signing secret. Consumed by ``app/auth/saml.py``
     # and ``app/auth/oidc.py`` to mint AiSOC session JWTs after an external
     # identity provider returns a successful authn response. We surface this
@@ -368,10 +550,11 @@ class Settings(BaseSettings):
     # fan-out auth), so the realtime edge can be rotated independently and a
     # leaked ticket secret never forges a full API session.
     #
-    # When empty in a development-class environment, both services fall back
-    # to ``DEV_REALTIME_TICKET_SECRET`` so local docker-compose "just works".
-    # Outside development the ticket endpoint fails closed (503) until a real
-    # secret is wired, and the realtime service rejects every connection.
+    # Generated by ``make up`` and passed to both this service and realtime.
+    # When empty the ticket endpoint fails closed (503) and the realtime edge
+    # rejects every connection, in every environment — there is no development
+    # fallback, because the one that used to be here was a constant committed
+    # to this repository and no manifest ever set the real secret.
     AISOC_REALTIME_JWT_SECRET: str = ""
     # Time-to-live, in seconds, for minted realtime tickets. Kept short so a
     # leaked ticket is only briefly useful; the frontend re-mints on every
@@ -423,9 +606,12 @@ class Settings(BaseSettings):
     # and the API returns 503 for endpoints that require it.
     AISOC_DISABLE_KAFKA: bool = False
     AISOC_DISABLE_CLICKHOUSE: bool = False
-    AISOC_DISABLE_OPENSEARCH: bool = False
     AISOC_DISABLE_NEO4J: bool = False
     AISOC_DISABLE_QDRANT: bool = False
+    # AISOC_DISABLE_OPENSEARCH is deliberately absent. It sat here with zero
+    # readers while three deploy configs set it and the env-var reference
+    # documented it, so an operator could switch off a subsystem this service
+    # never had. A flag that disables nothing is worse than no flag.
 
     # ------------------------------------------------------------------
     # v6 capability flags (AiSOC v6 capability roadmap).
@@ -647,17 +833,23 @@ def realtime_ticket_secret(s: Settings | None = None) -> str | None:
 
     * If ``AISOC_REALTIME_JWT_SECRET`` is set to a non-empty, non-insecure
       value, use it (any environment).
-    * Otherwise, in a development-class environment, fall back to the shared
-      ``DEV_REALTIME_TICKET_SECRET`` so local stacks work with zero config.
-    * Otherwise (production with the secret unset or set to a known insecure
-      placeholder), return ``None`` — the caller must fail closed.
+    * Otherwise return ``None`` — the caller must fail closed.
+
+    There is deliberately no development fallback. Both this and the Node
+    verifier used to fall back to ``DEV_REALTIME_TICKET_SECRET``, a constant
+    committed to this repository, and no manifest ever set the real secret or
+    the environment variable the production check read — so that constant was
+    the effective HMAC key everywhere, and anyone who could reach the realtime
+    edge could mint a ticket for any tenant (GHSA-4m55-xhcm-wjcr).
+
+    ``make up`` now generates ``AISOC_REALTIME_JWT_SECRET`` and compose passes
+    it to this service and to realtime, so local stacks still work with zero
+    manual config — on a real key rather than a published one.
     """
     s = s or settings
     configured = (s.AISOC_REALTIME_JWT_SECRET or "").strip()
     if configured and configured not in INSECURE_SECRET_KEY_DEFAULTS:
         return configured
-    if is_dev_env(s.ENVIRONMENT):
-        return DEV_REALTIME_TICKET_SECRET
     return None
 
 
@@ -760,6 +952,19 @@ def warn_if_insecure_defaults(s: Settings | None = None) -> list[str]:
 def is_production(env: str | None) -> bool:
     """True only for the literal ``production`` environment."""
     return (env or "").strip().lower() == "production"
+
+
+def console_base_url(s: Settings | None = None) -> str:
+    """Resolve the console origin used to build operator-facing absolute URLs.
+
+    Single source of truth for published-replay share links and tenant invite
+    links. Both used to carry their own hard-coded literal, which is how they
+    drifted apart *and* how a specific deployment's hostname ended up in links
+    handed to self-hosted operators. Routing both through here means a future
+    change can only move them together.
+    """
+    s = s or settings
+    return ((s.CONSOLE_PUBLIC_BASE_URL or "").strip() or s.DEFAULT_CONSOLE_BASE_URL).rstrip("/")
 
 
 class InsecureProductionDefaultsError(RuntimeError):

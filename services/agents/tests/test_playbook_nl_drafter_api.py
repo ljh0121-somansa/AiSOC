@@ -20,6 +20,7 @@ editor:
 from __future__ import annotations
 
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,9 @@ if str(_AGENTS_ROOT) not in sys.path:
     sys.path.insert(0, str(_AGENTS_ROOT))
 
 from app.api.playbooks import router as playbooks_router  # noqa: E402
+from app.security.tenant_scope import TenantPrincipal, require_console_or_service_auth  # noqa: E402
+
+_TEST_TENANT = uuid.UUID("aaaaaaaa-0000-0000-0000-00000000000a")
 
 # ---------------------------------------------------------------------------
 # Test app fixture
@@ -42,6 +46,14 @@ from app.api.playbooks import router as playbooks_router  # noqa: E402
 def client() -> TestClient:
     app = FastAPI()
     app.include_router(playbooks_router)
+    # The router is default-deny (every route carries
+    # `require_console_or_service_auth`), so these tests supply a resolved
+    # principal rather than credential material. What this file is about is
+    # the drafter's contract with the editor; that the routes refuse an
+    # anonymous caller is asserted in tests/isolation, against the real guard.
+    app.dependency_overrides[require_console_or_service_auth] = lambda: TenantPrincipal(
+        tenant_ids=frozenset({_TEST_TENANT}), subject="test"
+    )
     return TestClient(app)
 
 
@@ -58,7 +70,7 @@ def test_draft_from_nl_happy_path(client: TestClient) -> None:
     resp = _post(
         client,
         {
-            "prompt": ("When a high-severity alert fires, isolate the host " "and notify the SOC."),
+            "prompt": ("When a high-severity alert fires, isolate the host and notify the SOC."),
             "allow_llm": False,
         },
     )
@@ -147,6 +159,4 @@ def test_route_not_shadowed_by_id_param() -> None:
     # Any route containing ``{playbook_id}`` must appear AFTER nl_idx.
     for i, p in enumerate(paths_in_order):
         if p and "{playbook_id}" in p:
-            assert i > nl_idx, (
-                f"route {p!r} (idx {i}) comes BEFORE draft-from-nl (idx {nl_idx}); " f"it would shadow the NL drafter endpoint."
-            )
+            assert i > nl_idx, f"route {p!r} (idx {i}) comes BEFORE draft-from-nl (idx {nl_idx}); it would shadow the NL drafter endpoint."

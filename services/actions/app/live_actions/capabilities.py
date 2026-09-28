@@ -14,7 +14,7 @@ importing because:
 Adding a capability:
   1. Add it to ``Capability`` in ``services/connectors/app/connectors/base.py``.
   2. Add the same string here.
-  3. CI check (``services/actions/tests/test_capability_mirror.py``)
+  3. CI check (``scripts/check_action_contract.py``, ``check_capability_mirror``)
      compares the two sets and fails the build if they drift.
 
 Plugins MAY register executors for capabilities outside this set — we
@@ -63,6 +63,15 @@ KNOWN_CAPABILITIES: frozenset[str] = frozenset(
         "revoke_session",
         "revoke_token",
         "unisolate_host",
+        # Reverse verbs. Added because the action contract names them as
+        # the rollback for quarantine_file, disable_user, block_domain and
+        # block_ioc — and a declared reverse that is not in the vocabulary
+        # is worse than none, because the rollback path believes it has one.
+        "allow_domain",
+        "allow_hash",
+        "allow_ioc",
+        "enable_user",
+        "restore_file",
         # WS-E live action verbs
         "allow_ip",
         "block_ioc",
@@ -71,13 +80,41 @@ KNOWN_CAPABILITIES: frozenset[str] = frozenset(
         "force_mfa",
         "run_av_scan",
         "run_script",
+        "get_host",
+        "get_detections",
+        "get_user_activity",
         "search_siem",
+        # Gap-closure Phase 4.2: a cloud control-plane audit lookup and an
+        # indicator search over endpoint telemetry. Neither subject is a host
+        # or a principal, so neither fits the three verbs above.
+        "lookup_cloud_audit",
+        "lookup_endpoint_telemetry",
         "suspend_session",
         "sync_detection_rule",
+        # The return leg of a two-way SIEM integration: AiSOC's verdict
+        # written back onto the vendor finding that produced the alert.
+        "update_alert_disposition",
         "update_watcher",
+        # Alert lifecycle. Executors with three vendor arms each existed for
+        # both of these while neither verb appeared here, in the contracts or
+        # in the live-action registry, so governed dispatch answered
+        # executor_not_found for code that worked.
+        "ack_alert",
+        "suppress_alert",
+        # EVIDENCE. An ActionType with no executor anywhere, proposed by name
+        # on the C2 / exfiltration path — so the most serious incidents got a
+        # recommendation that answered "No executor found for action type".
+        "capture_forensics",
+        # HUMAN-IN-THE-LOOP. A working executor no adapter reached, because
+        # its honest result ("prompt delivered, nobody has answered") had no
+        # LiveActionStatus to land in.
+        "chatops_verify",
         # TICKET
         "push_case",
         "push_status",
+        "create_ticket",
+        # NOTIFY
+        "notify",
         # AUDIT
         "read_audit_trail",
     }

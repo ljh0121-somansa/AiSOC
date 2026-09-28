@@ -20,13 +20,13 @@ This document captures the planned direction for AiSOC across major versions. Al
 
 ## World-Class Hardening Program (2026-07, in flight)
 
-A proof-first, security-first program to make every README claim gate-backed, close four existential agent-security holes, and build the ingest-time-graph + multi-model-router moat. Executed one phase per PR with a mandatory CI gate each. Committed status is the checklist below (per-session working detail is tracked locally in `docs/audit/PROGRESS.md`, which is gitignored per repo convention). Baseline audit: [`docs/audit/REALITY_REPORT.md`](docs/audit/REALITY_REPORT.md) and [`docs/audit/CLAIM_TO_GATE_MATRIX.md`](docs/audit/CLAIM_TO_GATE_MATRIX.md).
+A proof-first, security-first program to make every README claim gate-backed, close four existential agent-security holes, and build the ingest-time-graph + multi-model-router moat. Executed one phase per PR with a mandatory CI gate each. Committed status is the checklist below (the six lettered deferrals — 3.5+, 5b, 7b+, 9b, 10b, 11b — are scoped in [`docs/audit/DEFERRED_SUBPHASES.md`](docs/audit/DEFERRED_SUBPHASES.md). They were previously said to be "tracked in `docs/audit/PROGRESS.md`", which is gitignored and was never committed, so six named commitments had no scope anywhere a contributor could read). Baseline audit: [`docs/audit/REALITY_REPORT.md`](docs/audit/REALITY_REPORT.md) and [`docs/audit/CLAIM_TO_GATE_MATRIX.md`](docs/audit/CLAIM_TO_GATE_MATRIX.md).
 
 - [x] Phase 0 — Reality audit (claim-to-gate matrix, ranked overclaims/untested-paths/circular-gates)
 - [x] Phase 1 — Four existential holes (prompt injection, memory poisoning, cross-store tenant isolation, data-exfiltration/redaction, cost DoS, vault)
 - [x] Phase 2 — Supply chain + truth (security.yml scanners, claim-gate ratchet, hard-fail insecure prod defaults, TRADEMARK, verifying-releases, license fix; continuation landed: per-image cosign signatures + CycloneDX SBOM attestations + SLSA provenance, all actions SHA-pinned)
 - [x] Phase 3 — Integration / E2E / chaos / DR (real-container spine test, backup-restore, chaos, upgrade, cross-store isolation live-replay; heavy-demo-stack Playwright E2E + demo-timing gate tracked as non-blocking 3.5+)
-- [ ] Phase 4 — Real evals + detection content truth table (third-party-labeled corpus, hallucination/calibration/abstention, model matrix) — **4a/4b landed** (de-circularised DAC candidate-rule gate + honest executable-vs-imported truth table); 4c+ live-agent eval / calibration / model matrix pending
+- [ ] Phase 4 — Real evals + detection content truth table (third-party-labeled corpus, hallucination/calibration/abstention, model matrix) — **4a/4b/4c landed**: de-circularised DAC candidate-rule gate; honest executable-vs-imported truth table; hallucination, abstention, calibration and containment metrics in `packages/aisoc-benchmark` with a documented adapter so a third-party agent can be graded on the same corpus; confidence calibration gated in `test_confidence_calibration.py`; and a **model matrix** (`scripts/run_model_matrix.py`) wired into the weekly wet eval, which grades the same corpus across several models by re-invoking the existing evaluator rather than defining a second notion of accuracy. **Remains open on one thing only, and it is not code:** the live-agent numbers need a funded provider key. Without one the matrix reports *not measured* per model rather than emitting zeros, because a zero is a measurement and "we did not run this" is not.
 - [x] Phase 5 — Data spine correctness (versioned event-schema registry + dead-letter queue + source-event lineage in the fusion consumer; idempotency via AlertSink dedup + event-time watermarking; backfill/replay-from-offset tracked as 5b)
 - [x] Phase 6 — Performance + cost (fusion hot-path throughput harness with a generous regression-floor gate; deterministic storage $/TB cost model + drift gate; storage-consolidation ADR-0005)
 - [x] Phase 7 — Ingest-time graph + multi-model router — **graph-at-ingest already shipped** (v8 T1.1, `services/ingest/internal/graph/`); **7a landed**: unified deterministic→ML→LLM router with tier attribution + the `AISOC_DETERMINISTIC` determinism contract (`services/agents/app/routing/model_router.py`, gated). 7b+ (posture collection, effective-permissions snapshot loader, bi-temporal valid_from/valid_to, fusion-time ContextBundle) tracked in `docs/audit/PROGRESS.md`
@@ -38,13 +38,13 @@ A proof-first, security-first program to make every README claim gate-backed, cl
 
 **Program status:** all 13 hardening phases (0–12) are landed. Building on them, the **Fully-Operational AI-SOC roadmap** (Phases A1–E1) is now complete — it wired the three end-to-end paths the reality audit found unwired and pushed the platform to competitive parity + beyond:
 
-- **Phase A (SIEM foundation):** A1 ClickHouse lake writer · A2 live detection-evaluation worker (825 executable rules on the stream) · A3 default-on one-command deploy (connectors + graph on) · A4 UEBA behavioral-model fusion.
+- **Phase A (SIEM foundation):** A1 ClickHouse lake writer · A2 live detection-evaluation worker (2603 executable rules on the stream) · A3 default-on one-command deploy (connectors + graph on) · A4 UEBA behavioral-model fusion.
 - **Phase B (SOAR foundation):** B1 auto-triage worker (copilot default) · B2 credential resolver + `decide()`-governed live dispatch + 10 vendor adapters · B3 real rollback + post-action verification + durable approval-SLA timers · B4 Business Context Rules in the hot path.
 - **Phase C (parity differentiators):** C1 Advanced Data Explorer · C2 Effective-Permissions live posture loader · C3 autopilot/copilot posture scorecard · C4 fuse-time attack-chain auto-grouping.
 - **Phase D (breadth):** D1 eight connectors (QRadar/Exabeam/Securonix/Devo/Netskope/Windows-Sysmon/Zeek-Suricata/syslog-CEF) · D2 AI/LLM-usage audit connector + `llm-*` detections + hot/cold lake tiering · D3 live-vendor mock-server smoke.
 - **Phase E (prove it):** E1 CI-gated benchmark scoreboard tied to a deterministic live-agent MITRE-accuracy run.
 
-The claim-to-gate matrix stands at **33 GATED / 7 PARTIAL / 0 NO GATE** — **every product claim is now backed by a failing test** and the ratchet (`MAX_NO_GATE=0`) forbids any regression. The 7 remaining PARTIAL rows are honest, named deferrals to phases outside the A–E scope. Per-session working detail is tracked locally in `docs/audit/PROGRESS.md`.
+The claim-to-gate matrix stands at **236 rows — 228 GATED / 8 PARTIAL / 0 NO GATE** — **every product claim is backed by a failing test** and the ratchet (`MAX_NO_GATE=0`) forbids any regression. The 8 remaining PARTIAL rows are honest, named deferrals; none was relabelled without building the gate it names. Count the table rows with `python3 scripts/check_claim_gate_matrix.py` rather than trusting a figure quoted in prose — this line has gone stale before. The six lettered deferrals are scoped in [`docs/audit/DEFERRED_SUBPHASES.md`](docs/audit/DEFERRED_SUBPHASES.md).
 
 ## v4.0 — Shipped
 
@@ -56,9 +56,26 @@ The claim-to-gate matrix stands at **33 GATED / 7 PARTIAL / 0 NO GATE** — **ev
 - [x] Eval harness: 20 synthetic incidents, ≥80% MITRE-tactic accuracy CI gate
 
 ### Visual SOAR studio
-- [x] React Flow playbook editor with full node palette (Trigger, Condition, Action, Loop, Parallel, Human Approval, Wait, Notify)
-- [x] DAG playbook engine with retries, idempotency, blast-radius checks
-- [x] `playbook.schema.json` (JSON Schema 2020-12) for portability and CI linting
+- [x] React Flow playbook editor over nine of the step types the engine
+      implements (enrich, investigate, notify, block_ip, isolate_host,
+      create_ticket, close_case, http, condition). The engine accepts 22 and
+      runs 21; widening the palette to the rest is outstanding. Loop,
+      Parallel, Wait and Human Approval were listed here and exist in neither
+      the palette nor the engine.
+- [x] Sequential playbook engine with conditions, branching, retries and
+      cycle detection. Not a DAG: there is no `depends_on` and no parallel
+      execution, and there are no idempotency keys.
+- [x] Step-level risk grading, by dispatch rather than by a schema field.
+      A step naming a response verb is dispatched to the action registry and
+      graded against that verb's capability contract — impact, reversibility,
+      approval requirement, verification probe — plus the tenant's autonomy
+      tier and the finding's confidence. Per step, so authorising a playbook
+      does not authorise what its steps contain. The old `blast_radius` step
+      field promised this and was declared by a schema the engine could not
+      read; it has been removed rather than left as a promise.
+- [x] `schemas/playbook.schema.json` (JSON Schema draft-07) for portability
+      and CI linting, held to the engine in both directions by
+      `scripts/check_playbook_schema_parity.py`
 - [x] Detection-as-Code: `detections/` directory with Sigma + AiSOC YAML, GitHub Action deploy-on-merge
 - [x] 12 starter playbook templates
 - [x] Community playbook marketplace (static index v4.0; publishing flow v4.1)
@@ -70,7 +87,7 @@ The claim-to-gate matrix stands at **33 GATED / 7 PARTIAL / 0 NO GATE** — **ev
 - [x] Public REST API v1 at `/api/v1`, OpenAPI 3.1 at `docs/openapi.yaml`
 - [x] GraphQL gateway (Strawberry) proxying REST
 - [x] Scoped API tokens (`cases:read`, `playbooks:run`, `plugins:install`)
-- [x] Auto-generated client SDKs: `@aisoc/sdk` (TypeScript), `aisoc-sdk` (Python/PyPI), `github.com/beenuar/aisoc/sdk-go`
+- [x] Auto-generated client SDKs: `@aisoc/sdk` (TypeScript), `aisoc-sdk` (Python/PyPI), `github.com/beenuar/AiSOC/packages/sdk-go`
 - [x] Docusaurus docs site at `docs/site/`, deployed to GitHub Pages
 - [x] Demo Lab: `pnpm aisoc:lab` one-command full-stack + Conti-style ransomware scenario
 - [x] 4 reference plugins: Okta connector, YARA enricher, Slack quarantine responder, MTTR sparkline widget
@@ -177,8 +194,8 @@ SOAR platforms drove this release.
 
 ### New console pages (`apps/web/src/components/`)
 
-- [x] `/investigate` — conversational, multi-turn investigation copilot
-- [x] `/coverage-advisor` — MITRE ATT&CK gap ranking by adversary prevalence
+- [x] `/investigate` — redirects to `/hunt`; the multi-turn copilot is `CopilotDock` and `/copilot`
+- [x] `/coverage-advisor` — ATT&CK techniques your rules reference, ranked by enabled coverage (not by adversary prevalence)
 - [x] `/shifts` — analyst shift-handoff dashboard
 - [x] `/easm` — External Attack Surface Management
 - [x] `/mssp` — MSSP executive dashboard
@@ -230,8 +247,24 @@ Implemented and reviewed by Beenu Arora <beenu@cyble.com>.
 - [x] Case auto-summary + PDF export (`case_summary.py` + `case_summary_html.py`)
 - [x] Investigation timeline (replayable) (`InvestigationTimeline.tsx`)
 - [x] Playbook gallery with 12 curated packs + GitHub PR integration for detection proposals
-- [ ] Mobile responder console (React Native) — triage and acknowledge from phone _(deferred to v8.0)_
-- [ ] Plugin publishing marketplace v3 (commercial plugins, revenue sharing) _(deferred to v8.0)_
+- [x] Mobile responder console — decide an approval from a phone
+      _(shipped in v9.0. The "not started" note this line used to carry was
+      true about React Native and misleading about the product: the responder
+      console already existed as a **PWA** — nine routes under
+      `apps/web/src/app/(responder)/`, a service worker, an IndexedDB offline
+      approval queue, Web Push with VAPID, and passkeys. `apps/mobile` is a
+      distribution channel on top of that, and it exists for one reason worth
+      the build: iOS Web Push requires an installed PWA and has been
+      unreliable even then, which for "approve a containment from your phone"
+      is the same as the feature not existing. Its `src/lib` unit tests and
+      type-check run in CI; **no device build, simulator run or store
+      submission has been performed**, and APNs/FCM credentials are an
+      account action rather than an engineering one — see
+      `apps/mobile/README.md`.)_
+- [ ] Plugin publishing marketplace v3 (commercial plugins, revenue sharing)
+      _(deferred past v8.0; **not started**. Revenue sharing is a commercial
+      decision rather than an engineering one, and the free packaging path is
+      itself still blocked on registry credentials — see v8.1.)_
 
 ---
 
@@ -445,7 +478,7 @@ Terraform skeleton equivalent to the existing AWS module.
       off `auditd_key` for sudoers / SSH / kernel-module / systemd
       tampering. 444-test full connectors suite green (excluding
       `test_scheduler.py` which needs the `apscheduler` dev dep).
-- [x] Connector registry now declares **83 first-party connectors**;
+- [x] Connector registry now declares **84 first-party connectors**;
       `pnpm marketplace:sync` rebuilt `marketplace/index.json` +
       `apps/web/public/marketplace/index.json`.
 
@@ -558,19 +591,269 @@ Terraform skeleton equivalent to the existing AWS module.
 
 ---
 
-## v8.0 — Planned
+## v8.0 — Shipped (2026-09-22)
 
-- Mobile responder console (React Native) — triage and acknowledge from phone
-- Plugin publishing marketplace v3 (commercial plugins, revenue sharing)
-- MSSP RBAC enforcement on `/api/v1/actors/*` endpoints (threat attribution)
+v8.0 shipped as the **close-the-loop** release rather than the feature list
+below. It had been reserved for the package-publish milestone, but nothing can
+publish without registry credentials, so packaging moved out (see v8.1) and the
+release instead wired capabilities the codebase already contained and never
+called. What v8.0 actually delivered is recorded under `[8.0.0]` in
+[`CHANGELOG.md`](CHANGELOG.md) and summarised in [`RELEASES.md`](RELEASES.md).
+
+Disposition of every item that had been listed against v8.0:
+
 - ~~Automated IOC sharing to community MISP instances via STIX/TAXII push~~ → **shipped in v7.2.0**
 - ~~NL→query: "show me failed logins from new ASNs last 24h" → ES|QL / KQL~~ → **shipped in v7.2.0** (deterministic translator + 50-pair eval set)
-- AI-generated threat intelligence briefings from public feeds
-- Embedded red-team scoring (ATT&CK coverage %) as a live dashboard widget
-- SLA breach predictor (ML model on historical MTTR data)
-- Incident cost estimator (breach impact calculator)
 - ~~SOC-in-a-box one-click cloud deploy (Terraform module for AWS / GCP)~~ → **GCP module shipped in v7.2.0** (AWS already shipped)
 - ~~Automated retro/blameless post-mortem drafting from case timeline~~ → **shipped in v7.2.0** (ideas backlog item promoted)
+- Mobile responder console (React Native) — **not started**, deferred; see the
+  note under v7.0 above. No React Native code exists in the tree.
+- Plugin publishing marketplace v3 (commercial plugins, revenue sharing) —
+  **not started**, deferred. Revenue sharing is a commercial decision rather
+  than an engineering one, and the free packaging path is itself still blocked
+  on registry credentials.
+- MSSP RBAC enforcement on `/api/v1/actors/*` (threat attribution) — **shipped
+  in v7.5.0** as part of the threat-actor attribution RBAC + port fix.
+- AI-generated threat intelligence briefings from public feeds — **open**, not
+  scheduled.
+- Embedded red-team scoring (ATT&CK coverage %) as a live dashboard widget —
+  **open**, not scheduled. The underlying coverage heatmap shipped in v5.1; the
+  dashboard widget did not.
+- SLA breach predictor (ML model on historical MTTR data) — **open**, not
+  scheduled.
+- Incident cost estimator (breach impact calculator) — **open**, not scheduled.
+
+---
+
+## v8.1 — Shipped (2026-09-23)
+
+Wave-2 features plus release integrity. Every backlog item was audited against
+the tree before any code was written, and the backlog was wrong in both
+directions: two items were already built, and four had the capability present
+with the path that feeds it broken. Two remain partial and say so — the two
+attack-chain implementations still never exchange data, and ChatOps still has
+no proactive card push or durable approval store.
+
+Full inventory under `[8.1.0]` in [`CHANGELOG.md`](CHANGELOG.md). Tracked in
+[`docs/roadmap/v8-progress.md`](docs/roadmap/v8-progress.md) and, for the
+community-facing view, issue
+[#362](https://github.com/beenuar/AiSOC/issues/362).
+
+**Packaging is not in v8.1 either, and the reason is worth stating plainly:**
+`release.yml` already builds, packs and would upload all eight packages — the
+npm and PyPI jobs are written and run on every tag. The repository's only
+secret is `FLY_API_TOKEN`. There is no `NPM_TOKEN` and no PyPI trusted
+publisher, so the upload steps skip with a warning by design rather than
+failing the release. This is an account action, not an engineering task, and
+promising it in a release that cannot perform it is the kind of claim this
+project's claim-to-gate matrix exists to prevent. Packaging is therefore named
+against **v8.2**, and it becomes a re-tag the moment the credentials exist.
+
+---
+
+## v8.1.1 — Shipped (2026-09-23)
+
+An adoption audit, and no new capability. The recurring feedback on this
+project — hard to install, fabricated data, architecture nobody could follow,
+documentation describing things a reader could not reproduce — turned out to
+share one root cause: **the documented quick start did not run the product.**
+`./install.sh` started a compose file with no ingest service, no fusion
+service and `AISOC_DISABLE_KAFKA: true`, and the populated console a reader
+saw was a seed script writing rows into Postgres.
+
+The pipeline itself works. It had simply never been demonstrated, and now
+`make smoke` demonstrates it on every CI run: one real event through ingest,
+Kafka, fusion and detection, read back from the API, eight stages each
+reporting independently.
+
+Also in this release: `/readyz` on `services/ingest` that dials Kafka rather
+than answering unconditionally, `make doctor`, CORE as the default ten-service
+profile, five fabricated-data surfaces gated behind demo mode, the three
+packages that could not be built at the v8.1.0 tag, and three new documents —
+`docs/audit/REPOSITORY_REALITY.md`, a data-flow rewrite of
+`docs/architecture/README.md`, and `docs/testing/CLEAN_INSTALL.md`.
+
+Full inventory under `[8.1.1]` in [`CHANGELOG.md`](CHANGELOG.md).
+
+---
+
+## v11.1 — Shipped (2026-09-25)
+
+One user's bug report, and the audit it turned into. A self-hoster bringing
+AiSOC up with Compose on a single host reported that it "always deploys the
+demo environment, even if I add the right variables". They were right, for two
+independent reasons. `next build` freezes *both* halves of the console's
+routing — `NEXT_PUBLIC_*` values are inlined into the bundle and the
+destinations returned by `rewrites()` are compiled into
+`routes-manifest.json` — so a pulled image could only ever talk to the hosts
+it was built against, while `docker-compose.yml` set the variables on the web
+service where nothing read them. And every host port published to a literal
+`127.0.0.1`, so the stack came up healthy and unreachable from anywhere but
+the machine it ran on. The console's addresses are now resolved when the
+container starts, and an address that is set and cannot be applied stops the
+container rather than silently falling back.
+
+**A minor: nothing here requires an operator to act.** Every new variable
+defaults to the behaviour that was previously compiled in, and the only
+removals are two variables the console never read.
+
+The second root cause was that the fix would have shipped to nobody. The
+console image a quickstart pulls was built from a commit two releases behind
+`main` and `aisoc-web:v11.0.0` was never pushed at all, while the rest of that
+release was — every workflow green throughout, because a green workflow says a
+job ran, not that the registry holds anything. The cause was arm64
+cross-building under QEMU, measured at roughly 7x on a good run and
+non-converging on a bad one: one arm64 `pnpm install` ran 6,358 seconds
+without finishing while the amd64 leg of the same build took 100s. Both
+publish workflows now build each architecture natively and merge the results
+into a manifest list, and `scripts/check_published_images.py` asks the
+registry whether every image the compose file, the chart and the docs name is
+actually there — 14 findings against `main` before it existed. The Helm chart
+could not have installed at all, and `aisoc-honeytokens`, `aisoc-purple-team`
+and `aisoc-osquery-tls` are published here for the first time.
+
+Also in this release: a recorded 2 min 57 s deployment walkthrough against the
+published images, with real data and real token counts. Both triage runs in it
+fell back to the deterministic path because the bundled 3B model's output
+failed schema validation — the closing card says so. No hosted provider has
+been exercised; there is still no funded key.
+
+Full inventory under `[11.1.0]` in [`CHANGELOG.md`](CHANGELOG.md).
+
+---
+
+## v11.2 — Shipped (2026-09-26)
+
+The answer to a question this repository had been asked for months: why 833
+executable rules against a library of roughly 7,000? Not a missing feature —
+Windows events nest their payload under `System`/`EventData`, one level below
+anything the engine flattened, so `CommandLine` (2,173 rules) and `Image`
+(2,300 rules) read `None` and no Windows rule could fire however correctly it
+was written. The fix is in `windows_event.normalize()`, because those are
+names from the Windows event schema and the engine is shared by every
+connector; the engine and matcher are byte-identical.
+
+**The engine now runs 2,603 rules, and every added rule was watched to fire.**
+`scripts/sigma_compiler.py` translates imported Sigma into `match_when` or
+refuses: of 3,132 rules considered, 1,770 ship and 1,362 are refused with a
+recorded reason. The largest refusals are 556 whose log source no connector
+emits and 464 whose negation would flip on a missing field, since Sigma treats
+`not filter` as true when the field is absent and only two matcher operators
+do. A rule enters the compiled ruleset only after a vendor-shaped event has
+been replayed through the real connector and the real engine and produced a
+hit, with an empty event of the same shape producing nothing — and
+`compile_sigma_ruleset.py --prove-gate` reverts the connector and requires all
+1,687 Windows rules to stop firing, so the proof is known to be able to fail.
+It is a claim about reachability, not about detection.
+
+**A minor: nothing here requires an operator to act.** No configuration
+change, no migration, no API change; the connector fix only adds fields and a
+normalized key still wins on collision. The detection surface is 3.1x wider
+though, so a deployment with Windows telemetry should expect more alerts from
+the same stream; `upstream_status` travels onto the alert so the 125
+`experimental` rules can be filtered without disabling the rest.
+
+Also here: upstream lifecycle status no longer gates execution (fireability
+does), all 122 previously phantom-enabled rules are resolved, windowed
+aggregation rules went from 10 to 18, and auto-triage asks the provider for
+JSON rather than correcting prose afterwards — measured 44/50 to 50/50 on the
+bundled local model. Four counters that still classified rules by directory
+were moved onto the compiled ruleset, which is what closed the long-standing
+disagreement between the validator, the coverage page, the marketplace index
+and the truth table.
+
+Full inventory under `[12.0.0]` in [`CHANGELOG.md`](CHANGELOG.md).
+
+---
+
+## v11.0 — Shipped (2026-09-25)
+
+What a first run actually produced. Most of this was found by bringing the
+stack up from the documented path and photographing the result, and nearly
+every item passed the existing test suite while failing on a real deployment.
+Following the README broke the credential vault, because `cp .env.example .env`
+wrote a placeholder the vault treats as fatal while treating *empty* as fine.
+`make up` then reported the stack broken on every machine, scoring the one-shot
+model pull's normal exit as a dead container. And the profile a new user runs
+had no real data and no model behind it, which is also why the console's threat
+page had recently been caught rendering invented indicators: the missing feed
+and the fabrication were one hole.
+
+**A major because upgrading requires action on two items.** `POST /v1/ingest`
+and `POST /v1/ingest/batch` now require a credential and take the tenant from
+it, where they previously read `X-Tenant-ID` and believed it — so anyone who
+could reach the port could write alerts into any tenant. And CORE now needs
+**8 GB of memory and 20 GB of free disk**, up from `~6.5 GB`, because the
+threat-intelligence feed, its vector store and a local model moved into it.
+
+Re-measured rather than restated: CORE is 16 long-running services plus a
+one-shot model pull and `full` is 22; resident memory for the whole stack went
+1.72 GiB → 4.84 GiB. A fresh `make up` now holds 1,723 real CISA KEV entries
+within a minute of boot with no credentials, and runs triage against a bundled
+3B model — which returned usable triage output **44 times in 50 before its reply
+was constrained to a JSON object, and 50 of 50 after**, the remainder falling
+back to the deterministic path and logging that they had. No hosted provider has
+been exercised; there is still no funded key.
+
+Full inventory under `[11.0.0]` in [`CHANGELOG.md`](CHANGELOG.md).
+
+---
+
+## v10.0 — Shipped (2026-09-25)
+
+An audit of one shape: a control that exists, is tested, and sits on a path
+nothing reaches. Row-level security covered 92 tables and filtered nothing,
+because every service connected to Postgres as a superuser. Fifty-eight routes
+across four services carried no authentication at all, and thirty more let the
+caller name the tenant they were reading. UEBA reported healthy and could not
+write a baseline or an anomaly. AI triage was wired to a gateway that both of
+its resolvers had been deliberately written to ignore.
+
+**A major because upgrading requires action.** Services now connect as a
+DML-only `aisoc_app` role rather than as the schema owner, which is what makes
+those 92 policies filter; an existing data volume or a managed database must be
+migrated deliberately. Also breaking: the `/mssp/*` payloads dropped fields
+that described fabricated data and now refuse a non-member, two executor-less
+`ActionType` members were removed, `CostTracker.total_cost_usd` is gone, and
+the published `aisoc-web:latest` image no longer carries demo mode — the demo
+build moved to its own tag.
+
+Two published figures were re-measured rather than restated: CORE is 11
+services (the LLM gateway moved into it) and `full` is 21, not 30. The quick
+start now ends by creating an administrator and printing a generated password
+once, because the credential pair the documentation published was wrong in
+three independent ways.
+
+Full inventory under `[10.0.0]` in [`CHANGELOG.md`](CHANGELOG.md).
+
+---
+
+## v9.0 — Shipped (2026-09-23)
+
+Ten waves of one audit question: what in this tree exists, is tested, and has
+no caller? v8.0 named that shape and found it a dozen times; v9.0 went looking
+for it deliberately and found it in the approval loop, the marketplace, the
+mobile console, the detection engine and the benchmark scoreboard.
+
+The one worth stating first inverts what the feature appeared to do:
+**approving an action executed nothing.** `decide()` flipped a row and never
+reached the execution service, so every tap of Approve recorded a decision and
+ran nothing — while telling the operator the opposite. Nothing ever created an
+approval either, so the queue had no producer and was structurally empty on
+every deployment.
+
+Also: UEBA consumed a topic nothing writes; a plugin could never be rejected
+for a bad signature; there was no registry allow-list and no digest pinning,
+both of which the notes claimed existed; the public scoreboard was frozen for
+ten weeks with every check passing; neither published Go SDK was installable;
+and the Helm chart did not render at all.
+
+What is knowingly still open is listed under `### Known` in `[9.0.0]` —
+eight `PARTIAL` matrix rows, the migration-on-existing-volume path, 133
+unreachable detection rules, and the OCI install route held back rather than
+shipped with eight unresolved high findings.
+
+Full inventory under `[9.0.0]` in [`CHANGELOG.md`](CHANGELOG.md).
 
 ---
 

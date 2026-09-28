@@ -19,9 +19,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
 from app.models.pack_assignment import OsqueryPackAssignment
+from app.security.tenant_scope import (
+    TenantPrincipal,
+    require_console_or_service_auth,
+    scoped_tenant_or_403,
+)
 from app.services.pack_loader import OsqueryPack, get_all_packs, get_pack
 
 router = APIRouter(tags=["packs"])
+
+#: The console reaches this service directly through a Next rewrite, so the
+#: FIM and pack surfaces are internet-reachable. The tenant comes from the
+#: caller's credential; a `tenant_id` on the request is a filter intersected
+#: with it, never a selector.
+ScopedPrincipal = Annotated[TenantPrincipal, Depends(require_console_or_service_auth)]
 
 
 # ---------------------------------------------------------------------------
@@ -87,13 +98,13 @@ class PackAssignmentOut(BaseModel):
 
 
 @router.get("/packs", response_model=list[PackOut])
-async def list_packs() -> list[PackOut]:
+async def list_packs(principal: ScopedPrincipal) -> list[PackOut]:
     """Return all packs loaded from the on-disk YAML catalog."""
     return [PackOut.from_pack(p) for p in get_all_packs()]
 
 
 @router.get("/packs/{pack_id}", response_model=PackOut)
-async def get_pack_detail(pack_id: str) -> PackOut:
+async def get_pack_detail(pack_id: str, principal: ScopedPrincipal) -> PackOut:
     """Return a single pack by id."""
     pack = get_pack(pack_id)
     if pack is None:
@@ -104,6 +115,7 @@ async def get_pack_detail(pack_id: str) -> PackOut:
 @router.get("/packs/{pack_id}/render")
 async def render_pack(
     pack_id: str,
+    principal: ScopedPrincipal,
     format: Annotated[
         Literal["osquery-json", "osctrl", "fleetdm"],
         Query(description="Target render format"),
@@ -136,9 +148,11 @@ async def render_pack(
 async def assign_pack(
     tenant_id: str,
     body: PackAssignRequest,
+    principal: ScopedPrincipal,
     db: AsyncSession = Depends(get_db),
 ) -> PackAssignmentOut:
     """Assign (or update) an osquery pack for a tenant."""
+    tenant_id = str(scoped_tenant_or_403(principal, tenant_id))
     if get_pack(body.pack_id) is None:
         raise HTTPException(status_code=404, detail=f"Pack '{body.pack_id}' not found in catalog")
 
@@ -176,9 +190,11 @@ async def assign_pack(
 @router.get("/tenants/{tenant_id}/packs", response_model=list[PackAssignmentOut])
 async def list_tenant_packs(
     tenant_id: str,
+    principal: ScopedPrincipal,
     db: AsyncSession = Depends(get_db),
 ) -> list[PackAssignmentOut]:
     """List all pack assignments for a tenant."""
+    tenant_id = str(scoped_tenant_or_403(principal, tenant_id))
     result = await db.execute(select(OsqueryPackAssignment).where(OsqueryPackAssignment.tenant_id == tenant_id))
     rows = result.scalars().all()
     return [
@@ -195,9 +211,11 @@ async def list_tenant_packs(
 async def remove_pack_assignment(
     tenant_id: str,
     pack_id: str,
+    principal: ScopedPrincipal,
     db: AsyncSession = Depends(get_db),
 ) -> None:
     """Remove a pack assignment from a tenant."""
+    tenant_id = str(scoped_tenant_or_403(principal, tenant_id))
     await db.execute(
         delete(OsqueryPackAssignment).where(
             OsqueryPackAssignment.tenant_id == tenant_id,

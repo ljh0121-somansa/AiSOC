@@ -11,7 +11,7 @@ import { InvestigationRail } from './InvestigationRail';
 import { EmptyState, EmptyStateIcons } from '@/components/ui/EmptyState';
 import { ErrorState } from '@/components/ui/ErrorState';
 import { SavedViewsBar } from '@/components/saved-views/SavedViewsBar';
-import { isDemoMode } from '@/lib/demoMode';
+import { demoFallback } from '@/lib/demoFallback';
 
 // Wave 1 of the AiSOC v6 capability roadmap. The "entities" tab renders the
 // rolled-up Risk-Based Alerting queue — alerts contribute time-decayed risk
@@ -84,7 +84,10 @@ const MOCK_ALERTS: Alert[] = Array.from({ length: 25 }, (_, i): Alert => {
     mitreAttack: i % 3 === 0 ? [{ tactic: 'Execution', technique: 'PowerShell', techniqueId: 'T1059.001' }] : [],
     riskScore: ((i * 37 + 13) % 100),
     confidenceLabel: conf,
-    confidenceScore: Number(confScore.toFixed(2)),
+    // Canonical 0-100 scale, matching what `normalizeAlert` emits for a real
+    // alert. Sample data on a different scale than the real payload is how the
+    // `2100%` render passed review.
+    confidenceScore: Math.round(confScore * 100),
   };
 });
 
@@ -269,12 +272,12 @@ export function AlertsView() {
     ['alerts', filters],
     () => alertsApi.list(filters),
     {
-      fallbackData: demo ? {
+      fallbackData: demoFallback({
         alerts: MOCK_ALERTS,
         total: MOCK_ALERTS.length,
         page: 1,
         pageSize: 25,
-      } : undefined,
+      }),
       refreshInterval: 30000,
     }
   );

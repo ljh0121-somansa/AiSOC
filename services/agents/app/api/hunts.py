@@ -24,14 +24,19 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.hunt import HuntCorpus
 from app.hunt import scheduler as hunt_scheduler
 from app.hunt import store as hunt_store
+from app.security.tenant_scope import require_console_or_service_auth
 
 logger = logging.getLogger("aisoc.api.hunts")
-router = APIRouter(prefix="/api/v1/hunts", tags=["hunts"])
+#: Default-deny. The console reaches this router directly through a Next
+#: rewrite carrying the first-party access token, so the guard resolves
+#: either that session or a trusted service declaring the tenant it acts
+#: for — a bearer-token-only scheme would lock the browser out.
+router = APIRouter(prefix="/api/v1/hunts", tags=["hunts"], dependencies=[Depends(require_console_or_service_auth)])
 
 
 def _hunt_summary(h: Any) -> dict[str, Any]:
@@ -70,6 +75,22 @@ async def list_hunts() -> list[dict[str, Any]]:
     return [_hunt_summary(h) for h in corpus.list()]
 
 
+@router.get("/runs", summary="Recent hunt runs")
+async def list_runs(
+    limit: int = Query(default=50, ge=1, le=500),
+) -> list[dict[str, Any]]:
+    return await hunt_store.list_recent_runs(limit=limit)
+
+
+@router.get("/findings", summary="Recent hunt findings")
+async def list_findings(
+    hunt_id: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> list[dict[str, Any]]:
+    return await hunt_store.list_recent_findings(hunt_id=hunt_id, status=status, limit=limit)
+
+
 @router.get("/{hunt_id}", summary="Get a single hunt definition")
 async def get_hunt(hunt_id: str) -> dict[str, Any]:
     corpus = HuntCorpus.default()
@@ -104,19 +125,3 @@ async def run_hunt(hunt_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Read-side (DB-backed)
 # ---------------------------------------------------------------------------
-
-
-@router.get("/runs", summary="Recent hunt runs")
-async def list_runs(
-    limit: int = Query(default=50, ge=1, le=500),
-) -> list[dict[str, Any]]:
-    return await hunt_store.list_recent_runs(limit=limit)
-
-
-@router.get("/findings", summary="Recent hunt findings")
-async def list_findings(
-    hunt_id: str | None = Query(default=None),
-    status: str | None = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=500),
-) -> list[dict[str, Any]]:
-    return await hunt_store.list_recent_findings(hunt_id=hunt_id, status=status, limit=limit)

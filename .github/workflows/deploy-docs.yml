@@ -22,7 +22,7 @@ jobs:
     name: Build Docusaurus
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
 
@@ -32,15 +32,25 @@ jobs:
       # "Multiple versions of pnpm specified ... ERR_PNPM_BAD_PM_VERSION".
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
 
       - name: Install dependencies
-        run: pnpm --filter @aisoc/docs install
+        # `--frozen-lockfile` like every other install of this workspace. A
+        # filtered install is still an install: without the flag the published
+        # docs site could be built from a dependency set no other job resolved.
+        run: pnpm --filter @aisoc/docs install --frozen-lockfile
 
+      # Set explicitly rather than leaning on the defaults in
+      # docusaurus.config.ts. These values decide the canonical <link>, the
+      # sitemap and every absolute asset URL, so a silent default drift would
+      # de-index the docs without failing a build.
       - name: Build docs
+        env:
+          DOCS_URL: https://beenuar.github.io
+          DOCS_BASE_URL: /AiSOC/
         run: pnpm --filter @aisoc/docs build
 
       - name: Upload artifact
@@ -58,4 +68,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5

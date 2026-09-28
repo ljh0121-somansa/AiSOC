@@ -29,12 +29,22 @@
     "openapi-typescript": "^7.0.0",
     "tsup": "^8.0.0",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.6"
+    "vitest": "^4.1.11"
   },
   "peerDependencies": {
     "typescript": ">=5.0.0"
   },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "provenance": true
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/beenuar/AiSOC.git",
+    "directory": "packages/sdk-ts"
+  },
+  "homepage": "https://beenuar.github.io/AiSOC/",
+  "bugs": {
+    "url": "https://github.com/beenuar/AiSOC/issues"
   }
 }

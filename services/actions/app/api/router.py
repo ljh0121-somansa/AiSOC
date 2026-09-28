@@ -13,14 +13,23 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
 
 from app.core.config import get_settings
-from app.models.action import ActionPrincipal, ActionRequest, ActionStatus, ActionType
+from app.models.action import (
+    ActionPrincipal,
+    ActionRequest,
+    ActionStatus,
+    ActionType,
+    ChatOpsApprover,
+)
 from app.security.authz import (
     ActionAuthzError,
     authorize_action,
     authorize_approver,
     require_service_auth,
 )
+from app.security.chatops_identity import resolve_approver
 from app.security.chatops_token import ChatOpsTokenError, verify_token
+from app.services import action_store
+from app.services.approval_gate import apply_matrix
 from app.services.blast_radius import BlastRadiusGate
 from app.services.executor_registry import EXECUTOR_REGISTRY
 from app.services.timeline_client import TimelineClientError, post_timeline_event
@@ -29,8 +38,11 @@ logger = structlog.get_logger()
 router = APIRouter()
 gate = BlastRadiusGate()
 
-# In-memory action store (replace with DB in production)
-_actions: dict[str, dict[str, Any]] = {}
+# The module-global `_actions` dict that used to live here is gone; storage is
+# `app.services.action_store`, which persists to Postgres when a DSN is
+# configured. A restart used to lose every action awaiting approval, so an
+# analyst tapping Approve on a Slack card got "Action not found" for an
+# incident that was still live. Tests reset state with `action_store.clear()`.
 
 # Replay-protection set: action IDs that have already received a response.
 # Single-use enforcement is layered on top of HMAC + expiry. Anything more
@@ -50,6 +62,11 @@ async def submit_action(request: ActionRequest, _auth: None = Depends(require_se
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     status, blast_radius, reason = gate.evaluate(request)
+    # Second axis: confidence against the action's declared impact, under the
+    # tenant's autonomy tier. The matrix that implements this was written,
+    # tested, and called by nothing — so the gate the docs described was not
+    # the gate that ran. It can only raise a requirement, never lower one.
+    status, reason = await apply_matrix(request, status, blast_radius, reason)
 
     record = {
         "id": str(request.id),
@@ -64,8 +81,14 @@ async def submit_action(request: ActionRequest, _auth: None = Depends(require_se
         # W4.4 — remember who requested it so an approver can't approve their
         # own action (separation of duties).
         "requested_by_user_id": request.principal.user_id if request.principal else None,
+        # Kept so approve can rebuild the request faithfully. Without this the
+        # approve path reconstructed an ActionRequest with an empty
+        # `parameters`, so an action that was gated *because* of what it
+        # targets executed against defaults — and reported COMPLETED. An
+        # approval that silently changes what it approved is not an approval.
+        "parameters": dict(request.parameters or {}),
     }
-    _actions[str(request.id)] = record
+    await action_store.save(record)
 
     # Auto-execute if approved
     if status == ActionStatus.APPROVED:
@@ -89,6 +112,9 @@ async def submit_action(request: ActionRequest, _auth: None = Depends(require_se
             record["status"] = ActionStatus.FAILED
             record["error"] = f"No executor found for action type: {request.action_type}"
 
+    # Persist again so the executed status is durable, not just the pending one.
+    await action_store.save(record)
+
     logger.info(
         "Action submitted",
         action_id=str(request.id),
@@ -99,36 +125,84 @@ async def submit_action(request: ActionRequest, _auth: None = Depends(require_se
     return record
 
 
+def _bind_approver(
+    record: dict[str, Any],
+    action_id: str,
+    approver: ActionPrincipal | None,
+    assertion: ChatOpsApprover | None,
+    *,
+    require: bool,
+) -> ActionPrincipal | None:
+    """Resolve and authorize the identity behind an approve/reject call.
+
+    Returns the bound principal, or ``None`` when no identity was supplied and
+    ``require`` is false. Raises ``HTTPException`` on denial.
+
+    A ChatOps assertion carries identity only — never permissions — because a
+    bot that asserted its own permissions could grant itself anything. The
+    mapping from a verified platform user to a principal is operator
+    configuration; an unmapped user is refused rather than admitted with an
+    empty permission set.
+
+    ``require`` is true for approve and false for reject. The asymmetry is
+    deliberate: an approval with no identity cannot be evaluated against
+    separation of duties, while a rejection causes no vendor effect and has no
+    human at all when it comes from the approval-timeout scheduler — requiring
+    one would leave expired requests stuck in ``awaiting_approval`` forever.
+    """
+    if approver is None and assertion is not None:
+        approver = resolve_approver(assertion.platform, assertion.platform_user_id)
+        if approver is None:
+            logger.warning(
+                "approval_denied_unmapped_identity",
+                action_id=action_id,
+                platform=assertion.platform,
+            )
+            detail = f"{assertion.platform} user is not mapped to an AiSOC approver. Add them to AISOC_CHATOPS_APPROVERS."
+            raise HTTPException(status_code=403, detail=detail)
+
+    if approver is None:
+        settings = get_settings()
+        if require and (settings.AISOC_ACTIONS_REQUIRE_APPROVER or settings.AISOC_ACTIONS_REQUIRE_PRINCIPAL):
+            raise HTTPException(status_code=403, detail="an approver identity is required")
+        return None
+
+    try:
+        authorize_approver(record, approver)
+    except ActionAuthzError as exc:
+        logger.warning("Approval denied", action_id=action_id, reason=str(exc))
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    return approver
+
+
 @router.post("/actions/{action_id}/approve")
 async def approve_action(
     action_id: str,
     approver: ActionPrincipal | None = None,
+    chatops_approver: ChatOpsApprover | None = None,
     _auth: None = Depends(require_service_auth),
 ):
     """Approve a pending action (human-in-the-loop gate).
 
-    W4.4 — when an approver identity is supplied it is bound: the approver must
-    hold the action's required permission and must not be the requester. When
-    principals are required (``AISOC_ACTIONS_REQUIRE_PRINCIPAL``) an approver is
-    mandatory."""
-    record = _actions.get(action_id)
+    W4.4 — the approver is bound to the decision: they must hold the action's
+    required permission and must not be the requester. T3.6 — an approval with
+    no resolvable identity is refused by default
+    (``AISOC_ACTIONS_REQUIRE_APPROVER``), because separation of duties cannot
+    be evaluated against nobody. ChatOps callers send ``chatops_approver``
+    (verified platform identity) and the mapping supplies the permissions."""
+    record = await action_store.get(action_id)
     if not record:
         raise HTTPException(status_code=404, detail="Action not found")
     if record["status"] != ActionStatus.AWAITING_APPROVAL:
         raise HTTPException(status_code=400, detail=f"Action is not awaiting approval (current: {record['status']})")
 
-    if approver is None:
-        if get_settings().AISOC_ACTIONS_REQUIRE_PRINCIPAL:
-            raise HTTPException(status_code=403, detail="an approver identity is required")
-    else:
-        try:
-            authorize_approver(record, approver)
-        except ActionAuthzError as exc:
-            logger.warning("Approval denied", action_id=action_id, reason=str(exc))
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
-        record["approved_by_user_id"] = approver.user_id
+    bound = _bind_approver(record, action_id, approver, chatops_approver, require=True)
+    if bound is not None:
+        record["approved_by_user_id"] = bound.user_id
 
-    # Reconstruct request and execute
+    # Reconstruct the request as submitted, parameters included. Dropping
+    # them turned an approved action into a different action that still
+    # reported success.
     request = ActionRequest(
         id=UUID(action_id),
         incident_id=UUID(record["incident_id"]),
@@ -136,6 +210,10 @@ async def approve_action(
         action_type=ActionType(record["action_type"]),
         target=record["target"],
         rationale=record["rationale"],
+        parameters=dict(record.get("parameters") or {}),
+        # The bound approver, not the original requester: the executor's
+        # authorization has to evaluate the identity that authorised this run.
+        principal=bound,
     )
 
     executor = EXECUTOR_REGISTRY.get(request.action_type)
@@ -147,25 +225,53 @@ async def approve_action(
         record["status"] = ActionStatus.FAILED
         record["error"] = "No executor available"
 
+    await action_store.save(record)
     logger.info("Action approved and executed", action_id=action_id, status=record["status"])
     return record
 
 
 @router.post("/actions/{action_id}/reject")
-async def reject_action(action_id: str, _auth: None = Depends(require_service_auth)):
-    """Reject a pending action."""
-    record = _actions.get(action_id)
+async def reject_action(
+    action_id: str,
+    approver: ActionPrincipal | None = None,
+    chatops_approver: ChatOpsApprover | None = None,
+    _auth: None = Depends(require_service_auth),
+):
+    """Reject a pending action.
+
+    Binds the deciding identity on the same terms as approve. A rejection used
+    to take no identity and record none, so "who declined to contain this
+    host, and were they entitled to" had no answer — which matters as much as
+    the approve side during an incident review.
+    """
+    record = await action_store.get(action_id)
     if not record:
         raise HTTPException(status_code=404, detail="Action not found")
+
+    bound = _bind_approver(record, action_id, approver, chatops_approver, require=False)
+    if bound is not None:
+        record["rejected_by_user_id"] = bound.user_id
+
     record["status"] = ActionStatus.REJECTED
-    logger.info("Action rejected", action_id=action_id)
+    await action_store.save(record)
+    logger.info(
+        "Action rejected",
+        action_id=action_id,
+        rejected_by=bound.user_id if bound else None,
+    )
     return record
 
 
 @router.get("/actions/{action_id}")
-async def get_action(action_id: str):
-    """Get action status and result."""
-    record = _actions.get(action_id)
+async def get_action(action_id: str, _auth: None = Depends(require_service_auth)):
+    """Get action status and result.
+
+    Behind the service guard: an action record names the host or account an
+    action was aimed at and the parameters it ran with, and ``GET`` by id was
+    reachable with no credential at all. ``aisoc_action_records`` carries no
+    RLS policy, so the id was the only thing standing in front of it.
+    """
+    record = await action_store.get(action_id)
     if not record:
         raise HTTPException(status_code=404, detail="Action not found")
     return record
@@ -259,10 +365,11 @@ async def chatops_callback(token: str = Query(..., min_length=8)):
             status_code=200,
         )
 
-    record = _actions.get(action_id_str)
-    # We still record on the timeline even if the in-memory record is gone
-    # (e.g. service restart). The case timeline is the durable store —
-    # losing the local record shouldn't lose the user's reply.
+    record = await action_store.get(action_id_str)
+    # We still record on the timeline even if the record is gone entirely
+    # (no database configured, and this replica did not handle the submit).
+    # The case timeline is durable either way — losing the local record
+    # must not lose the user's reply.
 
     timeline_warning: str | None = None
     try:

@@ -11,8 +11,10 @@
  *       Center:  timeline (audit + activity feed)
  *       Right:   tasks + notes
  *
- * Like the rest of the app, this gracefully falls back to demo data if the
- * backend hasn't been seeded.
+ * The hosted demo has no backend of its own, so a failed load falls back to
+ * a seeded case *there and only there* — `buildDemoCase()` copies the route
+ * param into the record it invents, which on any other deployment would put
+ * a fabricated incident on screen under the id the analyst had opened.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -40,6 +42,7 @@ import { ErrorState } from '@/components/ui/ErrorState';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { InvestigationLedger } from './InvestigationLedger';
 import { ContextualActions } from '@/components/copilot/ContextualActions';
+import { canUseDemoData } from '@/lib/demoFallback';
 
 type WorkspaceTab =
   | 'overview'
@@ -306,7 +309,6 @@ function TaskRow({ task, onChangeStatus }: TaskRowProps) {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 export function CaseWorkspace({ caseId }: { caseId: string }) {
-  const [demoMode, setDemoMode] = useState(false);
   // Honor `?tab=…` so the hosted demo deeplink
   // (`/cases/INC-RT-001?tab=ledger`) lands visitors directly on the live
   // agent decision feed for the LockBit 3.0 ransomware showcase. Falls back
@@ -323,19 +325,17 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
     { revalidateOnFocus: false, shouldRetryOnError: false },
   );
 
-  const useFallback = !!error;
+  // `buildDemoCase(caseId)` takes its id from the route param, so an ungated
+  // fallback does not merely show sample data — it presents an invented
+  // title, assignee, four alert ids and a five-event timeline *as the case
+  // the analyst opened*. Outside the hosted demo a failed load reads as a
+  // failed load.
+  const useFallback = !!error && canUseDemoData();
   const caseRecord: Case | undefined = useMemo(() => {
     if (data) return data;
     if (useFallback) return buildDemoCase(caseId);
     return undefined;
   }, [data, useFallback, caseId]);
-
-  // Track demo mode for the header banner. Calling setState during render is
-  // a React anti-pattern that can interact badly with hydration; defer to an
-  // effect so the first paint matches between server and client.
-  useEffect(() => {
-    if (useFallback && !demoMode) setDemoMode(true);
-  }, [useFallback, demoMode]);
 
   // ─── Investigation state ───────────────────────────────────────────────────
   const [investigating, setInvestigating] = useState(false);
@@ -518,24 +518,19 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
         setInvestigationStatus('failed');
 
         const errObj = e as any;
-
         const errorMessage =
-        errObj?.response?.data?.detail ||
-        errObj?.response?.data?.message ||
-        errObj?.response?.data?.error ||
-        errObj?.detail ||
-        errObj?.message ||
-        (e instanceof Error ? e.message : '에이전트 조사 실행 중 오류가 발생했습니다.');
+          errObj?.response?.data?.detail ||
+          errObj?.response?.data?.message ||
+          errObj?.response?.data?.error ||
+          errObj?.detail ||
+          errObj?.message ||
+          (e instanceof Error ? e.message : 'Could not reach the investigation service');
 
-        // data 상태에도 error 메시지를 명시적으로 넣어 화면에 표시되게 함
-        setInvestigationData((prev) => ({
-          ...(prev || {}),
-          error: errorMessage,
-        }));
-
-        toast.error(`Investigation failed: ${errorMessage}`);
+        setInvestigationData({ status: 'failed', error: errorMessage });
+        setReportMd('');
+        toast.error(`Investigation could not start: ${errorMessage}`);
     }
-  }, [caseRecord, caseId, investigating, stopPolling]);
+  }, [caseRecord, caseId, investigating, stopPolling, connectWs]);
 
   // ─── Local mutations (optimistic) ──────────────────────────────────────────
 
@@ -562,13 +557,19 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
 
   const updateStatus = async (status: CaseStatus) => {
     if (!caseRecord) return;
+    const previous = caseRecord.status;
     setStatusUpdating(true);
     void mutate({ ...caseRecord, status }, { revalidate: false });
     try {
       await casesApi.update(caseRecord.id, { status });
       toast.success(`Status set to ${STATUS_LABEL[status]}`);
-    } catch {
-      toast(`Demo: status set to ${STATUS_LABEL[status]} locally (writes disabled)`);
+    } catch (e: unknown) {
+      // The optimistic mutation has to come back off. Leaving it applied
+      // showed a status the database does not have, on the one screen an
+      // analyst uses to decide whether an incident is still open.
+      void mutate({ ...caseRecord, status: previous }, { revalidate: false });
+      const message = e instanceof Error ? e.message : 'the case service rejected the write';
+      toast.error(`Status unchanged — ${message}`);
     } finally {
       setStatusUpdating(false);
     }
@@ -689,7 +690,7 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
           <span className="text-slate-600">/</span>
           <span className="font-mono text-slate-400">{caseRecord.id}</span>
         </div>
-        {demoMode && (
+        {useFallback && (
           <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-500/10 px-2 py-0.5 text-[11px] text-amber-300 ring-1 ring-amber-500/30">
             <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
             Demo data — writes disabled

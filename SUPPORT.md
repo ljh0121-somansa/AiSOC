@@ -4,7 +4,8 @@ There are a few places to ask, in roughly the order you should try them:
 
 ## 1. Docs
 
-The Docusaurus site at <https://tryaisoc.com/docs> mirrors [`apps/docs/docs/`](apps/docs/docs/) in this repo.
+The Docusaurus site at <https://beenuar.github.io/AiSOC/> is published from
+[`apps/docs/docs/`](apps/docs/docs/) in this repo on every push to `main`.
 Hit the search box first — it covers connectors, quickstarts, operations
 runbooks, the eval-harness methodology, deployment guides, and the API
 reference.
@@ -29,13 +30,16 @@ Please don't open a GitHub *issue* for a question — they're reserved for
 bugs, feature requests, detection-rule proposals, and benchmark
 submissions, each of which has its own template.
 
-## 3. Try the live demo
+## 3. Try it yourself
 
-<https://tryaisoc.com> is a community-maintained Fly.io instance. It can
-go offline (see [docs/operations/live-demo-runbook.md](docs/operations/live-demo-runbook.md)). When that happens, the
-always-on fallback is the
+The fastest way to see the product is the
 [Codespaces quickstart](https://codespaces.new/beenuar/AiSOC?quickstart=1) —
-zero local install, runs in your browser.
+zero local install, runs in your browser, and drives the real stack rather
+than a hosted screenshot of it. Offline and even quicker, from a clone:
+`pip install -e packages/aisoc-sandbox && aisoc-sandbox demo`. (`aisoc-sandbox` is
+built and packed on every tag but not published to PyPI — the upload is
+blocked on registry credentials — so the from-source path is the one that
+works today.)
 
 ## 4. File a bug
 

@@ -54,7 +54,15 @@ from pathlib import Path
 
 import yaml
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+# `scripts/` is on sys.path when this file is run as a program, but not when a
+# test loads it by path with importlib. gate_toolkit sits beside it either way.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from gate_toolkit import repo_root, self_test_if_requested
+
+self_test_if_requested(__file__)
+
+REPO_ROOT = repo_root()
 QUARANTINE_DIR = REPO_ROOT / "detections" / "splunk-imports" / "_quarantine"
 README_PATH = QUARANTINE_DIR / "README.md"
 
@@ -193,10 +201,7 @@ def _render_mitre_lines(rules: Iterable[QuarantineRule]) -> list[str]:
         return ["_(No MITRE technique tags on the rules in this category.)_"]
     out = []
     for technique, count in counter.most_common(TOP_MITRE_PER_CATEGORY):
-        out.append(
-            f"- [`{technique}`](https://attack.mitre.org/techniques/{technique}/) "
-            f"— {count:,} rule{'s' if count != 1 else ''}"
-        )
+        out.append(f"- [`{technique}`](https://attack.mitre.org/techniques/{technique}/) — {count:,} rule{'s' if count != 1 else ''}")
     extra = len(counter) - TOP_MITRE_PER_CATEGORY
     if extra > 0:
         out.append(f"- _… and {extra:,} more techniques._")
@@ -217,8 +222,7 @@ def _render_rule_table(rules: list[QuarantineRule]) -> list[str]:
         # Escape pipe characters in rule name to avoid breaking the table
         safe_name = rule.name.replace("|", "\\|")
         lines.append(
-            f"| {safe_name} | [`{rule.file_name}`](./{rule.file_name}) "
-            f"| `{rule.splunk_status}` | `{rule.severity or 'n/a'}` | {mitre} |"
+            f"| {safe_name} | [`{rule.file_name}`](./{rule.file_name}) | `{rule.splunk_status}` | `{rule.severity or 'n/a'}` | {mitre} |"
         )
     return lines
 
@@ -277,12 +281,37 @@ def render_readme(rules: list[QuarantineRule]) -> str:
         "category, references) is already populated."
     )
     lines.append(
-        "3. **Re-author the detection** under the right native bucket "
-        "(`detections/<category>/`) using the AiSOC schema documented in "
-        "[`apps/docs/docs/detections/`](../../../apps/docs/docs/detections/). "
-        "Map the SPL search to the AiSOC OCSF stream — usually a "
-        "`logsource` + `detection.condition` block. Carry the original "
+        "3. **Re-author the detection as a Python spec**, not as YAML. This step "
+        "used to say to write a `detection.condition` block under "
+        "`detections/<category>/`, which does not work: everything under "
+        "`detections/` is a *generated projection* of the spec modules and the "
+        "engine never reads it. A rule authored that way passes CI, is counted "
+        "by the truth table, and is never loaded — 44 rules in the native tier "
+        "are in exactly that state. Add an `S(...)` entry to the matching "
+        "`scripts/detection_specs_part3_<category>.py` with a flat `match_when`, "
+        "then run `python3 scripts/generate_detections.py` followed by "
+        "`python3 scripts/export_detection_ruleset.py`. Carry the original "
         "`provenance.upstream_path` over so attribution is preserved."
+    )
+    lines.append(
+        "   - **Check every field name against the emitting connector's "
+        "`normalize()` output.** `scripts/check_detection_fields.py` gates "
+        "computed fields — counters, window sizes, allowlist booleans — which "
+        "cannot fire at all, because nothing in the pipeline computes them. "
+        "They need a windowed-engine rule or a fusion-time enrichment instead."
+    )
+    lines.append(
+        "   - **SPL with `| stats` or `| tstats` is not translatable to "
+        "`match_when`,** because that matcher sees one event at a time. "
+        "Aggregation over a window belongs in "
+        "`services/fusion/app/services/windowed_detection.py`, which loads "
+        "`app/data/windowed_ruleset.json` through `load_window_rules()` and is "
+        "wired on by default in `main.py`. Add the rule to "
+        "`scripts/export_windowed_ruleset.py` and re-export. This step used to "
+        'say the windowed engine had "three hardcoded rules and no loader" '
+        "and to skip those rules until it had one — that stopped being true "
+        "when the loader landed, and in the meantime it told translators to "
+        "skip the single largest untranslated family in this directory."
     )
     lines.append(
         "4. **Add fixtures** under `detections/fixtures/positive/<rule-id>.json` "
@@ -319,10 +348,7 @@ def render_readme(rules: list[QuarantineRule]) -> str:
         "and commit the regenerated README to make CI green."
     )
     lines.append("")
-    lines.append(
-        "Two soft conventions sit on top of the gate (not machine-enforced "
-        "today, but expected for translation PRs):"
-    )
+    lines.append("Two soft conventions sit on top of the gate (not machine-enforced today, but expected for translation PRs):")
     lines.append("")
     lines.append(
         "- **Reference an umbrella tracking issue.** When you translate a "
@@ -363,10 +389,7 @@ def render_readme(rules: list[QuarantineRule]) -> str:
 
     lines.append("---")
     lines.append("")
-    lines.append(
-        "_Generated by `scripts/build_quarantine_index.py`. "
-        f"Source: {len(rules):,} YAML rules in this directory._"
-    )
+    lines.append(f"_Generated by `scripts/build_quarantine_index.py`. Source: {len(rules):,} YAML rules in this directory._")
     lines.append("")
     return "\n".join(lines)
 
@@ -421,10 +444,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     README_PATH.write_text(rendered)
-    print(
-        f"wrote {README_PATH.relative_to(REPO_ROOT)} "
-        f"({len(rules):,} rules indexed, {len(rendered):,} bytes)."
-    )
+    print(f"wrote {README_PATH.relative_to(REPO_ROOT)} ({len(rules):,} rules indexed, {len(rendered):,} bytes).")
     return 0
 
 

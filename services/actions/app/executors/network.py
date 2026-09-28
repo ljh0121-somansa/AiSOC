@@ -44,66 +44,21 @@ from datetime import datetime
 import structlog
 
 from app.clients.aws_security_groups import AWSSecurityGroupsClient
-from app.clients.cloudflare_client import CloudflareClient
-from app.clients.fortigate_client import FortiGateClient
-from app.clients.panos_client import PanOsClient
+
+# Re-exported from app.clients.factories, which is where these now live so
+# app.services.rollback can import them without creating a cycle back into
+# this module. Imported here because rollback and verification import them
+# from this path, and tests monkeypatch them here.
+from app.clients.factories import (  # noqa: F401
+    _aws_client,
+    _cloudflare_client,
+    _fortigate_client,
+    _panos_client,
+)
 from app.executors.base import _SIM_FUNNEL_CTA, BaseExecutor
 from app.models.action import ActionRequest, ActionResult, ActionStatus, BlastRadius
 
 logger = structlog.get_logger()
-
-
-def _aws_client(params: dict) -> AWSSecurityGroupsClient | None:
-    access_key = params.get("aws_access_key_id")
-    secret_key = params.get("aws_secret_access_key")
-    sg_id = params.get("aws_security_group_id")
-    if not sg_id:
-        return None
-    return AWSSecurityGroupsClient(
-        access_key_id=access_key,
-        secret_access_key=secret_key,
-        region=params.get("aws_region", "us-east-1"),
-        role_arn=params.get("aws_role_arn"),
-        session_name=params.get("aws_session_name", "aisoc-action"),
-    )
-
-
-def _panos_client(params: dict) -> PanOsClient | None:
-    """Build a PAN-OS client. Returns None if the minimum
-    credentials are missing so the executor can fall through.
-    """
-    host = params.get("panos_host")
-    api_key = params.get("panos_api_key")
-    tag = params.get("panos_tag")
-    if not (host and api_key and tag):
-        return None
-    return PanOsClient(
-        host=host,
-        api_key=api_key,
-        vsys=params.get("panos_vsys", "vsys1"),
-        verify_tls=bool(params.get("panos_verify_tls", True)),
-    )
-
-
-def _fortigate_client(params: dict) -> FortiGateClient | None:
-    host = params.get("fgt_host")
-    token = params.get("fgt_api_token")
-    group = params.get("fgt_address_group")
-    if not (host and token and group):
-        return None
-    return FortiGateClient(
-        host=host,
-        api_token=token,
-        vdom=params.get("fgt_vdom", "root"),
-        verify_tls=bool(params.get("fgt_verify_tls", True)),
-    )
-
-
-def _cloudflare_client(params: dict) -> CloudflareClient | None:
-    token = params.get("cf_api_token")
-    if not token:
-        return None
-    return CloudflareClient(api_token=token)
 
 
 class BlockIPExecutor(BaseExecutor):
@@ -242,7 +197,7 @@ class BlockIPExecutor(BaseExecutor):
                 "action": "block_ip",
                 "ip": ip,
                 "firewall_rule_id": f"SIM-BLOCK-{ip.replace('.', '-')}",
-                "note": ("Simulation mode — provide aws_*/panos_*/fgt_*/cf_* credentials " "to enable live execution." + _SIM_FUNNEL_CTA),
+                "note": ("Simulation mode — provide aws_*/panos_*/fgt_*/cf_* credentials to enable live execution." + _SIM_FUNNEL_CTA),
             },
             rollback_data={"ip": ip, "rule_type": "block_ip"},
             completed_at=datetime.utcnow(),
@@ -275,6 +230,40 @@ class BlockIPExecutor(BaseExecutor):
                 logger.error("block_ip.rollback.failed", ip=ip, error=str(exc))
                 return False
         return True
+
+
+async def read_back_blocked_ip(ip: str, params: dict) -> bool | None:
+    """Re-read the enforcing rule set to confirm an IP block is actually in place.
+
+    Used by post-action verification. Returns True when a rule covering ``ip``
+    is present, False when the rule set is readable and the IP is absent (the
+    block silently did not take, or was removed), and None when we cannot tell.
+
+    Only AWS security groups expose a read-back today. The PAN-OS, FortiGate
+    and Cloudflare arms return None rather than a guess, because reporting
+    VERIFIED without a confirming query is the exact failure this is meant to
+    prevent.
+    """
+    aws = _aws_client(params)
+    if aws is None:
+        return None
+    try:
+        rules = await aws.describe_rules(params.get("aws_sg_id"))
+    except Exception as exc:  # noqa: BLE001 — indeterminate, never a false VERIFIED
+        logger.warning("block_ip.read_back_failed", ip=ip, error=str(exc))
+        return None
+    if not rules:
+        # An empty list also means "boto3 unavailable" in this client, so it is
+        # not safe to read as "the rule is absent".
+        return None
+    needle = f"{ip}/32" if "/" not in ip else ip
+    for rule in rules:
+        if rule.get("IsEgress"):
+            continue
+        cidr = rule.get("CidrIpv4") or rule.get("CidrIpv6") or ""
+        if cidr in {needle, ip}:
+            return True
+    return False
 
 
 class AllowIPExecutor(BaseExecutor):
@@ -402,7 +391,7 @@ class AllowIPExecutor(BaseExecutor):
             output={
                 "action": "allow_ip",
                 "ip": ip,
-                "note": ("Simulation mode — provide aws_*/panos_*/fgt_*/cf_* credentials " "to enable live execution." + _SIM_FUNNEL_CTA),
+                "note": ("Simulation mode — provide aws_*/panos_*/fgt_*/cf_* credentials to enable live execution." + _SIM_FUNNEL_CTA),
             },
             rollback_data={"ip": ip},
             completed_at=datetime.utcnow(),

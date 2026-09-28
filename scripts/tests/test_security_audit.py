@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
+
+# Import the module under test
+import sys
 import textwrap
 from pathlib import Path
 
 import pytest
 
-# Import the module under test
-import sys
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import security_audit
 from security_audit import (
     Finding,
     Ignore,
@@ -24,8 +26,10 @@ from security_audit import (
     load_ignores,
     parse_govulncheck_json,
     parse_pip_audit_json,
+    run_govulncheck,
+    run_pip_audit,
+    run_pnpm_audit,
 )
-
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -413,6 +417,32 @@ class TestExitCodeFor:
         )
         assert exit_code_for(r) == 1
 
+    def test_unscanned_alone_fails(self):
+        """A clean scan and a skipped scan must not both exit 0.
+
+        This is the property that makes an exit of 0 mean anything: without
+        it, a service the gate could not read is indistinguishable from a
+        service the gate read and cleared. `services/slack-bot` sat in that
+        state behind a stale poetry.lock while its lock resolved advisories
+        every other service had already moved past (#650).
+        """
+        r = Report(unscanned=["services/slack-bot: poetry export failed — NOT scanned"])
+        assert exit_code_for(r) == 1
+
+    def test_unscanned_fails_even_with_only_low_findings(self):
+        r = Report(
+            findings=[Finding("python", "low", "X", "p", "l", "t")],
+            unscanned=["services/api: pip-audit exited 2 — NOT scanned"],
+        )
+        assert exit_code_for(r) == 1
+
+    def test_warnings_alone_do_not_fail(self):
+        """Warnings are observations about a scan that happened; they must stay
+        non-fatal so that a coverage gap remains the only reason a finding-free
+        run can still exit 1."""
+        r = Report(warnings=["some non-fatal note"])
+        assert exit_code_for(r) == 0
+
 
 # ─── Report property tests ───────────────────────────────────────────────────
 
@@ -446,3 +476,234 @@ class TestReportProperties:
             ]
         )
         assert len(r.low_info) == 3
+
+
+# ─── Coverage-gap tests: a scan that did not happen must not read as clean ───
+
+
+class _Proc:
+    """Minimal stand-in for subprocess.CompletedProcess."""
+
+    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class TestPnpmCoverageGaps:
+    @staticmethod
+    def _workspace(tmp_path: Path) -> Path:
+        (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+        return tmp_path
+
+    def test_unparseable_output_is_a_coverage_gap_not_a_warning(self, monkeypatch, tmp_path: Path):
+        """pnpm audit that returns garbage has audited nothing.
+
+        Recorded as `unscanned` so `exit_code_for` fails. As a `warning` the
+        arm exited 0 and printed "pnpm: 0 findings" for a workspace it had
+        never successfully read.
+        """
+        monkeypatch.setattr(
+            security_audit.subprocess,
+            "run",
+            lambda *a, **k: _Proc(returncode=1, stdout="<html>not json</html>"),
+        )
+
+        report = run_pnpm_audit(self._workspace(tmp_path), [])
+
+        assert report.unscanned, "unparseable pnpm output must be recorded as a coverage gap"
+        assert not report.findings
+        assert exit_code_for(report) == 1
+
+    def test_successful_audit_records_no_gap(self, monkeypatch, tmp_path: Path):
+        monkeypatch.setattr(
+            security_audit.subprocess,
+            "run",
+            lambda *a, **k: _Proc(returncode=0, stdout='{"advisories": {}}'),
+        )
+
+        report = run_pnpm_audit(self._workspace(tmp_path), [])
+
+        assert report.unscanned == []
+        assert exit_code_for(report) == 0
+
+
+class TestNothingToScanIsNotACleanScan:
+    """Zero targets discovered is a coverage gap, not a clean result.
+
+    Every arm of this audit printed "N findings" and exited 0 against a
+    directory with no manifests in it — the same sentence, and the same exit
+    status, as a clean audit of the real workspace. Found nothing and scanned
+    nothing are different results and only one of them is good news.
+    """
+
+    def test_pnpm_refuses_a_workspace_with_no_lockfile(self, tmp_path: Path):
+        report = run_pnpm_audit(tmp_path, [])
+
+        assert report.unscanned, "no pnpm-lock.yaml must be a coverage gap"
+        assert exit_code_for(report) == 1
+
+    def test_pnpm_audits_every_install_root_not_only_the_repo_root(self, monkeypatch, tmp_path: Path):
+        """A second install root must be audited, and its findings must name it.
+
+        ``apps/mobile`` keeps its own ``pnpm-workspace.yaml`` so its installs
+        stop rewriting the root lock. Auditing only the repo root therefore
+        never reached it, and this arm reported a clean workspace while two
+        high-severity advisories stood open there.
+        """
+        (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '6.0'\n")
+        nested = tmp_path / "apps" / "mobile"
+        nested.mkdir(parents=True)
+        (nested / "pnpm-lock.yaml").write_text("lockfileVersion: '6.0'\n")
+
+        monkeypatch.setattr(
+            security_audit,
+            "pnpm_install_roots",
+            lambda root: [".", "apps/mobile"],
+        )
+
+        audited: list[Path] = []
+
+        def fake_at(root: Path, label: str, ignores):
+            audited.append(root)
+            report = Report()
+            if label.endswith("apps/mobile"):
+                report.findings.append(
+                    Finding(
+                        tool="pnpm",
+                        severity="high",
+                        vuln_id="GHSA-5p2g-fcmc-qvqq",
+                        package="image-size",
+                        location=label,
+                        title="denial of service",
+                    )
+                )
+            return report
+
+        monkeypatch.setattr(security_audit, "run_pnpm_audit_at", fake_at)
+
+        report = run_pnpm_audit(tmp_path, [])
+
+        assert audited == [tmp_path, tmp_path / "apps/mobile"], "both install roots must be audited"
+        assert len(report.findings) == 1
+        assert report.findings[0].location == "pnpm workspace apps/mobile", (
+            "a finding must name the install root it came from, not a generic 'pnpm workspace'"
+        )
+        assert exit_code_for(report) == 1
+
+    def test_pnpm_install_roots_are_read_from_the_tree(self, tmp_path: Path):
+        """Discovery is structural, so a new install root needs no edit here."""
+        import subprocess
+
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '6.0'\n")
+        nested = tmp_path / "apps" / "mobile"
+        nested.mkdir(parents=True)
+        (nested / "pnpm-lock.yaml").write_text("lockfileVersion: '6.0'\n")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+
+        assert security_audit.pnpm_install_roots(tmp_path) == [".", "apps/mobile"]
+
+    def test_pnpm_refuses_a_tree_with_no_install_root_at_all(self, tmp_path: Path):
+        """Zero install roots is not zero workspaces vulnerable."""
+        report = run_pnpm_audit(tmp_path, [])
+
+        assert report.unscanned, "a tree with no lockfile anywhere must be a coverage gap"
+        assert exit_code_for(report) == 1
+
+    def test_python_refuses_a_tree_with_no_manifests(self, tmp_path: Path):
+        report = run_pip_audit(tmp_path, [])
+
+        assert report.unscanned, "no pyproject.toml anywhere must be a coverage gap"
+        assert exit_code_for(report) == 1
+
+    def test_go_refuses_a_tree_with_no_modules(self, tmp_path: Path):
+        report = run_govulncheck(tmp_path, [])
+
+        assert report.unscanned, "no go.mod anywhere must be a coverage gap"
+        assert exit_code_for(report) == 1
+
+    def test_validate_ignores_refuses_a_missing_policy_file(self, monkeypatch, tmp_path: Path):
+        monkeypatch.setattr(security_audit, "get_repo_root", lambda: tmp_path)
+
+        assert security_audit.cmd_validate_ignores(argparse.Namespace()) == 1
+
+    def test_validate_ignores_accepts_a_policy_file_with_no_entries(self, monkeypatch, tmp_path: Path):
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "security_audit_ignores.txt").write_text("# every suppression has been retired\n")
+        monkeypatch.setattr(security_audit, "get_repo_root", lambda: tmp_path)
+
+        assert security_audit.cmd_validate_ignores(argparse.Namespace()) == 0
+
+
+class TestGoCoverageGaps:
+    @staticmethod
+    def _module(tmp_path: Path) -> Path:
+        mod = tmp_path / "services" / "ingest"
+        mod.mkdir(parents=True)
+        (mod / "go.mod").write_text("module example.com/ingest\n")
+        return tmp_path
+
+    def test_unexpected_exit_is_a_coverage_gap(self, monkeypatch, tmp_path: Path):
+        """govulncheck exits 0 (clean) or 3 (vulnerabilities found).
+
+        Any other code means the module never got analysed — a build failure
+        or a missing toolchain. Treated as a coverage gap for the same reason
+        as the Python arm: otherwise the arm prints "go: 0 findings" for a
+        module it could not read.
+        """
+        root = self._module(tmp_path)
+        monkeypatch.setattr(
+            security_audit.subprocess,
+            "run",
+            lambda *a, **k: _Proc(returncode=1, stderr="build failed: no required module provides package"),
+        )
+
+        report = run_govulncheck(root, [])
+
+        assert report.unscanned, "a failed govulncheck run must be recorded as a coverage gap"
+        assert "services/ingest" in report.unscanned[0]
+        assert exit_code_for(report) == 1
+
+    def test_missing_binary_is_a_coverage_gap(self, monkeypatch, tmp_path: Path):
+        root = self._module(tmp_path)
+
+        def _raise(*a, **k):
+            raise FileNotFoundError("govulncheck")
+
+        monkeypatch.setattr(security_audit.subprocess, "run", _raise)
+
+        report = run_govulncheck(root, [])
+
+        assert report.unscanned
+        assert exit_code_for(report) == 1
+
+    def test_clean_module_records_no_gap(self, monkeypatch, tmp_path: Path):
+        root = self._module(tmp_path)
+        monkeypatch.setattr(security_audit.subprocess, "run", lambda *a, **k: _Proc(returncode=0, stdout=""))
+
+        report = run_govulncheck(root, [])
+
+        assert report.unscanned == []
+        assert report.findings == []
+        assert exit_code_for(report) == 0
+
+    def test_findings_exit_code_3_still_counts_as_scanned(self, monkeypatch, tmp_path: Path):
+        root = self._module(tmp_path)
+        stdout = "\n".join(
+            [
+                '{"osv": {"id": "GO-2026-0001", "aliases": ["CVE-2026-0001"], "summary": "boom"}}',
+                '{"finding": {"osv": "GO-2026-0001"}}',
+            ]
+        )
+        monkeypatch.setattr(
+            security_audit.subprocess,
+            "run",
+            lambda *a, **k: _Proc(returncode=3, stdout=stdout),
+        )
+
+        report = run_govulncheck(root, [])
+
+        assert report.unscanned == []
+        assert [f.vuln_id for f in report.findings] == ["GO-2026-0001"]
+        assert exit_code_for(report) == 1

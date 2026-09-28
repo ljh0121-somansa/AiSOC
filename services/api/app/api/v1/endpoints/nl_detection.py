@@ -13,7 +13,7 @@ functional in all deployment environments.
 
 from __future__ import annotations
 
-import os
+import json
 import uuid
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
@@ -27,6 +27,13 @@ from app.core.airgap import AirgapViolation, enforce_airgap_for_url
 from app.models.detection_proposal import DetectionRuleProposal
 from app.services.detection_eval import evaluate_candidate_rule
 from app.services.fixture_synth import derive_fixtures_from_sigma
+from app.services.llm_safety import LLMContractViolation, safe_chat_completions_request
+from app.services.model_aliases import (
+    UnroutableModelError,
+    chat_completions_url,
+    resolve_api_key,
+    resolve_model_alias,
+)
 
 logger = structlog.get_logger()
 
@@ -120,9 +127,16 @@ FROM logs-*
 
 async def _llm_translate(request: NLDetectionRequest) -> dict[str, str | None]:
     """Attempt LLM-based translation; fall back to templates on any error."""
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    # The detection builder asked ``OPENAI_MODEL`` for its model and posted to a
+    # hardcoded api.openai.com — so it was the one LLM consumer that could not be
+    # pointed anywhere, and the model it sent (`gpt-4-turbo-preview`, from
+    # .env.example) is not one the bundled gateway defines. It is a
+    # natural-language translation task, so it takes the `nl` role like every
+    # other one.
+    model = resolve_model_alias("nl")
+    api_key = resolve_api_key(model) or ""
     if not api_key:
-        logger.debug("nl_detection.llm_unavailable", reason="no OPENAI_API_KEY")
+        logger.debug("nl_detection.llm_unavailable", reason="no API key resolved for the nl role")
         return _template_fallback(request)
 
     platforms_str = ", ".join(request.target_platforms)
@@ -134,7 +148,11 @@ async def _llm_translate(request: NLDetectionRequest) -> dict[str, str | None]:
         f"Return JSON with keys matching the platform names (sigma, kql, spl, esql)."
     )
 
-    completions_url = "https://api.openai.com/v1/chat/completions"
+    try:
+        completions_url = chat_completions_url(model)
+    except UnroutableModelError as exc:
+        logger.warning("nl_detection.unroutable_model", model=model, reason=str(exc))
+        return _template_fallback(request)
     try:
         enforce_airgap_for_url(completions_url)
     except AirgapViolation as exc:
@@ -142,35 +160,33 @@ async def _llm_translate(request: NLDetectionRequest) -> dict[str, str | None]:
         return _template_fallback(request)
 
     try:
-        import httpx
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                completions_url,
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
-                    "messages": [
-                        {"role": "system", "content": _SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "response_format": {"type": "json_object"},
-                    "temperature": 0.1,
-                    "max_tokens": 2000,
-                },
-            )
-            resp.raise_for_status()
-            import json
-
-            content = resp.json()["choices"][0]["message"]["content"]
-            rules = json.loads(content)
-            return {
-                "sigma": rules.get("sigma") if "sigma" in request.target_platforms else None,
-                "kql": rules.get("kql") if "kql" in request.target_platforms else None,
-                "spl": rules.get("spl") if "spl" in request.target_platforms else None,
-                "esql": rules.get("esql") if "esql" in request.target_platforms else None,
-                "_model": os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
-            }
+        # T2.3 — the description is analyst-authored but routinely contains a
+        # pasted log line, which is exactly what the contract refuses to
+        # forward.
+        body = await safe_chat_completions_request(
+            api_key=api_key,
+            model=model,
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            url=completions_url,
+            timeout=30.0,
+            response_format={"type": "json_object"},
+            temperature=0.1,
+            max_tokens=2000,
+        )
+        rules = json.loads(body["choices"][0]["message"]["content"])
+        return {
+            "sigma": rules.get("sigma") if "sigma" in request.target_platforms else None,
+            "kql": rules.get("kql") if "kql" in request.target_platforms else None,
+            "spl": rules.get("spl") if "spl" in request.target_platforms else None,
+            "esql": rules.get("esql") if "esql" in request.target_platforms else None,
+            "_model": model,
+        }
+    except LLMContractViolation as exc:
+        logger.warning("nl_detection.llm_contract_violation", reason=exc.reason)
+        return _template_fallback(request)
     except Exception as exc:
         logger.warning("nl_detection.llm_error", error=str(exc))
         return _template_fallback(request)
@@ -194,7 +210,7 @@ def _template_fallback(request: NLDetectionRequest) -> dict[str, str | None]:
 
 
 @router.post("/translate", response_model=NLDetectionResponse)
-async def translate_detection(payload: NLDetectionRequest) -> NLDetectionResponse:
+async def translate_detection(payload: NLDetectionRequest, user: AuthUser) -> NLDetectionResponse:
     """Convert a plain-English threat description into multi-platform detection rules."""
     if not payload.description.strip():
         raise HTTPException(

@@ -14,10 +14,15 @@ on:
   workflow_dispatch:
     inputs:
       target_url:
-        description: "URL to record against (defaults to the latest preview)"
+        description: "URL to record against. Defaults to a local demo stack (pnpm aisoc:demo)."
         required: false
         type: string
-        default: "https://tryaisoc.com"
+        # Deliberately a local address rather than a hosted one. A default
+        # pointing at a specific deployment means a self-hoster who runs this
+        # workflow records somebody else's instance — and that hostname then
+        # travels into the README caption and the docs. Bring the stack up
+        # with `pnpm aisoc:demo --no-open` and record against it.
+        default: "http://localhost:3000"
       release_tag:
         description: "Optional release tag; if set, the recording is uploaded as a release asset"
         required: false
@@ -37,7 +42,7 @@ jobs:
     # Hard 15-minute ceiling — a runaway recorder should fail fast.
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up pnpm
         # No `version:` input — action-setup@v6 reads the root
@@ -47,11 +52,18 @@ jobs:
         uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
 
       - name: Set up Node 22
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: pnpm
-          cache-dependency-path: apps/web/pnpm-lock.yaml
+          # The root workspace lockfile. `apps/web/pnpm-lock.yaml` does not
+          # exist — this is a pnpm workspace with one lockfile at the root —
+          # and setup-node hard-fails with "Some specified paths were not
+          # resolved" when the cache path matches nothing, so this workflow
+          # could never get past step three. It is workflow_dispatch-only, so
+          # no scheduled run ever exercised it. Every other workflow in the
+          # repo already points here.
+          cache-dependency-path: pnpm-lock.yaml
 
       - name: Install web dependencies
         working-directory: apps/web
@@ -67,7 +79,7 @@ jobs:
       - name: Run the screencast spec
         working-directory: apps/web
         env:
-          AISOC_SCREENCAST_URL: ${{ inputs.target_url || 'https://tryaisoc.com' }}
+          AISOC_SCREENCAST_URL: ${{ inputs.target_url || 'http://localhost:3000' }}
           # Disable any analytics injection so the recorder browser
           # doesn't render a cookie banner in the final cut.
           AISOC_DISABLE_ANALYTICS: "1"

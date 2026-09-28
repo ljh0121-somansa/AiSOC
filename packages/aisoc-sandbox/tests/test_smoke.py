@@ -3,7 +3,7 @@
 If any of these fail, `pip install aisoc-sandbox && aisoc-sandbox demo`
 no longer works on a clean machine — which is the only contract that
 matters for this package. The CI gate that runs this suite on a Linux
-+ macOS matrix (see `.github/workflows/sandbox-smoke.yml`) is the
++ macOS matrix (see the `sandbox-offline` job in `.github/workflows/readme-gates.yml`) is the
 authoritative trust signal for the `pip install` path.
 """
 
@@ -28,6 +28,7 @@ from aisoc_sandbox.cli import main
 # Scenarios are real, loadable, well-formed.
 # ---------------------------------------------------------------------------
 
+
 def test_bundled_scenarios_are_exactly_the_five_we_advertise() -> None:
     expected = {
         "aws-credential-exfil",
@@ -39,13 +40,18 @@ def test_bundled_scenarios_are_exactly_the_five_we_advertise() -> None:
     assert set(available_scenarios()) == expected
 
 
-@pytest.mark.parametrize("sid", sorted({
-    "aws-credential-exfil",
-    "github-token-theft",
-    "kubernetes-privesc",
-    "lateral-movement",
-    "phishing-payload",
-}))
+@pytest.mark.parametrize(
+    "sid",
+    sorted(
+        {
+            "aws-credential-exfil",
+            "github-token-theft",
+            "kubernetes-privesc",
+            "lateral-movement",
+            "phishing-payload",
+        }
+    ),
+)
 def test_each_scenario_loads_and_has_required_fields(sid: str) -> None:
     sc = load_scenario(sid)
     assert sc.id == sid
@@ -63,6 +69,7 @@ def test_unknown_scenario_raises_a_useful_error() -> None:
 # ---------------------------------------------------------------------------
 # Investigation funnel.
 # ---------------------------------------------------------------------------
+
 
 def test_run_emits_a_four_stage_ledger() -> None:
     sc = load_scenario("lateral-movement")
@@ -115,6 +122,7 @@ def test_ledger_human_render_is_plain_text_when_not_tty() -> None:
 # ---------------------------------------------------------------------------
 # CLI surface.
 # ---------------------------------------------------------------------------
+
 
 def test_cli_demo_default_returns_0(capsys: pytest.CaptureFixture[str]) -> None:
     exit_code = main(["demo"])

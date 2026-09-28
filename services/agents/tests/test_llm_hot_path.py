@@ -24,14 +24,24 @@ class _FakeLLM:
 
 
 @pytest.mark.asyncio
-async def test_safe_ainvoke_records_cost_into_bound_tracker():
+async def test_safe_ainvoke_records_tokens_and_refuses_to_invent_a_cost():
+    """Tokens are measured; the cost of an unpriceable alias is not invented.
+
+    The previous assertion was ``tracker.total_cost_usd >= 0.0``, which every
+    float satisfies — including the ``$0.000999`` the tracker produced by
+    pricing the *alias* ``aisoc-triage`` against a hosted list table it does
+    not appear in. A no-gateway call now books as ``unpriced``.
+    """
     llm = _FakeLLM()
     msgs = [SystemMessage(content="You are a triage agent."), HumanMessage(content="Alert: benign login from office")]
     async with CostTracker(run_id="r-cost", tenant_id="t-cost") as tracker:
         await safe_ainvoke(llm, msgs)
         # record_llm_call fired via safe_ainvoke — was invisible ($0) before.
         assert tracker.total_tokens == 15
-        assert tracker.total_cost_usd >= 0.0
+        assert tracker.measured_cost_usd is None
+        assert tracker.measured_call_count == 0
+        assert tracker.unpriced_call_count == 1
+        assert "total_cost_usd" not in tracker.summary()
 
 
 @pytest.mark.asyncio
@@ -50,8 +60,12 @@ def test_llm_override_routes_to_tenant_model(monkeypatch):
     with llm_override(api_key="tenant-byok-key", base_url="https://byok.example/v1", model="gpt-4o-tenant"):
         m = make_chat_model("triage")
         assert getattr(m, "model_name", None) == "gpt-4o-tenant"
-    # Outside the override, back to the alias (platform key from env, as in prod).
+    # Outside the override, back to the alias — which needs the gateway that
+    # docker-compose.yml supplies. A provider key alone is not enough to route
+    # an alias, and building a client that will 404 is what used to look like
+    # "the LLM is configured".
     monkeypatch.setenv("OPENAI_API_KEY", "sk-platform-test")
+    monkeypatch.setenv("LLM_GATEWAY_URL", "http://litellm:4000/v1")
     m2 = make_chat_model("triage")
     assert getattr(m2, "model_name", None) == "aisoc-triage"
 

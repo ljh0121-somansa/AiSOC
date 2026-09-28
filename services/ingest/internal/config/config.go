@@ -24,26 +24,65 @@ type Config struct {
 	JWTSecret       string
 	MetricsPort     int
 
+	// /v1/ingest authentication.
+	//
+	// ServiceToken is the shared secret a trusted AiSOC service presents
+	// when it pushes on behalf of many tenants (services/connectors polls
+	// every tenant's connectors from one process). It identifies a
+	// service, not a tenant, so a caller using it must also declare the
+	// tenant it is acting for; see internal/ingestauth. Empty means the
+	// service-token path is unavailable and only minted per-tenant push
+	// tokens are accepted — there is no configuration that accepts an
+	// unauthenticated push.
+	ServiceToken string
+	// IngestMaxBodyBytes caps a single /v1/ingest body. MaxBatchSize only
+	// bounds the event count *after* the payload is decoded, so this is
+	// what bounds the decode itself.
+	IngestMaxBodyBytes int64
+
 	// Shodan enrichment
 	ShodanAPIKey          string
 	ShodanEnrichEnabled   bool
 	ShodanCacheExpirySecs int
 
-	// CVE / vulnerability correlation
-	VulnCorrelEnabled   bool
-	VulnKafkaTopic      string // topic for VULNERABILITY_MATCH events
-	NvdAPIKey           string // optional NVD API key for higher rate limits
+	// CVE / vulnerability correlation.
+	//
+	// Off by default. Nothing in the platform consumes VulnKafkaTopic —
+	// fusion gets its vulnerability context by calling the enrichment service
+	// at fuse time, not from this stream — so with it on, every deployment
+	// downloaded the CISA KEV catalogue at boot and published matches into a
+	// topic with no reader. It remains available as an opt-in export for an
+	// external consumer; the messages carry an `event_type:
+	// VULNERABILITY_MATCH` header for exactly that.
+	VulnCorrelEnabled bool
+	VulnKafkaTopic    string // topic for VULNERABILITY_MATCH events
+	NvdAPIKey         string // optional NVD API key for higher rate limits
 
 	// Workstream 6 — universal capture push paths.
 	// InboxEnabled toggles the /v1/inbox/* routes. Off by default in
 	// development if no DATABASE_DSN is set, since the inbox store needs
 	// Postgres to resolve tokens.
-	InboxEnabled       bool
-	InboxTemplatesDir  string // path to vendor template YAMLs
+	InboxEnabled      bool
+	InboxTemplatesDir string // path to vendor template YAMLs
 	// InboxMaxBodyBytes caps a single inbox webhook body. Anything
 	// bigger gets a 413; vendors that page through alerts should batch
 	// at the source rather than push 50MB at once.
-	InboxMaxBodyBytes  int64
+	InboxMaxBodyBytes int64
+	// Per-tenant rate limits on the inbox. /v1/inbox/* is the one route
+	// deliberately open to the internet, authenticated only by a bearer
+	// token that lives in a vendor's webhook config, and it previously had
+	// no ceiling at all — one noisy or compromised integration could fill
+	// Kafka and the lake for every tenant sharing the spine.
+	//
+	// Two dimensions: requests bound parse and connection cost, events
+	// bound what actually reaches Kafka (one request can carry thousands).
+	// Zero disables that dimension. Limits are per replica, so the
+	// effective ceiling is rate x replicas; set accordingly or terminate
+	// at the edge if an exact global cap is required.
+	InboxRateRequestsPerSecond float64
+	InboxRateRequestBurst      float64
+	InboxRateEventsPerSecond   float64
+	InboxRateEventBurst        float64
 
 	// Kubernetes audit webhook (Track D, v7.1.0).
 	//
@@ -106,9 +145,9 @@ type Config struct {
 	//
 	// SnapshotEnabled toggles the per-event resource config snapshotter.
 	// When on, every event referencing a resource triggers a (cached)
-	// ``get_resource_config`` call on the relevant connector and the
+	// get_resource_config call on the relevant connector and the
 	// result lands as a versioned :Configuration node connected via
-	// ``:CONFIGURED_AS {ts}``. Off by default — the writer still runs,
+	// :CONFIGURED_AS {ts}. Off by default — the writer still runs,
 	// it just skips the snapshot lookup until the operator opts in.
 	SnapshotEnabled bool
 	// SnapshotCacheTTLSecs is the TTL for the Redis-backed config cache.
@@ -116,7 +155,7 @@ type Config struct {
 	// minute) only do one round-trip to the connector per TTL window.
 	SnapshotCacheTTLSecs int
 	// SnapshotProviderURL is the HTTP base URL of the connectors service
-	// that serves ``GET /v1/connectors/{id}/resource-config``. The
+	// that serves GET /v1/connectors/{id}/resource-config. The
 	// snapshotter calls this in lieu of importing the connector code
 	// directly (the connectors live in Python; the writer is Go).
 	// Empty disables remote lookups — the snapshotter then only emits
@@ -133,11 +172,11 @@ type Config struct {
 func Load() (*Config, error) {
 	cfg := &Config{
 		HTTPPort: mustGetEnvInt("HTTP_PORT", 8080),
-		// Canonical env var is ``KAFKA_BOOTSTRAP_SERVERS`` (matches
-		// ``.env.example`` and docker-compose). ``KAFKA_BROKERS`` is honored
+		// Canonical env var is KAFKA_BOOTSTRAP_SERVERS (matches
+		// .env.example and docker-compose). KAFKA_BROKERS is honored
 		// as a back-compat alias for older deployments.
-		KafkaBrokers: getEnvFallback("KAFKA_BOOTSTRAP_SERVERS", "KAFKA_BROKERS", "localhost:9092"),
-		KafkaTopic:   getEnv("KAFKA_TOPIC", "aisoc.raw_events"),
+		KafkaBrokers:    getEnvFallback("KAFKA_BOOTSTRAP_SERVERS", "KAFKA_BROKERS", "localhost:9092"),
+		KafkaTopic:      getEnv("KAFKA_TOPIC", "aisoc.raw_events"),
 		RedisAddr:       getEnv("REDIS_ADDR", "localhost:6379"),
 		DatabaseDSN:     getEnv("DATABASE_DSN", ""),
 		AttckDataPath:   getEnv("ATTCK_DATA_PATH", "/data/enterprise-attack.json"),
@@ -148,13 +187,19 @@ func Load() (*Config, error) {
 		JWTSecret:       getEnv("JWT_SECRET", ""),
 		MetricsPort:     mustGetEnvInt("METRICS_PORT", 9090),
 
+		// Per-service override wins over the shared platform token, the
+		// same precedence app.security.tenant_scope.resolve_service_token
+		// applies on the Python side.
+		ServiceToken:       getEnvFallback("AISOC_INGEST_SERVICE_TOKEN", "AISOC_SERVICE_TOKEN", ""),
+		IngestMaxBodyBytes: int64(mustGetEnvInt("INGEST_MAX_BODY_BYTES", 10*1024*1024)),
+
 		// Shodan
 		ShodanAPIKey:          getEnv("SHODAN_API_KEY", ""),
 		ShodanEnrichEnabled:   getEnv("SHODAN_ENRICH_ENABLED", "false") == "true",
 		ShodanCacheExpirySecs: mustGetEnvInt("SHODAN_CACHE_EXPIRY_SECS", 3600),
 
 		// CVE correlation
-		VulnCorrelEnabled: getEnv("VULN_CORREL_ENABLED", "true") == "true",
+		VulnCorrelEnabled: getEnv("VULN_CORREL_ENABLED", "false") == "true",
 		VulnKafkaTopic:    getEnv("VULN_KAFKA_TOPIC", "aisoc.vulnerability_matches"),
 		NvdAPIKey:         getEnv("NVD_API_KEY", ""),
 
@@ -162,6 +207,14 @@ func Load() (*Config, error) {
 		InboxEnabled:      getEnv("INBOX_ENABLED", "true") == "true",
 		InboxTemplatesDir: getEnv("INBOX_TEMPLATES_DIR", "/app/templates"),
 		InboxMaxBodyBytes: int64(mustGetEnvInt("INBOX_MAX_BODY_BYTES", 10*1024*1024)),
+		// Defaults sized to be invisible to a well-behaved vendor and
+		// firmly bounding to a runaway one: 50 req/s sustained with a
+		// 200 burst, and 5k events/s with a 20k burst (one large batch
+		// passes; a sustained flood does not).
+		InboxRateRequestsPerSecond: float64(mustGetEnvInt("INBOX_RATE_REQUESTS_PER_SECOND", 50)),
+		InboxRateRequestBurst:      float64(mustGetEnvInt("INBOX_RATE_REQUEST_BURST", 200)),
+		InboxRateEventsPerSecond:   float64(mustGetEnvInt("INBOX_RATE_EVENTS_PER_SECOND", 5000)),
+		InboxRateEventBurst:        float64(mustGetEnvInt("INBOX_RATE_EVENT_BURST", 20000)),
 
 		// Kubernetes audit webhook (Track D, v7.1.0).
 		K8sAuditSharedSecret: getEnv("K8S_AUDIT_SHARED_SECRET", ""),
@@ -196,9 +249,9 @@ func Load() (*Config, error) {
 	}
 
 	// JWT_SECRET is required outside development-class environments. The
-	// previous check exact-matched ``ENV == "development"`` only, so an
-	// operator who set ``ENVIRONMENT=development`` (the alias the Python
-	// API treats as equivalent) without also setting ``ENV`` would crash
+	// previous check exact-matched ENV == "development" only, so an
+	// operator who set ENVIRONMENT=development (the alias the Python
+	// API treats as equivalent) without also setting ENV would crash
 	// here even though every other service treated their stack as dev.
 	// envmode.IsDevRuntime closes that gap.
 	if cfg.JWTSecret == "" && !envmode.IsDevRuntime() {

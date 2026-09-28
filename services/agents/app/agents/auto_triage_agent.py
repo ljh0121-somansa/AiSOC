@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Any
 
@@ -33,9 +34,17 @@ from app.agents.dispositions import (
     TRUE_POSITIVE,
     normalize_disposition,
 )
+from app.context.dispositions import basis as disposition_basis
+from app.context.dispositions import render_for_prompt as render_dispositions
+from app.context.identity import basis as identity_basis
+from app.context.identity import render_for_prompt as render_identity
+from app.context.knowledge_base import citation_basis, unresolvable_citations
+from app.context.knowledge_base import render_for_prompt as render_runbooks
+from app.context.organisation_memory import render_for_prompt
 from app.investigator.prompt_sanitizer import sanitize_text, wrap_untrusted
 from app.llm import safe_ainvoke
 from app.llm.factory import make_chat_model
+from app.llm.structured_output import extract_json_block
 from app.models.state import AgentStatus, InvestigationState
 from app.prompt_serialization import format_extra_fields_for_llm
 from app.prompting.envelope import make_nonce, scan_evidence_fields, system_rule
@@ -43,6 +52,19 @@ from app.prompting.envelope import make_nonce, scan_evidence_fields, system_rule
 logger = structlog.get_logger()
 
 AUTO_CLOSE_THRESHOLD: float = float(os.getenv("AISOC_AUTO_CLOSE_THRESHOLD", "0.85"))
+
+#: Ceiling on the tenant-skill block in the triage prompt. The API caps each
+#: field at authoring time; this is the floor under a body written before
+#: those caps existed, and under a skill whose individually-legal fields sum
+#: to more prompt than the evidence gets.
+_MAX_SKILL_PROMPT_CHARS = 4000
+
+#: Ceiling on each first-party context block. Every renderer caps its own
+#: fields; this is the ceiling on the assembled block, and it exists because
+#: the default `sanitize_text` cap of 2000 would silently cut five analyst
+#: decisions mid-sentence. A truncated list of decisions reads to the model
+#: like a complete one.
+_MAX_CONTEXT_BLOCK_CHARS = 3000
 
 
 class AutoTriageError(RuntimeError):
@@ -66,6 +88,11 @@ _metrics: dict[str, Any] = {
     "btp_count": 0,
     "tp_count": 0,
     "injection_demoted": 0,
+    # Phase 6.3. A rationale citing a runbook marker no retrieved chunk
+    # carries. Counted rather than only logged: this is the one hallucination
+    # the groundedness scorer cannot see, because a marker is not an indicator
+    # and would never appear in the evidence text it checks against.
+    "kb_citations_unresolvable": 0,
 }
 
 _SYSTEM_PROMPT = """\
@@ -140,8 +167,31 @@ def set_threshold(value: float) -> float:
     return AUTO_CLOSE_THRESHOLD
 
 
-def _build_alert_context(state: InvestigationState) -> str:
-    """Serialise the alert into a compact string the LLM can reason over."""
+def _build_alert_context(state: InvestigationState, *, nonce: str) -> str:
+    """Serialise the alert into a compact string the LLM can reason over.
+
+    ``state.organisation_memory`` is prepended, outside the untrusted-evidence
+    fence, because it is not evidence: it is the tenant's own compiled record
+    of what analysts have repeatedly said is normal here. It is still
+    sanitised and length-capped — the statements interpolate alert-derived
+    values like a process name, so they are tenant-authored but not
+    operator-typed.
+
+    ``state.tenant_skill`` sits beside it on the same reasoning and with the
+    same treatment. It is typed into the console by a user holding
+    ``settings:write``, which is the same trust class, and it is capped for
+    the reason that applies regardless of trust: the prompt budget is shared
+    with the evidence the verdict is supposed to rest on. The block the
+    resolver rendered is used verbatim rather than re-rendered here, so the
+    text that steered the verdict is the text the provenance record names.
+
+    ``state.knowledge_base`` is the one that does **not** sit beside them, and
+    that is the whole reason this function now takes a nonce. A runbook is
+    long, frequently imported in bulk, edited by more people than a skill, and
+    routinely quotes attacker output verbatim while doing its job. So it goes
+    inside a nonce fence of its own, with the boundary sentence stated inline,
+    exactly as an MCP reply does. See ``app.context.knowledge_base``.
+    """
     raw = state.raw_alert
     parts = [
         f"Alert Summary: {sanitize_text(state.alert_summary)}",
@@ -172,16 +222,147 @@ def _build_alert_context(state: InvestigationState) -> str:
         extras = {k: raw[k] for k in sorted(extra_keys)[:10]}
         parts.append("Additional fields (summary, not raw JSON):\n" + format_extra_fields_for_llm(extras))
 
-    return wrap_untrusted("\n".join(parts), label="alert_telemetry")
+    telemetry = wrap_untrusted("\n".join(parts), label="alert_telemetry")
+
+    preamble: list[str] = []
+    skill = state.tenant_skill or {}
+    skill_guidance = str(skill.get("triage_guidance") or "").strip()
+    if skill_guidance:
+        preamble.append(sanitize_text(skill_guidance)[:_MAX_SKILL_PROMPT_CHARS])
+    memory = render_for_prompt(state.organisation_memory)
+    if memory:
+        preamble.append(sanitize_text(memory))
+
+    # Both first-party, so both sit in the preamble beside organisation memory
+    # rather than inside the fence. A disposition and a reason code come from
+    # a closed server-owned vocabulary and the note is typed by an
+    # authenticated analyst; a directory record comes from the tenant's own
+    # import. Each renderer sanitises and caps its own fields, and
+    # `sanitize_text` here is the second pass the memory block already gets.
+    decisions = render_dispositions(state.recent_dispositions)
+    if decisions:
+        preamble.append(sanitize_text(decisions, max_len=_MAX_CONTEXT_BLOCK_CHARS))
+    who = render_identity(state.identity_context)
+    if who:
+        preamble.append(sanitize_text(who, max_len=_MAX_CONTEXT_BLOCK_CHARS))
+
+    # Not sanitised again on the way in: the retrieval already capped and
+    # sanitised each chunk, and `render_runbooks` fences the result. Running
+    # `sanitize_text` over the rendered block would rewrite the nonce markers
+    # it just placed, which is the one thing holding the fence together.
+    runbooks = render_runbooks(state.knowledge_base, nonce=nonce)
+
+    if not preamble and not runbooks:
+        return telemetry
+    return "\n\n".join([*preamble, *([runbooks] if runbooks else []), telemetry])
+
+
+def _close_truncated_json(fragment: str) -> str:
+    """Close an object the model started and did not finish.
+
+    Small local models stop mid-object more or less routinely — with
+    ``finish_reason: "stop"``, not a token limit, so there is nothing to raise
+    by giving them more room. Measured against the model CORE ships
+    (``llama3.2:3b-instruct-q4_K_M``), a triage response arrived as::
+
+        {
+          "verdict": "true_positive",
+          "confidence": 0.8,
+          "rationale": "…uncertainty remains due to the lack of IOCs.
+
+    with the closing quote and brace simply absent. Every field the caller
+    reads was present and correct; the response was discarded and the alert
+    fell through to deterministic triage.
+
+    This closes any open string and any unclosed brackets, and does nothing
+    else. It cannot invent a field: a fragment that never reached ``verdict``
+    still parses to an object without one, and the caller's
+    ``normalize_disposition(..., default=TRUE_POSITIVE)`` fails safe to the
+    conservative verdict exactly as it does for a malformed response today.
+    """
+    in_string = False
+    escaped = False
+    stack: list[str] = []
+    for ch in fragment:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and in_string:
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]" and stack:
+            stack.pop()
+
+    repaired = fragment
+    if in_string:
+        # Drop a dangling escape before closing, or the quote is consumed by it.
+        if escaped:
+            repaired = repaired[:-1]
+        repaired += '"'
+    # A trailing comma or bare key left by the cut is not recoverable; strip it.
+    repaired = re.sub(r",\s*$", "", repaired)
+    return repaired + "".join(reversed(stack))
+
+
+_NEUTRAL_CONFIDENCE = 0.5
+
+
+def _coerce_confidence(value: Any) -> float:
+    """Read a confidence, and never discard a verdict over this field alone.
+
+    ``float(value)`` was unguarded here. A model answering ``"confidence":
+    "high"`` raised ``ValueError``, which the caller turns into an
+    ``AutoTriageError``, throwing away a verdict and rationale that may have
+    been perfectly good because one field of three was the wrong type.
+
+    Not observed in the 70 measured calls behind this change — the failures
+    there were all malformed ``rationale`` — but it is reachable by any model
+    on any alert, and the cost of it firing is a fallback nobody can explain.
+
+    Degrading to a neutral value is safe *here* specifically because confidence
+    is a gate, not a verdict: ``run_auto_triage`` auto-closes only when
+    ``confidence >= AUTO_CLOSE_THRESHOLD``, which defaults to 0.85, so 0.5
+    routes to a human. An operator who lowers that below the neutral value is
+    choosing to auto-close on an unread field, which is why this returns the
+    neutral constant rather than 0.0 — a deployment that trusts everything
+    should not be handed a number that also fails every other comparison.
+    It is the verdict itself that must never be guessed, and that still fails
+    closed through ``normalize_disposition``.
+    """
+    if isinstance(value, bool):  # bool is an int; "confidence": true means nothing
+        return _NEUTRAL_CONFIDENCE
+    if isinstance(value, int | float):
+        return max(0.0, min(1.0, float(value)))
+    if isinstance(value, str):
+        text = value.strip().rstrip("%")
+        try:
+            number = float(text)
+        except ValueError:
+            return _NEUTRAL_CONFIDENCE
+        # "85%" and "85" both mean 0.85; a bare 0.85 already does.
+        if number > 1.0:
+            number /= 100.0
+        return max(0.0, min(1.0, number))
+    return _NEUTRAL_CONFIDENCE
 
 
 def _parse_llm_response(text: str) -> dict[str, Any]:
-    """Extract the JSON verdict from the LLM response, tolerating markdown fences."""
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.split("\n")
-        lines = [line for line in lines if not line.strip().startswith("```")]
-        cleaned = "\n".join(lines).strip()
+    """Extract the JSON verdict from the LLM response, tolerating markdown fences.
+
+    Extraction is shared with every other caller through
+    ``app.llm.structured_output.extract_json_block``: fences, and prose on
+    either side of the body. What stays here is the part that is specific to a
+    triage verdict — the taxonomy, the confidence gate, and the one repair
+    below. Extraction is a property of LLM replies; a verdict is not.
+    """
+    cleaned = extract_json_block(text)
 
     try:
         data = json.loads(cleaned)
@@ -190,6 +371,10 @@ def _parse_llm_response(text: str) -> dict[str, Any]:
         end = cleaned.rfind("}") + 1
         if start >= 0 and end > start:
             data = json.loads(cleaned[start:end])
+        elif start >= 0:
+            # An object was opened and never closed. Repair once, then give up
+            # and let the caller fall back to deterministic triage.
+            data = json.loads(_close_truncated_json(cleaned[start:]))
         else:
             raise
 
@@ -200,8 +385,7 @@ def _parse_llm_response(text: str) -> dict[str, Any]:
     if verdict not in LLM_VERDICTS:
         verdict = TRUE_POSITIVE
 
-    confidence = float(data.get("confidence", 0.5))
-    confidence = max(0.0, min(1.0, confidence))
+    confidence = _coerce_confidence(data.get("confidence"))
 
     rationale = data.get("rationale", "No rationale provided by LLM.")
 
@@ -230,17 +414,17 @@ async def run_auto_triage(state: InvestigationState) -> InvestigationState:
     injection = scan_evidence_fields((str(k), v) for k, v in raw.items() if isinstance(v, str | int | float | list | dict))
     nonce = make_nonce()
 
-    alert_context = _build_alert_context(state)
-
-    llm = make_chat_model(
-        "triage",
-        temperature=0.0,
-        max_tokens=512,
-        model_kwargs={"response_format": {"type": "json_object"}},
-    )
+    alert_context = _build_alert_context(state, nonce=nonce)
 
     t0 = time.monotonic()
     try:
+        # Inside the try: "the model could not be built" and "the call failed"
+        # are the same condition to every caller, and only one of them used to
+        # become an AutoTriageError. An unroutable gateway alias raises here,
+        # and auto_triage_node catches AutoTriageError specifically — so
+        # constructing outside would have failed the whole graph run over a
+        # configuration problem the deterministic path handles fine.
+        llm = make_chat_model("triage", temperature=0.0, max_tokens=512, json_output=True)
         response = await safe_ainvoke(
             llm,
             [
@@ -254,7 +438,15 @@ async def run_auto_triage(state: InvestigationState) -> InvestigationState:
         # Issue #571: do NOT swallow + return a null-verdict RUNNING state.
         # Raise a typed error so the caller falls back to deterministic triage
         # (or marks the alert needs_review) instead of completing with no verdict.
-        logger.error("Auto-triage LLM call failed", error=str(exc))
+        #
+        # The response excerpt is logged with it. A parse failure whose message
+        # is a character offset into text nobody kept is not diagnosable: the
+        # only way to find out what a model actually emitted was to reproduce
+        # the prompt by hand against the gateway. Bounded at 400 characters,
+        # and it is the model's own words about an alert this service already
+        # logs the summary of.
+        excerpt = str(locals().get("raw_text") or "")[:400].replace("\n", "\\n")
+        logger.error("Auto-triage LLM call failed", error=str(exc), response_excerpt=excerpt)
         state.add_finding(f"Auto-triage LLM error: {exc}")
         _metrics["total_processed"] += 1
         raise AutoTriageError(str(exc)) from exc
@@ -285,6 +477,35 @@ async def run_auto_triage(state: InvestigationState) -> InvestigationState:
         f"LLM confidence: {confidence:.2f}",
         f"Rationale: {rationale}",
     ]
+    # Which version of which skill was in the prompt that produced this
+    # verdict. On the basis rather than only in a log line, because this is
+    # the field a disputed auto-close is explained from, and a log line is
+    # gone long before the dispute arrives.
+    skill_ref = str((state.tenant_skill or {}).get("ref") or "")
+    if skill_ref:
+        owner = str((state.tenant_skill or {}).get("owner") or "unrecorded")
+        state.confidence_basis.append(f"Tenant skill applied: {skill_ref} (owner: {owner})")
+
+    # Which runbook chunks the prompt carried, by the markers the rationale
+    # cites. Recorded on the basis for the same reason the skill reference is:
+    # a citation whose target nobody can find is not a citation, and the
+    # retrieval that produced it is cached and gone by the time anyone asks.
+    state.confidence_basis.extend(citation_basis(state.knowledge_base))
+    state.confidence_basis.extend(disposition_basis(state.recent_dispositions))
+    state.confidence_basis.extend(identity_basis(state.identity_context))
+    unresolvable = unresolvable_citations(rationale, state.knowledge_base)
+    if unresolvable:
+        # The model cited a runbook that was never retrieved. Named rather
+        # than left in the rationale looking like the others, because a marker
+        # that resolves to nothing is indistinguishable from one that resolves
+        # until somebody goes looking for the document.
+        state.confidence_basis.append(f"Knowledge base: the rationale cites {', '.join(unresolvable)}, which no retrieved chunk carries")
+        _metrics["kb_citations_unresolvable"] += 1
+        logger.warning(
+            "auto_triage.unresolvable_kb_citation",
+            incident_id=str(state.incident_id),
+            cited=unresolvable,
+        )
 
     state.add_finding(f"Auto-triage: verdict={verdict}, confidence={confidence:.2f}, latency={elapsed_ms}ms")
     state.add_finding(f"Auto-triage rationale: {rationale}")

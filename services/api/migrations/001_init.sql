@@ -197,7 +197,7 @@ CREATE INDEX IF NOT EXISTS idx_rules_enabled ON detection_rules(enabled);
 CREATE INDEX IF NOT EXISTS idx_rules_type    ON detection_rules(rule_type);
 
 -- ──────────────────────────────────────────────────────────────────────────────
--- Seed: default tenant & admin user
+-- Seed: default tenant
 -- ──────────────────────────────────────────────────────────────────────────────
 
 INSERT INTO tenants (id, name, slug, plan)
@@ -205,12 +205,17 @@ VALUES
     ('00000000-0000-0000-0000-000000000001', 'SOMANSA', 'default', 'enterprise')
 ON CONFLICT (slug) DO NOTHING;
 
--- password = "admin" (bcrypt)
+-- SOMANSA default-tenant administrator is seeded here (AiSOC custom).
+--
+-- NOTE: this is a deployment-time default credential. Operators should
+-- reset it after first login; bootstrap_admin.py can re-run against this
+-- same tenant to mint a fresh password. See
+-- services/api/app/scripts/bootstrap_admin.py.
 INSERT INTO users (id, tenant_id, email, username, hashed_password, role, is_active, is_verified)
 VALUES (
     '00000000-0000-0000-0000-000000000002',
     '00000000-0000-0000-0000-000000000001',
-    'admin@somansa.com',
+    'admin@omansa.com',
     'admin',
     '$2b$12$b4lDfeFRZFPAoW.0ccPl..kxZarIgm4NrwFvXjJS65phRFv46nILK',
     'platform_admin',

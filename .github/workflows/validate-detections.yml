@@ -18,7 +18,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -27,6 +27,36 @@ jobs:
 
       - name: Install PyYAML
         run: pip install pyyaml
+
+      - name: Install the runtime deps the fireability proof replays through
+        # The proof runs a real connector's normalize() and the real
+        # DetectionEngine rather than a copy of either, so it needs what those
+        # modules import. A gate that reimplemented them would need nothing
+        # here and would also prove nothing.
+        # `cryptography` is bounded to match every other install path: the
+        # vault's Fernet token format and the Ed25519 plugin signatures are
+        # behaviour, not a library preference, so an unbounded install here
+        # would be a build of this commit running software nobody tested.
+        run: pip install structlog httpx pydantic pydantic-settings "cryptography>=46,<51"
+
+      - name: Rule ids must be stable
+        # Ids were positional, so inserting a rule renumbered every rule
+        # after it — and ids appear in alert rows, suppression priors and
+        # customer-written exceptions, so a renumber makes a historical
+        # alert reference a different rule than the one that fired. The
+        # workaround was "append, never insert", which nothing enforced.
+        run: |
+          python3 -m pip install --quiet pytest
+          python3 -m pytest tests/test_detection_id_stability.py -q
+
+      - name: The committed pack must be what the generator emits
+        # The lock made ids position-independent but nothing reconciled it
+        # against the YAML already on disk, and no gate compared the two. The
+        # committed pack fell 45 network ids behind, so the id the engine
+        # stamps onto an alert and the id the catalogue publishes for the same
+        # rule named different rules. Unreviewed drift in a generated artifact
+        # is not cosmetic when the artifact is a join key.
+        run: python3 scripts/generate_detections.py --check
 
       - name: Run detection rule validator (strict fixture replay)
         run: python3 scripts/validate_detections.py --strict-fixtures
@@ -46,6 +76,37 @@ jobs:
         # specs). Fails if the specs changed without re-exporting, so the live
         # worker can't silently drift from the committed corpus.
         run: python3 scripts/export_detection_ruleset.py --check
+
+      # A rule can be loaded by the engine, pass fixture replay, count toward
+      # the published executable total, and still never fire — because the
+      # matcher does a flat `event.get(field)` and nothing ever computes the
+      # field. Fixture replay cannot catch this: fixtures are synthesized from
+      # the rule they test, so replaying them is a tautology. Ratcheted rather
+      # than clean, because the corpus already contains such rules and blocking
+      # every unrelated PR on them would only invite weakening the gate.
+      - name: Verify detection rules match on fields that exist
+        run: python3 scripts/check_detection_fields.py
+
+      # The windowed engine loads its corpus from a JSON artifact the same way
+      # the stateless one does, so it needs the same drift gate: a spec change
+      # without a re-export would leave the deployed engine running a corpus
+      # nobody reviewed.
+      - name: Verify exported windowed ruleset is current
+        run: python3 scripts/export_windowed_ruleset.py --check
+
+      # Recompiles every imported Sigma rule AND re-proves it: each shipped
+      # rule is replayed, as a vendor-shaped event, through its connector's
+      # real normalize() and the real engine. A rule that stops firing — because
+      # a connector changed what it emits, or the matcher changed what an
+      # operator means — fails here rather than going quiet in production.
+      - name: Verify compiled Sigma ruleset is current and still fires
+        run: python3 scripts/compile_sigma_ruleset.py --check
+
+      # The proof above only means something if it can fail. This reverts the
+      # connector to the behaviour that made Windows fields unreachable and
+      # requires every rule depending on them to stop firing.
+      - name: Prove the fireability gate is not vacuous
+        run: python3 scripts/compile_sigma_ruleset.py --prove-gate
 
       - name: Count rules by severity
         if: always()

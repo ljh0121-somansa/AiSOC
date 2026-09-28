@@ -40,7 +40,8 @@ if TYPE_CHECKING:
 # CONTAIN / REMEDIATE / TICKET / AUDIT). Adding a new capability:
 #   1. Add the enum member here.
 #   2. Update the relevant connectors' ``capabilities()`` classmethod.
-#   3. Update ``test_capabilities`` in ``services/connectors/tests/test_capabilities.py``.
+#   3. Keep ``test_every_declared_capability_is_a_valid_verb`` in
+#      ``services/connectors/tests/test_conformance.py`` passing.
 #
 # Per-instance downscoping happens in the API layer: an operator can store an
 # ``allowed_capabilities`` whitelist on a ``Connector`` row and the agent
@@ -96,6 +97,15 @@ class Capability(str, Enum):
     QUARANTINE_FILE = "quarantine_file"
     BLOCK_HASH = "block_hash"
     BLOCK_DOMAIN = "block_domain"
+    # Reverse verbs. Every containment action whose contract declares a
+    # platform rollback needs its reverse in the vocabulary, otherwise the
+    # rollback path resolves to nothing while believing it has a route back.
+    # See services/actions/app/live_actions/capability_contracts.py.
+    RESTORE_FILE = "restore_file"
+    ALLOW_HASH = "allow_hash"
+    ALLOW_DOMAIN = "allow_domain"
+    ALLOW_IOC = "allow_ioc"
+    ENABLE_USER = "enable_user"
     BLOCK_USER_SIGNIN = "block_user_signin"
     DISABLE_USER = "disable_user"
     REVOKE_SESSION = "revoke_session"
@@ -115,14 +125,58 @@ class Capability(str, Enum):
     SUSPEND_SESSION = "suspend_session"
     FORCE_MFA = "force_mfa"
     # SIEM response (Splunk + Elastic)
+    # Read-only investigation verbs. Mirrored from the actions service,
+    # where a CI check asserts the two vocabularies stay identical — a
+    # verb present on one side only resolves to executor_not_found at
+    # dispatch, which reads as a missing integration rather than a
+    # missing enum member.
+    GET_HOST = "get_host"
+    GET_DETECTIONS = "get_detections"
+    GET_USER_ACTIVITY = "get_user_activity"
+    # Gap-closure Phase 4.2. Two reads that do not fit the three above
+    # because their subject is neither a host nor a principal: a cloud
+    # control-plane audit trail, and endpoint telemetry searched by
+    # indicator. Both take typed arguments and build their own query text
+    # server-side, which is the point: an investigation agent can reach
+    # these, and the plan forbids a model composing query text against a
+    # customer's estate.
+    LOOKUP_CLOUD_AUDIT = "lookup_cloud_audit"
+    LOOKUP_ENDPOINT_TELEMETRY = "lookup_endpoint_telemetry"
     SEARCH_SIEM = "search_siem"
     CREATE_NOTABLE_EVENT = "create_notable_event"
     SYNC_DETECTION_RULE = "sync_detection_rule"
     UPDATE_WATCHER = "update_watcher"
+    # The return leg. Ingest carries a vendor finding id in as `external_id`;
+    # this verb carries AiSOC's verdict back out to the same finding, so a
+    # notable AiSOC dismissed is not re-triaged by a human in Splunk.
+    UPDATE_ALERT_DISPOSITION = "update_alert_disposition"
+    # Alert lifecycle. Both have had Splunk, Elastic and Defender arms since
+    # Phase 3.3 and appeared in neither vocabulary, so the only way to reach
+    # working code was the ungoverned ActionType REST route.
+    ACK_ALERT = "ack_alert"
+    SUPPRESS_ALERT = "suppress_alert"
+
+    # EVIDENCE — acquire artefacts from a host before they age out.
+    # The investigation agent proposes this on the C2 / exfiltration path and
+    # nothing implemented it, so the product recommended an acquisition it
+    # could not perform at the point where evidence matters most.
+    CAPTURE_FORENSICS = "capture_forensics"
+
+    # HUMAN-IN-THE-LOOP — ask the affected person a question and route the
+    # answer back onto the case. Distinct from NOTIFY: notify tells a SOC
+    # channel something, this asks an end user to confirm or deny, and the
+    # action is not finished until they answer.
+    CHATOPS_VERIFY = "chatops_verify"
 
     # TICKET — bidirectional ITSM (Jira / ServiceNow / etc.).
     PUSH_CASE = "push_case"
     PUSH_STATUS = "push_status"
+    # Registered against Jira, ServiceNow, PagerDuty and Slack for as long as
+    # those adapters have existed, and absent here — so the registry logged
+    # `capability_unknown` for four executors at every startup. Distinct from
+    # push_case, which syncs an existing case rather than opening a record.
+    CREATE_TICKET = "create_ticket"
+    NOTIFY = "notify"
 
     # AUDIT — read-only configuration / posture queries.
     READ_AUDIT_TRAIL = "read_audit_trail"
@@ -171,8 +225,13 @@ CAPABILITY_GROUPS: tuple[tuple[str, tuple[Capability, ...]], ...] = (
             Capability.UNISOLATE_HOST,
             Capability.KILL_PROCESS,
             Capability.QUARANTINE_FILE,
+            Capability.RESTORE_FILE,
             Capability.BLOCK_HASH,
+            Capability.ALLOW_HASH,
             Capability.BLOCK_DOMAIN,
+            Capability.ALLOW_DOMAIN,
+            Capability.ALLOW_IOC,
+            Capability.ENABLE_USER,
         ),
     ),
     (

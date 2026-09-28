@@ -83,20 +83,70 @@ collapsed into this set in each connector's `normalize()`.
 
 ## Steps
 
-Each step has a `type` that maps to a handler in
-[`engine.py`](https://github.com/beenuar/AiSOC/tree/main/services/agents/app/playbook/engine.py).
+Each step has a `type`. The authoring contract is
+[`schemas/playbook.schema.json`](https://github.com/beenuar/AiSOC/tree/main/schemas/playbook.schema.json),
+and its `x-aisoc-execution` map records what
+[`engine.py`](https://github.com/beenuar/AiSOC/tree/main/services/agents/app/playbook/engine.py)
+actually does with each one. `scripts/check_playbook_schema_parity.py` holds
+the two together in both directions, so the table below cannot quietly stop
+being true.
+
+**Executed** — a handler runs and has a real effect:
 
 | `type` | What it does |
 |--------|--------------|
 | `enrich` | Calls the enrichment service for IOC reputation, geo, ASN, GreyNoise, VT, OTX. |
 | `investigate` | Triggers the AI investigator agent with focus areas (`forensics`, `lateral_movement`, etc.). |
-| `notify` | Sends a webhook, Slack, PagerDuty, or email notification. |
-| `block_ip` | Calls a firewall/EDR connector to block an IP (currently simulated for safety in OSS builds). |
-| `isolate_host` | Calls EDR to isolate a host (simulated by default). |
-| `create_ticket` | Opens a ticket in Jira / ServiceNow / Linear via connector. |
+| `notify` | Sends a webhook notification. SSRF-guarded. |
+| `http` | Generic outbound HTTP request — `method`, `url`, `body`, `headers`. SSRF-guarded. |
 | `close_case` | Marks the AiSOC case as closed via the API service. |
-| `http` | Generic outbound HTTP request — `method`, `url`, `body`, `headers`. |
 | `condition` | Pure branching node. Evaluates `condition` and routes to `next_true` / `next_false`. |
+| `osquery_live_query` | Distributed osquery via osctrl / FleetDM / aisoc-direct, against an allow-listed template. |
+
+**Governed** — the step is dispatched to the action registry in the actions
+service, which grades it against the verb's own capability contract and the
+tenant's autonomy policy before anything reaches a vendor:
+
+`block_ip`, `block_ioc`, `isolate_host`, `kill_process`, `quarantine_file`,
+`run_av_scan`, `run_script`, `disable_user`, `reset_password`,
+`revoke_session`, `force_mfa`, `search_siem`, `create_notable_event`,
+`create_ticket`.
+
+Each step is dispatched **individually**. Approving or running a playbook does
+not authorise whatever its steps happen to contain: the contract is applied
+per verb, per step, at the moment that step runs. See
+[Live actions](./live-actions.md) for what each verb declares about its impact,
+reversibility, approval requirement and verification probe.
+
+What comes back is a report whose `executed` field is the single thing that
+means a vendor was actually touched:
+
+| `status` | `executed` | Meaning |
+|----------|-----------|---------|
+| `executed` | `true` | The vendor ran it. `verification` says whether a probe confirmed the effect, or `unverified` if no probe exists. |
+| `awaiting_completion` | `true` | The vendor accepted it and the outcome is not known yet. |
+| `dry_run` | `false` | Previewed. This is the default posture — see below. |
+| `pending_approval` | `false` | Held for an analyst by the contract or the tenant's tier. Nothing ran. |
+| `blocked` | `false` | Refused by tenant policy. |
+| `simulated` | `false` | The executor found no usable credentials and took its safe path. |
+| `no_integration` | `false` | The verb is supported and this tenant has no enabled connector that performs it. |
+| `unsupported` | `false` | No executor is registered for this verb in this deployment. |
+| `failed` | `false` | The vendor or the dispatch itself failed. |
+
+A step that did not execute is recorded `FAILED`, so the run halts under the
+default `on_failure: abort`. This is deliberate: the steps after a containment
+assume the containment happened.
+
+**Execution is off by default.** `AISOC_PLAYBOOK_ACTIONS_EXECUTE` is unset, so
+response steps preview and report `dry_run`. Set it to `1` to let a playbook
+touch a vendor — and note that governance can still refuse an execution this
+allows, and can never allow one it refuses. `AISOC_AGENTS_SERVICE_TOKEN` must
+also be set, or the agents service cannot reach the API's service path and the
+step fails closed saying so.
+
+**No handler** — `approval` is the one step type the engine accepts and cannot
+run. It fails closed with a reason; see
+[Approvals and dry-runs](#approvals-and-dry-runs) below.
 
 Common step fields:
 
@@ -138,34 +188,64 @@ handling.
 - `on_failure: "abort"` (default) — failed step stops the run, marks it
   `FAILED`, and emits `run.done` with the error.
 - `on_failure: "continue"` — log the failure but proceed to the next step.
-  Useful for best-effort enrichment that shouldn't block containment.
+  Useful for best-effort enrichment that shouldn't block containment. It
+  decides whether the run keeps going, not what the run is called: a run that
+  finishes with any failed step is `FAILED`, with an error naming how many and
+  which. A green tick over a containment that never happened is the same fake
+  success one level up.
 - `on_failure: "retry"` — combined with `retry_max`, retries with exponential
   backoff before falling back to whatever you set as the next-failure mode.
 - Cycle detection — if the engine revisits the same `step.id`, it aborts with
   `error: "cycle at step <id>"` rather than looping forever.
-- Unknown step type — the step is recorded as `SKIPPED` with
-  `reason: "no handler for <type>"` so unknown actions never silently succeed.
+- Step type with no handler — the step is recorded as `FAILED` with
+  `unimplemented: true` and an error naming the verb, so a step the engine
+  cannot run never reports success. It is not retried: a handler that is
+  missing now will still be missing on the next attempt.
+
+  This page previously said such a step was recorded as `SKIPPED` "so unknown
+  actions never silently succeed". The engine did put `skipped: true` in the
+  result, but left the step's *status* at `SUCCESS` and the run completed —
+  so the documented safety property was the opposite of the behaviour. It now
+  does what this section always claimed.
 
 Each step result includes `_elapsed_ms` so you can see per-step latency in the
 UI and in run history.
 
 ## Approvals and dry-runs
 
-Two patterns are supported today for human-in-the-loop steps:
+**`dry_run` flag** — pass `dry_run: true` when calling
+`PlaybookEngine.run(...)`. Handlers short-circuit with
+`{"dry_run": true, "executed": false, "step": <name>}` and emit the same
+realtime events, so you can preview an entire run without touching
+production. A governed step additionally reports `would_dispatch` and the
+`target` it resolved, so a preview of a containment playbook reads as one. A
+step whose type has no handler is reported as
+`unimplemented: true, would_fail: true`, so a preview tells you which steps a
+real run would stop on.
 
-1. **`dry_run` flag** — pass `dry_run: true` when calling
-   `PlaybookEngine.run(...)` (or set `dry_run` in step params for individual
-   destructive actions). Handlers short-circuit with
-   `{"dry_run": true, "step": <name>}` and emit the same realtime events, so
-   you can preview an entire run without touching production.
-2. **Manual approval gate** — model the gate as a `condition` step backed by a
-   field that an operator sets via the API (`POST /v1/playbook-runs/{id}/approve`).
-   The engine pauses on the condition until the field flips, then resumes.
+**An `approval` step is not implemented, and is no longer the mechanism.**
+The engine is a single pass with no pause or resume, so there is nothing to
+suspend and nothing to wake. It fails closed with a reason rather than
+pretending, which halts the run under the default `on_failure: abort`.
 
-`block_ip`, `isolate_host`, and `create_ticket` are simulated by default in OSS
-builds (they return `{"simulated": true, ...}`). Wire them to real connectors
-by editing the corresponding handler in `engine.py` or by replacing the step
-with an `http` step that calls your connector's enforcement endpoint.
+You usually do not need one. Every response step is graded against its own
+capability contract at dispatch and comes back `pending_approval` on its own
+when a human is required — `isolate_host`, for instance, declares
+`approval: analyst`, which no autonomy tier or confidence level lifts. An
+`approval` step in front of it would gate a decision that is already gated.
+
+Where you want an action to actually wait for a named approver, submit it to
+the actions service (`POST /actions`), which holds it at `awaiting_approval`
+and records the deciding principal. That path is real and audited.
+
+This section previously described a second supported pattern: model the gate
+as a `condition` step backed by a field an operator sets via
+`POST /v1/playbook-runs/{id}/approve`, and "the engine pauses on the condition
+until the field flips, then resumes". No such endpoint exists, and the engine
+has no pause or resume — the loop evaluates each condition once against the
+run context and moves on. Worse, until recently an `approval` step reported
+`SUCCESS` without doing anything, so a playbook that modelled a gate ran
+straight through it into whatever it was gating.
 
 ## Realtime events
 

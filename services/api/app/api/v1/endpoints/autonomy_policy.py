@@ -19,18 +19,95 @@ role — see ``services/api/app/core/security.py``).
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 
 import structlog
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import text
+from starlette.convertors import Convertor, register_url_convertor
 
+from app._vendor.autonomy_evidence_rules import PromotionThresholds
 from app.api.v1.deps import AuthUser, DBSession
+from app.db.rls import TenantDBSession
+from app.services.autonomy_grants import (
+    GrantScopeError,
+    list_grants,
+    reconcile_grants,
+    request_promotion,
+    revoke_grant,
+)
+from app.services.shadow_agreement import (
+    SCOPE_COLUMNS,
+    agreement_for,
+    breakdown_for,
+    reconcile_local_closures,
+)
 
 logger = structlog.get_logger()
 
 router = APIRouter(prefix="/autonomy-policy", tags=["autonomy-policy"])
+
+
+# ---------------------------------------------------------------------------
+# `{action}` sits at this router's root, so it competes with every literal
+# sub-resource the router has. `DELETE /grants` lost that competition: FastAPI
+# matches in registration order, `DELETE /{action}` is declared several hundred
+# lines earlier, and so the revocation handler was unreachable. An operator
+# could earn an autonomy grant and not hand it back, which is a safety control
+# failing in the one direction that matters.
+#
+# Ordering the literals first would fix the symptom, but the constraint would
+# live nowhere except the order of the file and the next edit could silently
+# undo it. Constraining the parameter instead puts the exclusion in the route's
+# own matching regex, which is what Starlette compares a request against:
+# `/autonomy-policy/grants` no longer matches `/{action}` at all, so the
+# literal route is reached wherever either one is declared.
+#
+# FastAPI's `Path(pattern=...)` cannot do this. It is validation applied after
+# a route has already matched, so a reserved name would answer 422 instead of
+# falling through, and pydantic's regex engine rejects look-around outright.
+# Only a path convertor takes part in matching.
+#
+# The reserved set has to stay in step with the literals the router actually
+# serves; `test_route_shadowing.py` asserts that against the running app rather
+# than leaving it to be remembered here.
+# ---------------------------------------------------------------------------
+
+#: Literal sub-resources of this router. Not action names.
+RESERVED_SEGMENTS = ("agreement", "grants", "shadow-mode")
+
+#: Same shape `upsert_action_threshold` enforces on the body of an action name.
+_MAX_ACTION_LEN = 100
+
+#: The two routes that take an action spell this out rather than sharing a
+#: constant, because a decorator given a variable is a path no static reader
+#: can resolve, and `check_route_shadowing.py` would skip the pair silently.
+#: Drift is not a risk: Starlette raises on an unknown convertor at import.
+ACTION_CONVERTOR_NAME = "autonomy_action"
+
+
+class _ActionNameConvertor(Convertor):
+    """An action name: alphanumeric and underscores, and never a sub-resource.
+
+    Built from `RESERVED_SEGMENTS` rather than written out, so the tuple above
+    and the regex here cannot come to disagree.
+    """
+
+    regex = r"(?!(?:{})\Z)[A-Za-z0-9_]{{1,{}}}".format(
+        "|".join(re.escape(segment) for segment in RESERVED_SEGMENTS),
+        _MAX_ACTION_LEN,
+    )
+
+    def convert(self, value: str) -> str:
+        return value
+
+    def to_string(self, value: str) -> str:
+        return value
+
+
+register_url_convertor(ACTION_CONVERTOR_NAME, _ActionNameConvertor())
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +381,7 @@ async def get_autonomy_policy(
     return AutonomyPolicyResponse(tenant_id=str(user.tenant_id), actions=actions)
 
 
-@router.put("/{action}", response_model=ThresholdUpdateResponse)
+@router.put("/{action:autonomy_action}", response_model=ThresholdUpdateResponse)
 async def upsert_action_threshold(
     action: str,
     payload: ThresholdUpdateRequest,
@@ -430,7 +507,7 @@ async def upsert_action_threshold(
     )
 
 
-@router.delete("/{action}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
+@router.delete("/{action:autonomy_action}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 async def reset_action_threshold(
     action: str,
     user: AuthUser,
@@ -469,3 +546,437 @@ async def reset_action_threshold(
         action=action,
         reset_by=user.email,
     )
+
+
+# ---------------------------------------------------------------------------
+# Shadow mode and rolling agreement (gap-closure Phase 2.1 and 2.2)
+#
+# The thresholds above answer "how confident must the agent be". These answer
+# a different question the same admin screen has to carry: "has it earned the
+# right to be believed". They live in this module rather than beside it
+# because an operator raising an autonomy threshold and an operator reading
+# the track record that justifies it are the same person on the same visit,
+# and splitting the two across routers would mean neither surface shows both.
+# ---------------------------------------------------------------------------
+
+#: Matches every class. What a tenant turns on first, before they know which
+#: classes their own queue contains.
+WILDCARD = "*"
+
+#: An alert class is an `alerts.category` value. Constrained here so a caller
+#: cannot write a 2 KB string into a primary key, and lower-cased so `Identity`
+#: and `identity` are not two classes with half the evidence each.
+_MAX_CLASS_LEN = 100
+
+
+class ShadowModeEntry(BaseModel):
+    alert_class: str
+    enabled: bool
+    enabled_at: str | None = None
+    updated_at: str | None = None
+    updated_by: str | None = None
+
+
+class ShadowModeResponse(BaseModel):
+    tenant_id: str
+    entries: list[ShadowModeEntry]
+
+
+class ShadowModeUpdateRequest(BaseModel):
+    enabled: bool
+
+
+class AgreementWindowModel(BaseModel):
+    """Counts, and the rates derived from them.
+
+    Every rate is optional and is ``null`` when its denominator was zero. The
+    console renders that as "not measured". A zero here would say the agent
+    was wrong every time, which is a different fact with a different remedy,
+    and it is the more flattering of the two to print by accident in the
+    abstention column and the more damning in the agreement column.
+    """
+
+    resolved: int
+    labelled: int
+    unlabeled: int
+    answered: int
+    abstained: int
+    agreed: int
+    malicious_support: int
+    malicious_caught: int
+    agreement_rate: float | None = None
+    malicious_recall: float | None = None
+    abstention_rate: float | None = None
+
+
+class AgreementScopeModel(BaseModel):
+    key: str
+    window: AgreementWindowModel
+
+
+class AgreementResponse(BaseModel):
+    tenant_id: str
+    scope_kind: str
+    scope_key: str
+    window: AgreementWindowModel
+    #: The trailing slice of the most recent decisions, scored separately.
+    #: A window average is where a gradual decline hides, so the surface that
+    #: justifies a promotion has to show both or it is showing the flattering
+    #: half.
+    recent: AgreementWindowModel
+    window_start: str
+    window_end: str
+    thresholds: dict[str, float | int]
+    reconciled: int
+    by_alert_class: list[AgreementScopeModel]
+    by_rule: list[AgreementScopeModel]
+    by_source: list[AgreementScopeModel]
+    by_model: list[AgreementScopeModel]
+
+
+def _normalise_class(value: str) -> str:
+    cleaned = (value or "").strip().lower()
+    if cleaned == WILDCARD:
+        return WILDCARD
+    if not cleaned or len(cleaned) > _MAX_CLASS_LEN or not cleaned.replace("_", "").replace("-", "").isalnum():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"alert class must be '{WILDCARD}' or an alphanumeric category name of at most {_MAX_CLASS_LEN} characters",
+        )
+    return cleaned
+
+
+@router.get("/shadow-mode", response_model=ShadowModeResponse)
+async def get_shadow_mode(
+    user: AuthUser,
+    db: TenantDBSession,
+) -> ShadowModeResponse:
+    """Which alert classes this tenant is measuring rather than acting on."""
+    await user.require_permission_db("settings:read", db)
+
+    rows = (
+        (
+            await db.execute(
+                text(
+                    """
+                SELECT alert_class, enabled, enabled_at, updated_at, updated_by
+                FROM aisoc_shadow_mode
+                WHERE tenant_id = :tenant_id
+                ORDER BY alert_class
+                """
+                ),
+                {"tenant_id": str(user.tenant_id)},
+            )
+        )
+        .mappings()
+        .all()
+    )
+
+    return ShadowModeResponse(
+        tenant_id=str(user.tenant_id),
+        entries=[
+            ShadowModeEntry(
+                alert_class=row["alert_class"],
+                enabled=bool(row["enabled"]),
+                enabled_at=row["enabled_at"].isoformat() if row["enabled_at"] else None,
+                updated_at=row["updated_at"].isoformat() if row["updated_at"] else None,
+                updated_by=str(row["updated_by"]) if row["updated_by"] else None,
+            )
+            for row in rows
+        ],
+    )
+
+
+@router.put("/shadow-mode/{alert_class}", response_model=ShadowModeEntry)
+async def set_shadow_mode(
+    alert_class: str,
+    payload: ShadowModeUpdateRequest,
+    user: AuthUser,
+    db: TenantDBSession,
+) -> ShadowModeEntry:
+    """Start or stop measuring one alert class.
+
+    ``enabled_at`` is stamped on the transition into shadow and cleared on the
+    way out, rather than being set on every write. A promotion window that
+    reaches further back than the day measurement started is reaching back
+    before there was anything to measure, and the only way a later reader can
+    tell is if this column records the real start.
+    """
+    await user.require_permission_db("settings:write", db)
+    cleaned = _normalise_class(alert_class)
+
+    row = (
+        (
+            await db.execute(
+                text(
+                    """
+                INSERT INTO aisoc_shadow_mode (tenant_id, alert_class, enabled, enabled_at, updated_by, updated_at)
+                VALUES (:tenant_id, :alert_class, :enabled, CASE WHEN :enabled THEN now() ELSE NULL END, :updated_by, now())
+                ON CONFLICT (tenant_id, alert_class) DO UPDATE SET
+                    enabled = EXCLUDED.enabled,
+                    enabled_at = CASE
+                        WHEN EXCLUDED.enabled AND NOT aisoc_shadow_mode.enabled THEN now()
+                        WHEN EXCLUDED.enabled THEN aisoc_shadow_mode.enabled_at
+                        ELSE NULL
+                    END,
+                    updated_by = EXCLUDED.updated_by,
+                    updated_at = now()
+                RETURNING alert_class, enabled, enabled_at, updated_at, updated_by
+                """
+                ),
+                {
+                    "tenant_id": str(user.tenant_id),
+                    "alert_class": cleaned,
+                    "enabled": payload.enabled,
+                    "updated_by": str(user.user_id),
+                },
+            )
+        )
+        .mappings()
+        .one()
+    )
+    await db.commit()
+
+    logger.info(
+        "autonomy_policy.shadow_mode_set",
+        tenant_id=str(user.tenant_id),
+        alert_class=cleaned,
+        enabled=payload.enabled,
+        updated_by=user.email,
+    )
+    return ShadowModeEntry(
+        alert_class=row["alert_class"],
+        enabled=bool(row["enabled"]),
+        enabled_at=row["enabled_at"].isoformat() if row["enabled_at"] else None,
+        updated_at=row["updated_at"].isoformat() if row["updated_at"] else None,
+        updated_by=str(row["updated_by"]) if row["updated_by"] else None,
+    )
+
+
+@router.get("/agreement", response_model=AgreementResponse)
+async def get_agreement(
+    user: AuthUser,
+    db: TenantDBSession,
+    scope_kind: str = Query("tenant", description="tenant, alert_class, rule, source or model"),
+    scope_key: str = Query(WILDCARD, max_length=200),
+) -> AgreementResponse:
+    """Rolling agreement between the agent and this tenant's own analysts.
+
+    The tenant comes from the credential. ``scope_kind`` and ``scope_key``
+    narrow *within* that tenant and cannot widen beyond it: the scope names a
+    dimension from a fixed vocabulary, never a column, and the tenant
+    predicate is applied whatever the scope says.
+
+    Closures made in this console are reconciled on the way in rather than by
+    a background job. The sweep is bounded and indexed, and doing it here
+    means the number an operator is looking at includes the alert they closed
+    a minute ago, which is exactly when they come to look.
+    """
+    await user.require_permission_db("settings:read", db)
+
+    if scope_kind != "tenant" and scope_kind not in SCOPE_COLUMNS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"scope_kind must be 'tenant' or one of {sorted(SCOPE_COLUMNS)}",
+        )
+
+    reconciled = await reconcile_local_closures(db, user.tenant_id)
+    if reconciled:
+        await db.commit()
+
+    thresholds = PromotionThresholds()
+    evidence = await agreement_for(
+        db,
+        user.tenant_id,
+        scope_kind=scope_kind,
+        scope_key=scope_key,
+        thresholds=thresholds,
+    )
+
+    breakdowns: dict[str, list[AgreementScopeModel]] = {}
+    for dimension in ("alert_class", "rule", "source", "model"):
+        rows = await breakdown_for(db, user.tenant_id, scope_kind=dimension, thresholds=thresholds)
+        breakdowns[dimension] = [AgreementScopeModel(key=row.key, window=AgreementWindowModel(**row.window.as_dict())) for row in rows]
+
+    return AgreementResponse(
+        tenant_id=str(user.tenant_id),
+        scope_kind=evidence.scope_kind,
+        scope_key=evidence.scope_key,
+        window=AgreementWindowModel(**evidence.window.as_dict()),
+        recent=AgreementWindowModel(**evidence.recent.as_dict()),
+        window_start=evidence.window_start.isoformat(),
+        window_end=evidence.window_end.isoformat(),
+        thresholds=thresholds.as_dict(),
+        reconciled=reconciled,
+        by_alert_class=breakdowns["alert_class"],
+        by_rule=breakdowns["rule"],
+        by_source=breakdowns["source"],
+        by_model=breakdowns["model"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Evidence-gated autonomy (gap-closure Phase 2.3)
+#
+# The thresholds at the top of this module are a setting. These routes are
+# not: a tenant asks for a capability and the answer comes from their measured
+# track record. The gate refuses more often than it grants, which is the
+# point, so every refusal names what would change the answer.
+# ---------------------------------------------------------------------------
+
+
+class GrantModel(BaseModel):
+    id: str
+    scope_kind: str
+    scope_key: str
+    capability: str
+    state: str
+    source: str
+    #: Surfaced as its own field so no client has to compare a string to know
+    #: it is looking at autonomy somebody overruled into existence.
+    is_override: bool
+    evidence: dict | None = None
+    granted_at: str | None = None
+    demoted_at: str | None = None
+    demoted_reason: str | None = None
+    override_reason: str | None = None
+
+
+class GrantListResponse(BaseModel):
+    tenant_id: str
+    grants: list[GrantModel]
+    #: Grants demoted by this request's reconciliation pass. Returned rather
+    #: than left to be noticed, because an operator who just lost a capability
+    #: should find out on the page that took it, not from a dashboard later.
+    demoted_now: list[dict]
+
+
+class PromotionRequest(BaseModel):
+    scope_kind: str = Field(..., description="alert_class or action_verb")
+    scope_key: str = Field(..., min_length=1, max_length=200)
+    capability: str = Field(..., description="auto_close or auto_execute")
+    #: Ask for the capability even though the evidence refuses. The gate still
+    #: runs and still records what it refused; what changes is that the grant
+    #: is written and labelled an override.
+    override: bool = False
+    override_reason: str | None = Field(None, max_length=500)
+
+
+class PromotionResponse(BaseModel):
+    granted: bool
+    state: str
+    source: str
+    is_override: bool
+    #: Empty on an earned grant. On a refusal these are what to fix; on an
+    #: override they are what was waived, and they travel into the audit log
+    #: alongside the grant.
+    refusals: list[str]
+    evidence: dict
+    changed: bool
+
+
+@router.get("/grants", response_model=GrantListResponse)
+async def list_autonomy_grants(
+    user: AuthUser,
+    db: TenantDBSession,
+    request: Request,
+) -> GrantListResponse:
+    """Every capability this tenant holds or has held, re-checked on the way out.
+
+    Reconciliation runs first. A grant whose evidence has slipped below the
+    demotion floors is demoted here rather than being listed as current and
+    quietly failing at dispatch, which would leave an operator reading a page
+    that disagrees with the product.
+    """
+    await user.require_permission_db("settings:read", db)
+
+    await reconcile_local_closures(db, user.tenant_id)
+    demoted = await reconcile_grants(db, user.tenant_id, request=request)
+    grants = await list_grants(db, user.tenant_id)
+
+    return GrantListResponse(
+        tenant_id=str(user.tenant_id),
+        grants=[GrantModel(**row.as_dict()) for row in grants],
+        demoted_now=[transition.as_dict() for transition in demoted],
+    )
+
+
+@router.post("/grants", response_model=PromotionResponse)
+async def request_autonomy_grant(
+    payload: PromotionRequest,
+    user: AuthUser,
+    db: TenantDBSession,
+    request: Request,
+) -> PromotionResponse:
+    """Ask for a capability. The evidence decides; an operator may overrule.
+
+    A refusal is a 200 carrying `granted: false` and the reasons, not an
+    error. Being told no by a safety control is the control working, and
+    rendering it as a failure invites a client to retry it.
+
+    The tenant comes from the credential. `scope_key` narrows within that
+    tenant and cannot reach past it.
+    """
+    await user.require_permission_db("settings:write", db)
+
+    if payload.override and not (payload.override_reason or "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="an override requires a reason: an override nobody can review is not reviewable later either",
+        )
+
+    # Closures first. An operator who has just finished working a queue should
+    # be judged on those decisions, not on the state before them.
+    await reconcile_local_closures(db, user.tenant_id)
+
+    try:
+        transition = await request_promotion(
+            db,
+            tenant_id=user.tenant_id,
+            actor_id=user.user_id,
+            actor_email=user.email,
+            scope_kind=payload.scope_kind,
+            scope_key=payload.scope_key,
+            capability=payload.capability,
+            override=payload.override,
+            override_reason=payload.override_reason,
+            request=request,
+        )
+    except GrantScopeError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+
+    return PromotionResponse(**transition.as_dict())
+
+
+@router.delete("/grants", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
+async def revoke_autonomy_grant(
+    user: AuthUser,
+    db: TenantDBSession,
+    request: Request,
+    scope_kind: str = Query(...),
+    scope_key: str = Query(..., max_length=200),
+    capability: str = Query(...),
+) -> None:
+    """Hand a capability back.
+
+    Audited as a revocation rather than as a demotion. A human deciding to
+    stop and the evidence deciding for them are different events, and one word
+    for both would make "was this taken away because the numbers slipped"
+    unanswerable from the log.
+    """
+    await user.require_permission_db("settings:write", db)
+    try:
+        revoked = await revoke_grant(
+            db,
+            tenant_id=user.tenant_id,
+            actor_id=user.user_id,
+            actor_email=user.email,
+            scope_kind=scope_kind,
+            scope_key=scope_key,
+            capability=capability,
+            request=request,
+        )
+    except GrantScopeError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    if not revoked:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no standing grant for that scope")

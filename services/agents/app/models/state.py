@@ -64,6 +64,38 @@ class InvestigationState(BaseModel):
     alert_summary: str = ""
     raw_alert: dict[str, Any] = Field(default_factory=dict)
 
+    # Durable statements compiled from repeated analyst disagreement for this
+    # tenant (services/api analyst_feedback). Carried on the state rather than
+    # fetched inside the agent so the network read happens once per alert on
+    # the worker's own timeline, and so a test can set it directly.
+    organisation_memory: list[dict[str, Any]] = Field(default_factory=list)
+
+    # The tenant skill that matched this alert, if any, and the version of it.
+    # Carried for the same reason organisation memory is, plus one more: this
+    # is the provenance a disputed verdict is explained from months later, so
+    # it travels with the verdict rather than being recoverable only by
+    # re-running the resolver against a store that has since changed.
+    # `{"skill_id": ..., "version": N, "ref": "id@vN", "owner": ...}`.
+    tenant_skill: dict[str, Any] | None = None
+
+    # Knowledge-base runbook chunks retrieved for this alert, as
+    # `app.context.knowledge_base.RunbookRetrieval.as_state()` renders them:
+    # the chunks, the markers a citation resolves through, and what the
+    # retrieval refused. Carried for the same reasons as the two above.
+    #
+    # A dict rather than the dataclass because this module sits below
+    # `app.context`, whose package import reaches back here through
+    # `bundle.py`. A type annotation is not worth an import cycle.
+    knowledge_base: dict[str, Any] | None = None
+
+    # The last few analyst decisions on alerts of this shape, as
+    # `app.context.dispositions.RecentDispositions.as_state()` renders them,
+    # and the directory record for the principals this alert names, as
+    # `app.context.identity.IdentityContext.as_state()` renders it. Dicts
+    # rather than the dataclasses for the same import-cycle reason as above.
+    recent_dispositions: dict[str, Any] | None = None
+    identity_context: dict[str, Any] | None = None
+
     # Findings accumulated during investigation
     findings: list[str] = Field(default_factory=list)
     ioc_enrichments: dict[str, Any] = Field(default_factory=dict)
@@ -83,6 +115,27 @@ class InvestigationState(BaseModel):
     confidence: float = 0.0
     confidence_basis: list[str] = Field(default_factory=list)
     verdict: str | None = None
+
+    # Pre-fetched investigation context (graph neighbourhood, blast radius,
+    # historical verdicts, UEBA baselines, TI matches). Built on the escalation
+    # path so an auto-escalated alert is investigated with the same context an
+    # analyst-initiated investigation of the same alert would have had.
+    context_bundle: dict[str, Any] | None = None
+
+    # Fraction of the concrete indicators cited in the reasoning that actually
+    # appear in the evidence (see app/confidence/groundedness.py). None means
+    # the verdict was not scored. Recorded alongside the verdict so an
+    # ungrounded auto-closure is visible after the fact, not just at the time.
+    groundedness: float | None = None
+
+    # What the recursive investigation actually did: which strategy was
+    # selected, how many distinct pivots it took, whether it hit its
+    # iteration cap or time budget, and which data classes it could not
+    # check. Recorded rather than inferred, because a narrative is not
+    # evidence that anything was looked at — an investigation that called
+    # one tool and wrote three paragraphs reads identically to one that
+    # pivoted five times. This is what the depth gate grades.
+    investigation_depth: dict[str, Any] | None = None
 
     # Metadata
     iteration_count: int = 0

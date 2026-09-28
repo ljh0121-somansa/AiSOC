@@ -14,15 +14,19 @@ Endpoints
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any, Literal
 
-import httpx
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
+from app.api.v1.deps import AuthUser
 from app.core.airgap import AirgapViolation, enforce_airgap_for_url
-from app.services.model_aliases import resolve_model_alias
+from app.services.llm_safety import LLMContractViolation, safe_chat_completions_request
+from app.services.model_aliases import chat_completions_url, resolve_api_key, resolve_model_alias
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/translation", tags=["translation"])
 
@@ -108,12 +112,13 @@ def _user_prompt(req: TranslateRequest) -> str:
 
 
 async def _llm_translate(req: TranslateRequest) -> dict[str, Any] | None:
-    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY")
+    model = os.getenv("LLM_MODEL") or resolve_model_alias("nl")
+    # Resolved together with the route: when the call goes to the bundled
+    # gateway the bearer is the gateway's master key, not a provider key.
+    api_key = resolve_api_key(model)
     if not api_key:
         return None
-    base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-    model = os.getenv("LLM_MODEL") or resolve_model_alias("nl")
-    completions_url = f"{base_url}/chat/completions"
+    completions_url = chat_completions_url(model)
     # Air-gap check: refuses the call entirely (rather than silently
     # falling back to template-substitution) so misconfigurations are
     # loud. The except-Exception below would otherwise swallow this.
@@ -122,23 +127,32 @@ async def _llm_translate(req: TranslateRequest) -> dict[str, Any] | None:
     except AirgapViolation:
         raise
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                completions_url,
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": _SYSTEM},
-                        {"role": "user", "content": _user_prompt(req)},
-                    ],
-                    "temperature": 0.1,
-                    "response_format": {"type": "json_object"},
-                },
-            )
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
-        return json.loads(content)
+        # T2.3 — the contract runs before the request, so a vendor rule
+        # pasted in with a raw log sample attached is refused rather than
+        # forwarded.
+        body = await safe_chat_completions_request(
+            api_key=api_key,
+            model=model,
+            messages=[
+                {"role": "system", "content": _SYSTEM},
+                {"role": "user", "content": _user_prompt(req)},
+            ],
+            url=completions_url,
+            timeout=60.0,
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+        return json.loads(body["choices"][0]["message"]["content"])
+    except LLMContractViolation as exc:
+        # %-style, not a `reason=` keyword: `logger` here is
+        # `logging.getLogger`, not structlog, and the stdlib Logger rejects
+        # unknown keywords with a TypeError. An exception raised inside an
+        # `except` block is not caught by a sibling handler, so the
+        # `except Exception` below never saw it and the TypeError escaped —
+        # the one path whose whole job is to degrade gracefully was the one
+        # that raised.
+        logger.warning("translation.llm_contract_violation reason=%s", exc.reason)
+        return None
     except Exception:
         return None
 
@@ -234,7 +248,7 @@ def _fallback_templates(req: TranslateRequest) -> dict[str, Any]:
     status_code=status.HTTP_200_OK,
     summary="Translate a detection rule across formats",
 )
-async def translate_rule(body: TranslateRequest) -> TranslateResponse:
+async def translate_rule(body: TranslateRequest, user: AuthUser) -> TranslateResponse:
     if not body.target_formats:
         raise HTTPException(status_code=400, detail="At least one target_format is required.")
 

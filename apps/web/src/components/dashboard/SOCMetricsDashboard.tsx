@@ -11,27 +11,38 @@ import {
   type CalibrationBucket,
   type CostAggregate,
 } from "@/lib/api";
+import { demoFallback } from '@/lib/demoFallback';
+import { EmptyState } from '@/components/ui/EmptyState';
 
 const DEFAULT_SOC_METRICS: SOCMetrics = {
   kpis: {
-    mttd_hours: 0,
-    mttr_hours: 0,
-    mttc_hours: 0,
-    false_positive_rate: 0,
-    escalation_rate: 0,
-    alert_volume_7d: 0,
-    cases_opened_7d: 0,
-    cases_closed_7d: 0,
-    analyst_overrides_7d: 0,
+    mttd_hours: 1.4,
+    mttr_hours: 6.2,
+    mttc_hours: 14.8,
+    false_positive_rate: 0.12,
+    escalation_rate: 0.18,
+    alert_volume_7d: 1247,
+    cases_opened_7d: 23,
+    cases_closed_7d: 34,
+    analyst_overrides_7d: 8,
+    mttd_sample_count: 1247,
+    mttr_sample_count: 34,
+    mttc_sample_count: 12,
+    false_positive_rate_sample_count: 412,
+    escalation_rate_sample_count: 168,
   },
   attack_heatmap: [],
   calibration_curve: [],
 };
 
-const DEFAULT_COST_AGGREGATE: CostAggregate = {
-  window_days: 0,
-  by_model: [],
-  totals: { model: "-", runs: 0, calls: 0, total_prompt_tokens: 0, total_completion_tokens: 0, total_cost_usd: 0, total_latency_ms: 0, avg_cost_per_run: 0, avg_latency_per_call_ms: 0 },
+const MOCK_COST_AGGREGATE: CostAggregate = {
+  window_days: 30,
+  by_model: [
+    { model: "gpt-4o", runs: 312, calls: 1840, total_prompt_tokens: 4_620_000, total_completion_tokens: 890_000, total_cost_usd: 42.18, measured_call_count: 1840, estimated_cost_usd: 0, estimated_call_count: 0, unpriced_call_count: 0, total_latency_ms: 7_360_000, avg_cost_per_run: 0.1352, avg_latency_per_call_ms: 4000 },
+    { model: "gpt-4o-mini", runs: 580, calls: 3200, total_prompt_tokens: 2_100_000, total_completion_tokens: 620_000, total_cost_usd: 4.86, measured_call_count: 3200, estimated_cost_usd: 0, estimated_call_count: 0, unpriced_call_count: 0, total_latency_ms: 3_200_000, avg_cost_per_run: 0.0084, avg_latency_per_call_ms: 1000 },
+    { model: "claude-3.5-sonnet", runs: 145, calls: 870, total_prompt_tokens: 3_480_000, total_completion_tokens: 710_000, total_cost_usd: 29.61, measured_call_count: 870, estimated_cost_usd: 0, estimated_call_count: 0, unpriced_call_count: 0, total_latency_ms: 4_350_000, avg_cost_per_run: 0.2042, avg_latency_per_call_ms: 5000 },
+  ],
+  totals: { model: "all", runs: 1037, calls: 5910, total_prompt_tokens: 10_200_000, total_completion_tokens: 2_220_000, total_cost_usd: 76.65, measured_call_count: 5910, estimated_cost_usd: 0, estimated_call_count: 0, unpriced_call_count: 0, total_latency_ms: 14_910_000, avg_cost_per_run: 0.0739, avg_latency_per_call_ms: 2523 },
 };
 
 function formatUsd(n: number): string {
@@ -51,11 +62,13 @@ function KpiCard({
   value,
   unit,
   color,
+  hint,
 }: {
   label: string;
   value: string | number;
   unit?: string;
   color?: string;
+  hint?: string;
 }) {
   return (
     <div className="bg-gray-900 border border-gray-700 rounded-lg p-4 flex flex-col gap-1">
@@ -64,7 +77,110 @@ function KpiCard({
         {value}
         {unit && <span className="text-sm font-normal text-gray-400 ml-1">{unit}</span>}
       </span>
+      {hint && <span className="text-[10px] text-gray-500">{hint}</span>}
     </div>
+  );
+}
+
+/**
+ * A mean over no samples is unmeasured, not zero.
+ *
+ * The API reports each mean alongside the number of rows it averaged. Without
+ * that, these tiles could not distinguish "we respond in 0.0 hours" from
+ * "nothing has been resolved yet", and they rendered the first — an
+ * unbeatable MTTR for a tenant that had done nothing. `sampleCount` is
+ * optional so an older API, which sends no counts, keeps its previous
+ * behaviour rather than blanking every tile.
+ */
+function MeanHoursCard({
+  label,
+  hours,
+  sampleCount,
+  warnAbove,
+  cautionAbove,
+  window,
+}: {
+  label: string;
+  hours: number | undefined;
+  sampleCount: number | undefined;
+  warnAbove: number;
+  cautionAbove: number;
+  window: string;
+}) {
+  if (hours === undefined || sampleCount === 0) {
+    return (
+      <KpiCard
+        label={label}
+        value="—"
+        color="text-gray-500"
+        hint={sampleCount === 0 ? `not measured · no closures in ${window}` : undefined}
+      />
+    );
+  }
+  return (
+    <KpiCard
+      label={label}
+      value={hours.toFixed(1)}
+      unit="hrs"
+      color={hours > warnAbove ? "text-red-400" : hours > cautionAbove ? "text-yellow-400" : "text-green-400"}
+      hint={
+        sampleCount === undefined
+          ? undefined
+          : `mean of ${sampleCount} over ${window}`
+      }
+    />
+  );
+}
+
+/**
+ * A ratio over an empty denominator is unmeasured, not zero.
+ *
+ * Same defect as the means above, one step removed: the API computed
+ * `x / n if n > 0 else 0.0`, so a tenant that had resolved nothing and gated
+ * nothing scored 0% false positives and 0% escalations — the two best numbers
+ * on the page, both awarded for having done nothing. The denominator now
+ * travels with each rate, so the tile can say which it is. `sampleCount` is
+ * optional, so an older API that sends no counts keeps its previous
+ * behaviour rather than blanking the tile.
+ */
+function RateCard({
+  label,
+  rate,
+  sampleCount,
+  denominatorLabel,
+  warnAbove,
+  cautionAbove,
+  window,
+}: {
+  label: string;
+  rate: number | undefined;
+  sampleCount: number | undefined;
+  denominatorLabel: string;
+  warnAbove: number;
+  cautionAbove: number;
+  window: string;
+}) {
+  if (rate === undefined || sampleCount === 0) {
+    return (
+      <KpiCard
+        label={label}
+        value="—"
+        color="text-gray-500"
+        hint={sampleCount === 0 ? `not measured · no ${denominatorLabel} in ${window}` : undefined}
+      />
+    );
+  }
+  return (
+    <KpiCard
+      label={label}
+      value={`${(rate * 100).toFixed(1)}%`}
+      color={rate > warnAbove ? "text-red-400" : rate > cautionAbove ? "text-yellow-400" : "text-green-400"}
+      hint={
+        sampleCount === undefined
+          ? undefined
+          : `over ${sampleCount} ${denominatorLabel} in ${window}`
+      }
+    />
   );
 }
 
@@ -140,7 +256,7 @@ export function SOCMetricsDashboard() {
     () => metricsApi.getSOC(),
     {
       refreshInterval: 60_000,
-      fallbackData: DEFAULT_SOC_METRICS,
+      fallbackData: demoFallback(MOCK_SOC_METRICS),
       shouldRetryOnError: true,
       errorRetryCount: 3,
       errorRetryInterval: 4000,
@@ -151,17 +267,21 @@ export function SOCMetricsDashboard() {
 
   const refresh = useCallback(() => mutate(), [mutate]);
 
+  // `MOCK_SOC_METRICS` is reachable only through the `demoFallback` above,
+  // which is `undefined` outside the hosted demo.
+  //
+  // It used to also be substituted here, unconditionally, whenever `data` was
+  // absent or malformed — which is exactly the first-paint and error case. A
+  // self-hoster therefore saw MTTD 1.4h, a populated ATT&CK heatmap and an LLM
+  // spend line naming models they had never configured, presented as their own
+  // numbers. When there is no payload there are now no numbers.
   const isValidSOC =
     !!data &&
     typeof data.kpis?.mttd_hours === "number" &&
     Array.isArray(data.attack_heatmap);
-  const resolved = isValidSOC ? data : DEFAULT_SOC_METRICS;
-  const kpis = resolved.kpis;
-  const heatmap = resolved.attack_heatmap ?? [];
-  const calibration = resolved.calibration_curve ?? [];
-  // We surface the error inline rather than swapping the whole panel out for
-  // a blocking error state — the mock fallback keeps the page legible while
-  // the user retries.
+  const kpis = isValidSOC ? data.kpis : undefined;
+  const heatmap = isValidSOC ? (data.attack_heatmap ?? []) : [];
+  const calibration = isValidSOC ? (data.calibration_curve ?? []) : [];
   const errorMessage =
     error instanceof Error
       ? error.message
@@ -185,87 +305,63 @@ export function SOCMetricsDashboard() {
       {errorMessage && (
         <div className="rounded border border-red-900/60 bg-red-950/40 px-3 py-2 text-xs text-red-200">
           <span className="font-semibold">SOC metrics unavailable:</span>{" "}
-          {errorMessage}. Showing last known mock baseline; the live numbers
-          will refresh automatically once the API recovers.
+          {errorMessage}. No figures are shown below; they will populate once
+          the API recovers.
         </div>
       )}
 
+      {!kpis && !errorMessage && (
+        <EmptyState
+          title="No SOC performance data yet"
+          description="MTTD, MTTR, escalation and false-positive rates are computed from closed cases. They appear once the first investigations complete."
+          className="px-4 py-6"
+        />
+      )}
+
       {/* KPI Grid */}
+      {kpis && (
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <KpiCard
+          <MeanHoursCard
             label="MTTD"
-            value={typeof kpis?.mttd_hours === "number"? kpis?.mttd_hours.toFixed(1): "—"}
-            unit="hrs"
-            color={
-              typeof kpis?.mttd_hours === "number"?
-              (kpis?.mttd_hours ?? 0) > 4
-                ? "text-red-400"
-                : (kpis?.mttd_hours ?? 0) > 2
-                ? "text-yellow-400"
-                : "text-green-400"
-              :"text-gray-400"
-            }
+            hours={kpis?.mttd_hours}
+            sampleCount={kpis?.mttd_sample_count}
+            warnAbove={4}
+            cautionAbove={2}
+            window="7d"
           />
-          <KpiCard
+          <MeanHoursCard
             label="MTTR"
-            value={typeof kpis?.mttr_hours === "number"?kpis?.mttr_hours.toFixed(1): "—"}
-            unit="hrs"
-            color={
-              typeof kpis?.mttr_hours === "number"?
-              (kpis?.mttr_hours ?? 0) > 24
-                ? "text-red-400"
-                : (kpis?.mttr_hours ?? 0) > 8
-                ? "text-yellow-400"
-                : "text-green-400"
-              :"text-gray-400"
-            }
+            hours={kpis?.mttr_hours}
+            sampleCount={kpis?.mttr_sample_count}
+            warnAbove={24}
+            cautionAbove={8}
+            window="30d"
           />
-          <KpiCard
+          <MeanHoursCard
             label="MTTC"
-            value={typeof kpis?.mttc_hours === "number"?kpis?.mttc_hours.toFixed(1) : "—"}
-            unit="hrs"
-            color={
-              typeof kpis?.mttc_hours === "number"?
-              (kpis?.mttc_hours ?? 0) > 24
-                ? "text-red-400"
-                : (kpis?.mttc_hours ?? 0) > 8
-                ? "text-yellow-400"
-                : "text-green-400"
-              :"text-gray-400"
-            }
+            hours={kpis?.mttc_hours}
+            sampleCount={kpis?.mttc_sample_count}
+            warnAbove={24}
+            cautionAbove={8}
+            window="7d"
           />
-          <KpiCard
+          <RateCard
             label="Escalation Rate"
-            value={
-              typeof kpis?.escalation_rate === "number"?
-               `${(kpis.escalation_rate * 100).toFixed(1)}%` : "—"
-            }
-            color={
-              typeof kpis?.escalation_rate === "number"?
-              (kpis?.escalation_rate ?? 0) > 0.5
-                ? "text-red-400"
-                : (kpis?.escalation_rate ?? 0) > 0.25
-                ? "text-yellow-400"
-                : "text-green-400"
-              :"text-gray-400"
-            }
+            rate={kpis?.escalation_rate}
+            sampleCount={kpis?.escalation_rate_sample_count}
+            denominatorLabel="gate decisions"
+            warnAbove={0.5}
+            cautionAbove={0.25}
+            window="7d"
           />
-          <KpiCard
+          <RateCard
             label="False Positive Rate"
-            value={
-              typeof kpis?.false_positive_rate === "number"?
-               `${(kpis.false_positive_rate * 100).toFixed(1)}%`
-                : "—"
-            }
-            color={
-              typeof kpis?.false_positive_rate === "number"?
-              (kpis?.false_positive_rate ?? 0) > 0.3
-                ? "text-red-400"
-                : (kpis?.false_positive_rate ?? 0) > 0.15
-                ? "text-yellow-400"
-                : "text-green-400"
-              :"text-gray-400"
-            }
+            rate={kpis?.false_positive_rate}
+            sampleCount={kpis?.false_positive_rate_sample_count}
+            denominatorLabel="resolved alerts"
+            warnAbove={0.3}
+            cautionAbove={0.15}
+            window="7d"
           />
           <KpiCard
             label="Alert Volume (7d)"
@@ -286,6 +382,7 @@ export function SOCMetricsDashboard() {
             color="text-blue-400"
           />
         </div>
+      )}
 
       {/* Confidence Calibration Curve */}
       <div className="bg-gray-900 border border-gray-700 rounded-lg p-4">
@@ -319,7 +416,7 @@ function CostTelemetryPanel() {
     () => investigationsApi.getCostAggregate(30),
     {
       refreshInterval: 60_000,
-      fallbackData: DEFAULT_COST_AGGREGATE,
+      fallbackData: demoFallback(MOCK_COST_AGGREGATE),
       shouldRetryOnError: true,
       errorRetryCount: 3,
       errorRetryInterval: 4000,
@@ -328,13 +425,15 @@ function CostTelemetryPanel() {
     },
   );
 
+  // Same rule as the SOC panel: the mock is the demo fallback and nothing
+  // else. Naming `gpt-4o` / `claude-3.5-sonnet` and a $76.65 spend to a
+  // tenant that runs neither is a fabricated claim about their own estate.
   const isValidCost =
     !!data &&
     Array.isArray(data.by_model) &&
     typeof data.window_days === "number";
-  const resolved = isValidCost ? data : DEFAULT_COST_AGGREGATE;
-  const totals = resolved.totals;
-  const byModel = resolved.by_model ?? [];
+  const totals = isValidCost ? data.totals : undefined;
+  const byModel = isValidCost ? (data.by_model ?? []) : [];
   const maxModelCost = Math.max(...byModel.map((m) => m.total_cost_usd), 0.0001);
   const errorMessage =
     error instanceof Error
@@ -361,11 +460,11 @@ function CostTelemetryPanel() {
       {errorMessage && (
         <div className="mb-3 rounded border border-red-900/60 bg-red-950/40 px-3 py-2 text-xs text-red-200">
           <span className="font-semibold">Cost telemetry unavailable:</span>{" "}
-          {errorMessage}. Showing baseline projections until the API recovers.
+          {errorMessage}. No spend figures are shown until the API recovers.
         </div>
       )}
 
-      {isLoading && !resolved ? (
+      {isLoading && !isValidCost ? (
         <div className="h-32 animate-pulse bg-gray-800 rounded" />
       ) : !totals || totals.runs === 0 ? (
         <div className="text-gray-500 text-sm flex items-center justify-center h-24">
@@ -390,7 +489,10 @@ function CostTelemetryPanel() {
             <KpiCard label="LLM Calls" value={totals.calls} />
             <KpiCard
               label="Avg $/Run"
-              value={formatUsd(totals.avg_cost_per_run)}
+              // null when nothing in the window was measured. A mean of an
+              // unmeasured zero is not a cost per run.
+              value={totals.avg_cost_per_run === null ? "—" : formatUsd(totals.avg_cost_per_run)}
+              hint={totals.avg_cost_per_run === null ? "not measured" : undefined}
             />
             <KpiCard
               label="Avg Latency/Call"

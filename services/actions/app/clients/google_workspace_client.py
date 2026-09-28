@@ -49,7 +49,9 @@ import json
 import secrets
 import string
 import time
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import structlog
@@ -58,10 +60,18 @@ logger = structlog.get_logger()
 
 _TOKEN_URI = "https://oauth2.googleapis.com/token"
 _DIRECTORY = "https://admin.googleapis.com/admin/directory/v1"
+_REPORTS = "https://admin.googleapis.com/admin/reports/v1"
 _SCOPES = " ".join(
     [
         "https://www.googleapis.com/auth/admin.directory.user",
         "https://www.googleapis.com/auth/admin.directory.user.security",
+        # Gap-closure Phase 4.2. Required by `list_login_events`, and listed
+        # here rather than on a second client so one credential covers both
+        # directions. A deployment whose service account has not had this
+        # scope granted domain-wide gets a 403 on the login read and an
+        # unchanged containment path, which is the safe asymmetry: the read
+        # names the missing scope instead of reporting no logins.
+        "https://www.googleapis.com/auth/admin.reports.audit.readonly",
     ]
 )
 
@@ -88,7 +98,16 @@ class GoogleWorkspaceClient:
                 service_account_key = json.loads(service_account_key)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"gws_service_account_key is not valid JSON: {exc}") from exc
-        self._key = service_account_key
+        # `json.loads` happily returns a str, list or int for a document that
+        # is valid JSON but not an object. Without this the credential passed
+        # construction and failed at `self._key["client_email"]` — inside the
+        # JWT signing path, with `TypeError: string indices must be integers`,
+        # at the moment an operator triggered a live containment action. The
+        # configuration is wrong either way; it should say so when it is
+        # saved, not when it is used.
+        if not isinstance(service_account_key, dict):
+            raise ValueError(f"gws_service_account_key must be a JSON object, got {type(service_account_key).__name__}")
+        self._key: dict[str, Any] = service_account_key
         self._subject = subject_email
         self._token: str | None = None
         self._token_expiry: float = 0.0
@@ -147,6 +166,65 @@ class GoogleWorkspaceClient:
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"}
+
+    async def list_login_events(
+        self,
+        user_email: str,
+        *,
+        hours: int = 24,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Recent login audit activity for one account.
+
+        Gap-closure Phase 4.2. Read-only: a GET over the Reports API's
+        ``login`` application activity feed.
+
+        The Reports API takes the user key in the path and the window as
+        RFC 3339 query parameters, so there is no query language to escape
+        here. The address is still percent-encoded, because it arrives from
+        alert text and a path segment carrying ``../`` would otherwise steer
+        the request at a different Reports endpoint.
+
+        Note the scope this needs. The two scopes this client already requests
+        are directory scopes and do not cover reports; a deployment that has
+        not granted ``admin.reports.audit.readonly`` to the service account
+        gets a 403 here, which surfaces as a read failure naming the scope
+        rather than as an account with no logins.
+        """
+        since = datetime.now(UTC) - timedelta(hours=max(1, min(hours, 720)))
+        user_key = quote(str(user_email), safe="@")
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            await self._ensure_token(client)
+            resp = await client.get(
+                f"{_REPORTS}/activities/users/{user_key}/applications/login",
+                headers=self._headers(),
+                params={"startTime": since.strftime("%Y-%m-%dT%H:%M:%SZ"), "maxResults": min(limit, 100)},
+            )
+            resp.raise_for_status()
+            raw = resp.json().get("items", []) or []
+        return [self._project_login(entry) for entry in raw if isinstance(entry, dict)]
+
+    @staticmethod
+    def _project_login(entry: dict[str, Any]) -> dict[str, Any]:
+        raw_events = entry.get("events")
+        events: list[Any] = raw_events if isinstance(raw_events, list) else []
+        first: dict[str, Any] = events[0] if events and isinstance(events[0], dict) else {}
+        params = {
+            p.get("name"): (p.get("value") if p.get("value") is not None else p.get("boolValue"))
+            for p in (first.get("parameters") or [])
+            if isinstance(p, dict) and p.get("name")
+        }
+        raw_identity = entry.get("id")
+        identity: dict[str, Any] = raw_identity if isinstance(raw_identity, dict) else {}
+        return {
+            "at": identity.get("time"),
+            "event": first.get("name"),
+            "ip": entry.get("ipAddress"),
+            "login_type": params.get("login_type"),
+            "challenge_method": params.get("login_challenge_method"),
+            "is_suspicious": params.get("is_suspicious"),
+            "failure_type": params.get("login_failure_type"),
+        }
 
     async def suspend_user(self, user_email: str) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=20.0) as client:

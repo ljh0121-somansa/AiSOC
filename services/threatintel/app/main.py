@@ -13,11 +13,12 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from functools import partial
+from typing import Annotated
 
 import redis.asyncio as aioredis
 import structlog
 from aiokafka import AIOKafkaProducer
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from neo4j import AsyncGraphDatabase
 from opensearchpy import AsyncOpenSearch
 from prometheus_client import Counter, make_asgi_app
@@ -27,6 +28,7 @@ from app._health import install_health_routes
 from app.actors.attribution import ThreatActorAttributionEngine
 from app.airgap import airgap_status, is_host_allowed_for_airgap
 from app.api.actor_attribution import router as actor_attribution_router
+from app.api.indicators import router as indicators_router
 from app.clients.cisa_kev import CisaKevClient
 from app.clients.abuse_ch import ThreatFoxClient, UrlhausClient
 from app.clients.misp import MispClient
@@ -43,6 +45,7 @@ from app.feeds.handlers import (
 )
 from app.feeds.pipeline import ThreatIntelPipeline
 from app.feeds.scheduler import FeedScheduler
+from app.security.tenant_scope import TenantPrincipal, require_console_or_service_auth
 from app.storage.bloom import RedisBloomFilter
 from app.storage.neo4j import Neo4jStore
 from app.storage.opensearch import OpenSearchStore
@@ -148,7 +151,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     qdrant_store = QdrantStore(qdrant_client)
     neo4j_store = Neo4jStore(neo4j_driver)
 
-    await os_store.initialize()
+    # Both stores are best-effort. OpenSearch used to be the one unguarded
+    # call in this lifespan, which made it a hard dependency of the whole
+    # service: it ships in the `full` profile, this service now ships in CORE,
+    # and an unreachable OpenSearch killed the container before a single feed
+    # was registered. Qdrant is the CORE store and is what the console reads
+    # through; OpenSearch adds full-text search on top when it is there.
+    try:
+        await os_store.initialize()
+    except Exception as exc:
+        logger.warning(
+            "OpenSearch init failed — full-text IOC search is unavailable; feeds still write to Qdrant",
+            error=str(exc),
+        )
     try:
         await qdrant_store.initialize()
     except Exception as exc:
@@ -272,6 +287,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.pipeline = pipeline
     app.state.redis = redis
     app.state.os_store = os_store
+    # Read path for GET /api/v1/threat-intel/indicators. Qdrant is the sink
+    # CORE has, so it is the one the console's IOC list is served from.
+    app.state.qdrant_client = qdrant_client
 
     # Threat actor attribution engine — shares the os_store so the IOC
     # component of the score can match against collected threat intel.
@@ -318,6 +336,10 @@ app.mount("/metrics", metrics_app)
 # Threat actor attribution router (v0)
 app.include_router(actor_attribution_router)
 
+# What the feeds have collected. The API proxies this to serve the console's
+# /threat-intel page, which had no backend at all in CORE.
+app.include_router(indicators_router)
+
 
 @app.get("/health")
 async def health() -> dict:
@@ -339,6 +361,7 @@ async def health() -> dict:
 
 @app.get("/api/v1/iocs/search")
 async def search_iocs(
+    principal: Annotated[TenantPrincipal, Depends(require_console_or_service_auth)],
     value: str | None = None,
     ioc_type: str | None = None,
     source: str | None = None,
