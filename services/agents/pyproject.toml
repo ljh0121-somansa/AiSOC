@@ -70,7 +70,6 @@ asyncpg = ">=0.29,<0.32"
 sqlalchemy = {extras = ["asyncio"], version = "^2.0.25"}
 apscheduler = "^3.10.4"
 pyyaml = "^6.0.1"
-cffi = ">=1.16.0,<2"
 # Imported by app.security.credential_vault. This must be a direct runtime
 # dependency rather than an accidental dependency of Poetry itself.
 cryptography = ">=46,<51"

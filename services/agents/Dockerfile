@@ -43,7 +43,7 @@ RUN poetry install --no-interaction --no-ansi --only main --no-root
 # Also assert that the langgraph version on disk exposes the ``START``
 # sentinel — langgraph 0.0.x silently lacked it, which previously crashed the
 # agents service at boot with ``ImportError: cannot import name 'START'``.
-RUN python -c "import opentelemetry, langgraph, fastapi, sqlalchemy, asyncpg, redis, httpx, structlog, apscheduler, yaml, cryptography, cffi, _cffi_backend, weasyprint; from cryptography.fernet import Fernet; from langgraph.graph import END, START, StateGraph"
+RUN python -c "import opentelemetry, langgraph, fastapi, sqlalchemy, asyncpg, redis, httpx, structlog, apscheduler, yaml, cryptography, cffi, _cffi_backend; from cryptography.fernet import Fernet; from langgraph.graph import END, START, StateGraph"
 
 COPY app/ ./app/
 
