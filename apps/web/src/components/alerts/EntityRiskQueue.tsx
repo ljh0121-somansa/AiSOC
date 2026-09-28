@@ -119,6 +119,8 @@ function safeDate(d: any): Date {
   }
 
   return parsed;
+}
+
 /**
  * What actually went wrong, in words an operator can act on.
  *
