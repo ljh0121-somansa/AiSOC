@@ -12,6 +12,7 @@ import { EmptyState, EmptyStateIcons } from '@/components/ui/EmptyState';
 import { ErrorState } from '@/components/ui/ErrorState';
 import { SavedViewsBar } from '@/components/saved-views/SavedViewsBar';
 import { demoFallback } from '@/lib/demoFallback';
+import { isDemoMode } from '@/lib/demoMode';
 
 // Wave 1 of the AiSOC v6 capability roadmap. The "entities" tab renders the
 // rolled-up Risk-Based Alerting queue — alerts contribute time-decayed risk
