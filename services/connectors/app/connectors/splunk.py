@@ -394,7 +394,6 @@ class SplunkConnector(BaseConnector):
         entity = _clean_field(parsed.get("entity"))
         risk_obj = _clean_field(parsed.get("risk_object"))
         orig_host = _clean_field(parsed.get("orig_host"))
-
         hostname = None
         for cand in (host, host_key, orig_host, entity, risk_obj, dest):
             if cand:
@@ -470,6 +469,9 @@ class SplunkConnector(BaseConnector):
             "url": parsed.get("url"),
             "mitre_techniques": mitre_techniques,
             "risk_score": risk_score,
+            "raw_event": raw,
+            "created_at": parsed.get("_time"),
+        }
             "raw_event": raw,
             "created_at": parsed.get("_time"),
         }

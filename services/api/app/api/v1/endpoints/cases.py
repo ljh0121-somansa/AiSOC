@@ -46,7 +46,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response,
 from fastapi.responses import HTMLResponse
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import text
+from sqlalchemy import ARRAY, UUID, bindparam, text
 
 from app.api.v1.deps import AuthUser, DBSession, require_permission
 from app.core.logging import safe_log_value
@@ -1554,6 +1554,7 @@ async def auto_create_case(body: AutoCreateCaseRequest, request: Request, db: DB
                 ORDER BY created_at DESC LIMIT 1
             """).bindparams(tenant_id=tenant_uuid, aid=uuid.UUID(alert_ids[0]))
         )).fetchone()
+
         if existing_open_case:
             cid = existing_open_case.id
             curr_aids = [str(x) for x in (existing_open_case.alert_ids or [])]

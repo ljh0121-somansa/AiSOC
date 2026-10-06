@@ -18,6 +18,19 @@ import {
 } from '@/lib/api';
 import { format } from 'date-fns';
 import { clsx } from 'clsx';
+import {
+  HelpCircle,
+  Info,
+  TrendingDown,
+  TrendingUp,
+  Minus,
+  X,
+} from 'lucide-react';
+import {
+  explainFactor,
+  OVERALL_CONFIDENCE_HELP,
+  type FactorExplanation,
+} from '@/components/alerts/confidenceHelp';
 import { ContextualActions } from '@/components/copilot/ContextualActions';
 import { ExplainDrawer } from '@/components/alerts/ExplainDrawer';
 import { CreateCaseModal } from '@/components/alerts/CreateCaseModal';
@@ -106,6 +119,13 @@ function IOCBadge({ type, value, malicious }: { type: string; value: string; mal
 
 // ─── Detection Confidence ─────────────────────────────────────────────────────
 
+function formatConfidence(score: number): { pct: number; decimal: string } {
+  const isFraction = score <= 1 && score >= 0;
+  const pct = Math.round(isFraction ? score * 100 : score);
+  const decimal = (isFraction ? score : score / 100).toFixed(2);
+  return { pct, decimal };
+}
+
 function ConfidenceChip({ label, score }: { label: ConfidenceLabel; score?: number }) {
   const cfg = CONFIDENCE_CONFIG[label];
   // `score` is already the canonical 0-100 integer (see `normalizeAlert`).
@@ -160,14 +180,33 @@ function ConfidenceFactorBar({ factor }: { factor: ConfidenceFactor }) {
           aria-hidden="true"
         />
       </div>
-      <div className="text-[10px] text-gray-600 uppercase tracking-wider mt-1 font-mono">
-        {factor.factor}
+
+      <div className="flex items-center justify-between text-[10px] mt-1 font-mono">
+        <span className="text-gray-500 truncate">
+          Observed: <span className="text-gray-300">{explanation.observedText}</span>
+        </span>
+        <span
+          className={clsx(
+            'uppercase tracking-wider shrink-0 font-semibold',
+            isPenalty ? 'text-rose-400' : isBoost ? 'text-emerald-400' : 'text-gray-500'
+          )}
+        >
+          {isPenalty ? 'Penalty' : isBoost ? 'Boost' : 'Baseline'}
+        </span>
       </div>
+
+      {showHelp && (
+        <ConfidenceFactorTooltip
+          factor={factor}
+          explanation={explanation}
+          onClose={close}
+        />
+      )}
     </div>
   );
 }
 
-function ConfidenceExplainability({
+export function ConfidenceExplainability({
   label,
   score,
   rationale,
@@ -178,6 +217,14 @@ function ConfidenceExplainability({
   rationale: ConfidenceFactor[];
   ledgerRunId?: string;
 }) {
+  const {
+    isOpen: showFormulaHelp,
+    containerRef,
+    hoverStart,
+    hoverEnd,
+    togglePin,
+    close,
+  } = useTooltipState();
   const cfg = CONFIDENCE_CONFIG[label];
   const sortedRationale = [...rationale].sort((a, b) => b.contribution - a.contribution);
   const normalizedScore = typeof score === 'number' ? (score > 1 ? score / 100 : score) : null;
@@ -206,9 +253,78 @@ function ConfidenceExplainability({
 
         {sortedRationale.length > 0 && (
           <div className="space-y-3 pt-2 border-t border-gray-800/60">
-            <p className="text-xs font-medium text-gray-400">
-              Why this score
-            </p>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-1.5">
+                <p className="text-xs font-medium text-gray-400">
+                  Why this score
+                </p>
+                <div ref={containerRef} className="relative">
+                  <button
+                    type="button"
+                    aria-label="Explain detection confidence formula and scoring conditions"
+                    aria-expanded={showFormulaHelp}
+                    onClick={togglePin}
+                    onMouseEnter={hoverStart}
+                    onMouseLeave={hoverEnd}
+                    onFocus={hoverStart}
+                    onBlur={hoverEnd}
+                    className="p-0.5 rounded text-gray-400 hover:text-gray-200 hover:bg-gray-800 transition-colors focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    title="How is detection confidence calculated?"
+                  >
+                    <HelpCircle className="w-3.5 h-3.5" />
+                  </button>
+
+                  {showFormulaHelp && (
+                    <div
+                      role="tooltip"
+                      onMouseEnter={(e) => e.stopPropagation()}
+                      className="absolute left-0 bottom-full mb-2 z-50 w-80 sm:w-96 max-h-[85vh] overflow-y-auto max-w-[calc(100vw-2rem)] rounded-lg border border-gray-700 bg-gray-900/98 p-3.5 text-xs text-gray-200 shadow-2xl backdrop-blur-md pointer-events-auto"
+                    >
+                      <div className="flex items-center justify-between pb-2 border-b border-gray-800">
+                        <span className="font-semibold text-gray-100">{OVERALL_CONFIDENCE_HELP.title}</span>
+                        <button
+                          type="button"
+                          onClick={close}
+                          className="p-1 rounded text-gray-400 hover:text-gray-200 hover:bg-gray-800 transition-colors"
+                          aria-label="Close formula help"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                      <div className="py-2 space-y-2.5">
+                        <div className="p-2 rounded bg-gray-800/70 border border-gray-700/80 font-mono text-[11px] text-blue-300">
+                          {OVERALL_CONFIDENCE_HELP.formula}
+                        </div>
+                        <p className="text-[11px] text-gray-400 leading-relaxed">
+                          {OVERALL_CONFIDENCE_HELP.summary}
+                        </p>
+                        <div className="p-2.5 rounded bg-amber-950/40 border border-amber-800/50 text-[11px] text-amber-200 leading-relaxed">
+                          <span className="font-semibold text-amber-300 block mb-1">Why can score values be negative?</span>
+                          {OVERALL_CONFIDENCE_HELP.negativeExplanation}
+                        </div>
+                        <div className="pt-1">
+                          <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider block mb-1.5">
+                            Score Bands
+                          </span>
+                          <div className="space-y-1 text-[11px]">
+                            {OVERALL_CONFIDENCE_HELP.bands.map((b) => (
+                              <div key={b.label} className="flex items-start gap-2">
+                                <span className={clsx('font-semibold shrink-0 w-20', b.color)}>{b.label} ({b.range}):</span>
+                                <span className="text-gray-400 leading-tight">{b.desc}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+              <span className="text-[10px] text-gray-500 font-mono">
+                {sortedRationale.length} factors evaluated
+              </span>
+            </div>
+
             <div className="space-y-3">
               {sortedRationale.map((factor) => (
                 <ConfidenceFactorBar key={factor.factor} factor={factor} />
@@ -937,7 +1053,7 @@ export function AlertDetailView({ alertId }: { alertId: string }) {
             />
 
             <Section title="Description">
-              <p className="text-sm text-gray-300 leading-relaxed">{alert.description}</p>
+              <p className="text-sm text-gray-300 leading-relaxed break-words whitespace-pre-wrap overflow-x-auto">{alert.description}</p>
             </Section>
 
             {alert.confidenceLabel && (
@@ -975,15 +1091,19 @@ export function AlertDetailView({ alertId }: { alertId: string }) {
             {alert.mitreAttack && alert.mitreAttack.length > 0 && (
               <Section title="MITRE ATT&CK">
                 <div className="space-y-2">
-                  {alert.mitreAttack.map((m, i) => (
-                    <div key={i} className="flex items-center gap-3 p-3 bg-purple-500/5 border border-purple-500/20 rounded-lg">
-                      <span className="text-xs font-mono text-purple-400 bg-purple-500/10 px-2 py-1 rounded">{m.techniqueId}</span>
-                      <div>
-                        <div className="text-sm text-gray-200">{m.technique}</div>
-                        <div className="text-xs text-gray-500">Tactic: {m.tactic}</div>
+                  {alert.mitreAttack.map((m, i) => {
+                    const tactic = m.tactic ||
+                      (m.techniqueId ? TACTIC_BY_ID.get(tacticsFor(m.techniqueId)?.[0] ?? '')?.name : '');
+                    return (
+                      <div key={i} className="flex items-center gap-3 p-3 bg-purple-500/5 border border-purple-500/20 rounded-lg">
+                        <span className="text-xs font-mono text-purple-400 bg-purple-500/10 px-2 py-1 rounded">{m.techniqueId}</span>
+                        <div>
+                          <div className="text-sm text-gray-200">{m.technique}</div>
+                          <div className="text-xs text-gray-500">Tactic: {tactic || '—'}</div>
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </Section>
             )}

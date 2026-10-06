@@ -562,6 +562,12 @@ var canonicalClassByConnector = map[string]struct {
 	"auth0":        {3002, "Authentication"},
 	"duo_security": {3002, "Authentication"},
 	"onepassword":  {3002, "Authentication"},
+	// elastic_search pulls raw ECS firewall/network logs. Their canonical OCSF
+	// model is Network Activity (4001), not a Security Finding (2001).
+	// Keeps low/medium firewall events out of the finding auto-promoter
+	// (class_uid//1000==2) so the AiSOC detection ruleset owns the gate;
+	// genuine high/critical events still promote via the severity_id>=4 gate.
+	"elastic_search": {4001, "Network Activity"},
 }
 
 func isCanonicalEnvelope(p map[string]interface{}) bool {
@@ -657,11 +663,15 @@ func canonicalProfile(connectorType string) connectorProfile {
 	if name == "" {
 		name = "Connector"
 	}
+	fieldMap := _canonicalFieldMap
+	if connectorType == "elastic_search" {
+		fieldMap = elasticFieldMap
+	}
 	return connectorProfile{
 		product:     OcsfProduct{Name: name, VendorName: name},
 		classUID:    classUID,
 		className:   className,
-		fieldMap:    _canonicalFieldMap,
+		fieldMap:    fieldMap,
 		severityMap: _canonicalSeverityMap,
 	}
 }
@@ -728,22 +738,22 @@ func (n *Normalizer) Normalize(raw *RawEvent) (*NormalizedEvent, error) {
 	// Apply field mappings
 	for srcField, dstField := range profile.fieldMap {
 		if val := getNestedField(raw.Payload, srcField); val != nil {
-			setNestedField(ocsf, dstField, val)                                                                  
-       }                                                                                                      
-	} 
+			setNestedField(ocsf, dstField, val)
+		}
+	}
 
 	// Fallback: If Splunk _raw is present and fields are still missing, try extracting from _raw
-	if splunkRawStr := getNestedField(raw.Payload, "raw_event.raw_event._raw"); splunkRawStr != nil {       
-		if s, ok := splunkRawStr.(string); ok {          
-			// Extract host                       
-			if getNestedField(ocsf, "device.name") == nil {           
-				if host := extractFromSplunkRaw(s, "orig_host"); host != "" {                                                                                                       
-						setNestedField(ocsf, "device.name", host)   
+	if splunkRawStr := getNestedField(raw.Payload, "raw_event.raw_event._raw"); splunkRawStr != nil {
+		if s, ok := splunkRawStr.(string); ok {
+			// Extract host
+			if getNestedField(ocsf, "device.name") == nil {
+				if host := extractFromSplunkRaw(s, "orig_host"); host != "" {
+					setNestedField(ocsf, "device.name", host)
 				} else if host := extractFromSplunkRaw(s, "entity"); host != "" {
-					setNestedField(ocsf, "device.name", host)                                                                                                                                      
-				}                                                                                              
-			}   
-		// Extract user
+					setNestedField(ocsf, "device.name", host)
+				}
+			}
+			// Extract user
 			if getNestedField(ocsf, "actor.user.name") == nil {
 				if user := extractFromSplunkRaw(s, "USER"); user != "" {
 					setNestedField(ocsf, "actor.user.name", user)
@@ -943,6 +953,13 @@ func extractTechniqueIDs(payload map[string]interface{}) []string {
 	candidateKeys := []string{
 		"technique_id", "mitre_technique", "attck_technique", "tactic_id",
 		"mitre_techniques", "attack_technique",
+
+		"mitre_techniques.0",
+		"threat.technique.id",
+		"threat.tactic.id",
+		"raw_event.mitre_techniques",
+		"raw_event.threat.technique.id",
+
 		"raw_event.annotations.mitre_attack",
 		"raw_event.raw_event.annotations.mitre_attack",
 		"raw_event.raw_event.annotations.mitre_attack_id",
@@ -1004,13 +1021,33 @@ func normalizeTechniqueID(s string) string {
 
 // normalizeTime attempts to parse and re-format a timestamp as RFC3339
 func normalizeTime(t string) string {
+	t = strings.TrimSpace(t)
+	if t == "" {
+		return time.Now().UTC().Format(time.RFC3339Nano)
+	}
+
+	// 1. Epoch Timestamp (숫자 형태: 초/밀리초/마이크로초) 파싱
+	if num, err := strconv.ParseInt(t, 10, 64); err == nil {
+		switch {
+		case num > 1e14: // Microseconds
+			return time.Unix(0, num*1000).UTC().Format(time.RFC3339Nano)
+		case num > 1e11: // Milliseconds
+			return time.UnixMilli(num).UTC().Format(time.RFC3339Nano)
+		default: // Seconds
+			return time.Unix(num, 0).UTC().Format(time.RFC3339Nano)
+		}
+	}
 	formats := []string{
 		time.RFC3339Nano,
 		time.RFC3339,
-		"2006-01-02T15:04:05.000Z",
-		"2006-01-02T15:04:05Z",
+		"2006-01-02T15:04:05.999999999Z07:00", // ISO8601 (가변 소수점 + 타임존)
+		"2006-01-02T15:04:05.999999999-07:00",
+		"2006-01-02T15:04:05.999999999",
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05.999999999", // Logstash / Syslog
 		"2006-01-02 15:04:05",
 		"01/02/2006 15:04:05",
+		"02/Jan/2006:15:04:05 -0700", // Nginx / Apache
 	}
 	for _, f := range formats {
 		if parsed, err := time.Parse(f, t); err == nil {

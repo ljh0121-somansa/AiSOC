@@ -78,7 +78,30 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def _create_schema() -> None:
-    """Apply any pending graph migrations.
+    """Create constraints and indexes for the graph schema.
+
+    The live ingest writer is the single source of truth for graph vocabulary
+    (see services/ingest/internal/graph). These labels must mirror its label
+    set; the query layer only consumes nodes the writer produces.
+    """
+    # Ingest label set — the writer never creates Host/IOC/Technique/Process.
+    _GRAPH_LABELS: tuple[str, ...] = (
+        "User", "Endpoint", "NetworkPath", "Resource", "Alert", "Detection",
+        "Repo", "Identity", "ServiceAccount", "SaaSApp", "Permission",
+        "Role", "Policy", "Container", "Image", "Case",
+    )
+
+    # Per invariant: uniqueness is keyed on natural_key (the only id the writer
+    # persists); a per-label tenant_id index covers tenant-scoped lookups.
+    statements: list[str] = []
+    for label in _GRAPH_LABELS:
+        statements.append(
+            f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label}) "
+            f"REQUIRE n.natural_key IS UNIQUE"
+        )
+        statements.append(
+            f"CREATE INDEX IF NOT EXISTS FOR (n:{label}) REQUIRE (n.tenant_id)"
+        )
 
     This used to be a fixed list of ``CREATE … IF NOT EXISTS`` statements with
     every failure swallowed at ``debug``, which meant a schema change could
@@ -93,8 +116,11 @@ async def _create_schema() -> None:
     ``debug``, and the pending list is readable for diagnostics.
     """
     async with get_session() as session:
-        applied = await run_migrations(session, strict=False)
-        pending = await pending_ids(session)
+        for cypher in statements:
+            try:
+                await session.run(cypher)
+            except Exception as exc:
+                logger.debug("Schema statement skipped cypher=%s error=%s", cypher[:60], exc)
 
     if applied:
         logger.info("Neo4j graph migrations applied: %s", ", ".join(applied))

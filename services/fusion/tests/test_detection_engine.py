@@ -97,14 +97,54 @@ def test_build_alert_carries_rule_metadata():
     assert alert.hostname == "HOST-1"
 
 
-def test_no_ocsf_or_bad_tenant_is_safe():
+def test_build_alert_description_includes_mitre_and_entities():
     eng = _engine()
-    assert eng.evaluate({"tenant_id": TENANT}) == []
-    msg = _msg({"event_name": "ConsoleLogin", "user_type": "Root", "error_code": None})
-    msg["tenant_id"] = "not-a-uuid"
-    msg["ocsf_event"].pop("tenant_uid", None)
-    hit = eng.evaluate(msg)[0]
-    assert eng.build_alert(msg, hit) is None  # bad tenant -> no alert
+    msg = _msg(
+        {"event_name": "ConsoleLogin", "user_type": "Root", "error_code": None},
+        product="aws",
+    )
+    msg["ocsf_event"]["src_endpoint"] = {"ip": "10.0.0.1"}
+    msg["ocsf_event"]["dst_endpoint"] = {"ip": "10.0.0.2"}
+    hit = next(h for h in eng.evaluate(msg) if h.rule_id == "det-cloud-001")
+    alert = eng.build_alert(msg, hit)
+    assert alert is not None
+    assert "T1078.004" in alert.description
+    assert "Entity:" in alert.description
+    assert "host=HOST-1" in alert.description
+    assert "src=10.0.0.1 -> dst=10.0.0.2" in alert.description
+    # The old count-style ("N MITRE technique(s)") phrasing must be gone.
+    assert "MITRE technique" not in alert.description
+
+
+def test_build_alert_description_handles_string_mitre():
+    from dataclasses import replace
+
+    eng = _engine()
+    msg = _msg(
+        {"event_name": "ConsoleLogin", "user_type": "Root", "error_code": None},
+        product="aws",
+    )
+    hit = next(h for h in eng.evaluate(msg) if h.rule_id == "det-cloud-001")
+    hit = replace(hit, mitre="T1078.004")  # string branch
+    alert = eng.build_alert(msg, hit)
+    assert alert is not None
+    assert "T1078.004" in alert.description
+
+
+def test_build_alert_description_falls_back_to_category_when_no_mitre():
+    from dataclasses import replace
+
+    eng = _engine()
+    msg = _msg(
+        {"event_name": "ConsoleLogin", "user_type": "Root", "error_code": None},
+        product="aws",
+    )
+    hit = next(h for h in eng.evaluate(msg) if h.rule_id == "det-cloud-001")
+    hit = replace(hit, mitre="")  # empty string -> category fallback
+    alert = eng.build_alert(msg, hit)
+    assert alert is not None
+    assert hit.category in alert.description
+
 
 
 def test_falls_back_to_ocsf_when_no_raw_data():
@@ -117,6 +157,12 @@ def test_falls_back_to_ocsf_when_no_raw_data():
     assert any(h.rule_id == "det-cloud-001" for h in hits)
 
 
-def test_real_ruleset_loads_and_is_nonempty():
+def test_engine_starts_empty_and_is_populated_by_apply_reload():
+    # The engine is Postgres-source-of-truth: it boots with an empty map and is
+    # populated at fusion startup by reconcile_from_postgres / live apply_reload
+    # calls, NOT by a boot-time JSON load. Verify that contract.
     eng = DetectionEngine()
-    assert eng.rule_count > 500  # the exported corpus (~817)
+    assert eng.rule_count == 0
+    eng.apply_reload("CREATE", "det-1", {"event_type": "ConsoleLogin"},
+                     metadata={"name": "Root Login", "severity": "critical", "category": "cloud"})
+    assert eng.rule_count == 1

@@ -238,7 +238,7 @@ function GraphCanvas({ graph, onSelect }: GraphCanvasProps) {
         data: {
           id: n.id,
           label: n.label,
-          kind: n.kind,
+          kind: normalizeKind(n.kind),
           color: KIND_COLORS[n.kind] ?? '#94a3b8',
           shape: KIND_SHAPES[n.kind] ?? 'ellipse',
           size: 24 + Math.min(36, (n.riskScore ?? 30) / 2),
@@ -560,7 +560,12 @@ export function AttackGraphView() {
               telemetry.
             </p>
           </div>
-          <div className="text-xs text-slate-500" suppressHydrationWarning>
+          <div className="flex items-center gap-2 text-xs text-slate-500" suppressHydrationWarning>
+            {graph && graph.source === 'relational' ? (
+              <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400 font-medium">
+                Relational fallback
+              </span>
+            ) : null}
             {graph
               ? `Generated ${new Date(graph.generatedAt).toLocaleTimeString()}`
               : ''}

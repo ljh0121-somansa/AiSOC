@@ -1,5 +1,5 @@
 id: det-cloud-221
-name: M365 Exchange Transport Rule Redirects Mail Externally
+name: M365 Exchange Transport Rule Redirects Mail Externally (External Redirect Action)
 description: A transport rule was created or modified to redirect or BCC mail to an
   external domain. Attackers use this for persistent email exfiltration that survives
   password resets.

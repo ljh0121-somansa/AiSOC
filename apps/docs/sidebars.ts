@@ -168,6 +168,7 @@ const sidebars: SidebarsConfig = {
         "connectors/zeek_suricata",
         "connectors/zscaler",
         // END GENERATED CONNECTOR LIST
+        "connectors/elastic_search",
       ],
     },
     {

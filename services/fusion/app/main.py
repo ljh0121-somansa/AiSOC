@@ -178,6 +178,8 @@ async def lifespan(app: FastAPI):
     worker_task.cancel()
     if memory_task is not None:
         memory_task.cancel()
+    if getattr(app.state, "detection_reload_task", None) is not None:
+        app.state.detection_reload_task.cancel()
     await redis_client.aclose()
     logger.info("Alert Fusion Service stopped")
 

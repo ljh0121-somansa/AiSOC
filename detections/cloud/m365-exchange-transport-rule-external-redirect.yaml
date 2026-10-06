@@ -1,5 +1,5 @@
 id: det-cloud-192
-name: M365 Exchange Transport Rule Redirects Mail Externally
+name: M365 Exchange Transport Rule Redirects Mail Externally (Redirect + BCC)
 description: Detects creation or modification of an Exchange Online transport rule that
   redirects or forwards mail to an external domain. Commonly abused in BEC attacks to
   silently siphon conversations.

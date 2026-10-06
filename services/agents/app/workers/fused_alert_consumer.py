@@ -59,6 +59,8 @@ from app.memory.outcomes import AI, should_auto_suppress
 from app.models.state import AgentStatus, InvestigationState
 from app.routing.model_router import is_deterministic_mode
 from app.security.llm_resolver import resolve_llm_config
+from app.playbook import PlaybookEngine
+from app.playbook.store import PlaybookStore, normalize_severity
 from app.workers.business_context import BusinessContextApplier
 from app.workers.shadow_mode import (
     LiveShadowModePolicy,

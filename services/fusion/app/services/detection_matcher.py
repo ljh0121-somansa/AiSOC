@@ -57,6 +57,10 @@ OPERATORS: list[tuple[str, str, str]] = sorted(
     key=lambda x: -len(x[0]),
 )
 
+# Inverse of ``OPERATORS``: op_name -> display token, reused when rendering
+# human-readable condition prose in :func:`format_match_condition`.
+_OP_TOKENS: dict[str, str] = {op_name: token for _suffix, op_name, token in OPERATORS}
+
 
 def _split_op(key: str) -> tuple[str, str]:
     """Return (field, op_name). Plain equality / null check => op == 'eq'."""
@@ -101,6 +105,9 @@ def _check(field: str, op: str, expected: Any, event: dict[str, Any]) -> bool:
         return actual in expected if isinstance(expected, list) else False
 
     if op == "not_in":
+        # Blacklist negation: only fires when the field is present.
+        if actual is None:
+            return False
         return actual not in expected if isinstance(expected, list) else False
 
     if op == "contains_any":
@@ -161,6 +168,9 @@ def _check(field: str, op: str, expected: Any, event: dict[str, Any]) -> bool:
         return any(actual.startswith(str(s)) for s in expected)
 
     if op == "not_startswith":
+        # Blacklist negation: only fires when the field is present.
+        if actual is None:
+            return False
         if not isinstance(actual, str):
             return False
         return not actual.startswith(str(expected))
@@ -195,12 +205,21 @@ def _check(field: str, op: str, expected: Any, event: dict[str, Any]) -> bool:
             return str(expected).lower() in str(actual).lower()
 
     if op == "not_endswith_any":
+        # Allowlist negation: rule fires only when `actual` does NOT end with any
+        # of the supplied suffixes. Used to carve out legit-binary basenames in
+        # otherwise-broad endpoint rules (e.g. browser-credential-grabber).
+        # Only fires when the field is present.
+        if actual is None:
+            return False
         if not isinstance(expected, list) or not isinstance(actual, str):
             return False
         return not any(actual.endswith(str(s)) for s in expected)
 
     if op == "not_contains_any":
         if not isinstance(expected, list):
+            return False
+        # Blacklist negation: only fires when the field is present.
+        if actual is None:
             return False
         if isinstance(actual, list):
             actual_lc = {_to_lc_str(x) for x in actual}
@@ -226,6 +245,66 @@ def _eval_clause(clause: dict[str, Any], event: dict[str, Any]) -> bool:
         if not _check(field, op, expected, event):
             return False
     return True
+
+
+def format_match_condition(match_when: dict[str, Any], fields: dict[str, Any]) -> str:
+    """Render a rule's ``match_when`` as human-readable analyst prose.
+
+    Mirrors :func:`matches` structure: plain clauses render as
+    ``field='actual' (OP TOKEN expected)``, nested ``all_of`` members join with
+    ``AND`` and ``any_of`` members with ``OR`` (each group wrapped in parens).
+    The plain field name is recovered from the key suffix (``dst_port_not_in``
+    -> ``dst_port`` + ``NOT IN``), and the runtime value is pulled from
+    ``fields`` for readable prose. A missing value still renders the operator
+    clause so a pure-constraint rule (``dst_port NOT IN (80, 443, ...)``) reads
+    sensibly. Empty spec -> ``"all conditions matched"``. Pure; never raises.
+    """
+    if not isinstance(match_when, dict) or not match_when:
+        return "all conditions matched"
+
+    def _expected_str(expected: Any) -> str:
+        if isinstance(expected, list):
+            return f"({', '.join(str(e) for e in expected)})"
+        return str(expected)
+
+    def render_plain(key: str, expected: Any) -> str:
+        field, op = _split_op(key)
+        token = _OP_TOKENS.get(op, op.upper())
+        if expected is None:
+            return f"{field} is not present"
+        actual = fields.get(field) if isinstance(fields, dict) else None
+        if op == "eq":
+            return f"{field}={actual!r}" if actual is not None else f"{field}={expected!r}"
+        if actual is None:
+            return f"{field} ({token} {_expected_str(expected)})"
+        return f"{field}={actual!r} ({token} {_expected_str(expected)})"
+
+    def render_clause(clause: Any) -> str:
+        if not isinstance(clause, dict) or not clause:
+            return str(clause)
+        # Groups join their members (any_of => OR, all_of => AND); plain
+        # clauses render as ``field=value (OP)`` and are joined with AND.
+        inner_parts = []
+        for key, value in clause.items():
+            if key == "any_of" and isinstance(value, list):
+                inner_parts.append(f"({' OR '.join(render_clause(sub) for sub in value)})")
+            elif key == "all_of" and isinstance(value, list):
+                inner_parts.append(f"({' AND '.join(render_clause(sub) for sub in value)})")
+            else:
+                inner_parts.append(render_plain(key, value))
+        return " AND ".join(inner_parts)
+
+    parts = []
+    for key, value in match_when.items():
+        if key == "any_of" and isinstance(value, list):
+            inner = " OR ".join(render_clause(sub) for sub in value)
+            parts.append(f"({inner})")
+        elif key == "all_of" and isinstance(value, list):
+            inner = " AND ".join(render_clause(sub) for sub in value)
+            parts.append(f"({inner})")
+        else:
+            parts.append(render_plain(key, value))
+    return " AND ".join(parts)
 
 
 def matches(match_when: dict[str, Any], event: dict[str, Any]) -> bool:

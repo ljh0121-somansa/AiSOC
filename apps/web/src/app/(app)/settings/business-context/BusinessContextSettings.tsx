@@ -21,15 +21,23 @@ import {
 } from "./client";
 import { RuleBuilder } from "./RuleBuilder";
 import { PreviewTable } from "./PreviewTable";
+import { initMonacoEnv } from '@/lib/monaco-env';
 
-const MonacoEditor = dynamic(() => import("@monaco-editor/react"), {
-  ssr: false,
-  loading: () => (
-    <div className="flex h-full items-center justify-center text-sm text-slate-500">
-      Loading editor...
-    </div>
-  ),
-});
+
+const MonacoEditor = dynamic(
+  () => {
+    initMonacoEnv();
+    return import("@monaco-editor/react");
+  },
+  {
+    ssr: false,
+    loading: () => (
+      <div className="flex h-full items-center justify-center text-sm text-slate-500">
+        Loading editor...
+      </div>
+    ),
+  },
+);
 
 const STARTER_YAML = `# Business context rules — YAML.
 # Each rule mutates a fused alert before it reaches the triage agent.

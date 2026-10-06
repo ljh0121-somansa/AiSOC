@@ -349,7 +349,25 @@ export const authApi = {
     if (typeof window === 'undefined') return null;
     try {
       const raw = window.localStorage.getItem(AUTH_USER_KEY);
-      return raw ? (JSON.parse(raw) as AuthUser) : null;
+      if (raw) return JSON.parse(raw) as AuthUser;
+      const token =
+        window.localStorage.getItem('aisoc_access_token') ||
+        window.localStorage.getItem(AUTH_TOKEN_KEY);
+      if (token && token.includes('.')) {
+        const parts = token.split('.');
+        if (parts.length === 3) {
+          const payload = JSON.parse(atob(parts[1]));
+          if (payload) {
+            return {
+              id: payload.sub,
+              email: payload.email,
+              role: payload.role,
+              tenant_id: payload.tenant_id,
+            };
+          }
+        }
+      }
+      return null;
     } catch {
       return null;
     }
@@ -701,7 +719,7 @@ export type ConfidenceLabel = 'high' | 'medium' | 'low';
 export interface ConfidenceFactor {
   factor: string;
   label: string;
-  value: number;
+  value: string | number;
   contribution: number;
   weight: number;
 }
@@ -898,7 +916,7 @@ function normalizeAlert(raw: unknown): Alert {
     ? (rationaleRaw as Array<Record<string, unknown>>).map((f) => ({
         factor: String(f.factor ?? ''),
         label: String(f.label ?? ''),
-        value: Number(f.value ?? 0),
+        value: typeof f.value === 'number' ? f.value : String(f.value ?? ''),
         contribution: Number(f.contribution ?? 0),
         weight: Number(f.weight ?? 0),
       }))
@@ -2194,7 +2212,7 @@ export interface FunnelMetrics {
   /** Alerts produced per event-of-interest, clamped to [0, 1]. */
   alert_yield: number;
   mitre_coverage: { covered: number; total: number; ratio: number };
-  /** Period-over-period deltas (fraction, e.g. 0.05 = +5%). */
+  /** Period-over-period deltas in percentage (e.g. 5.0 = +5%, -100.0 = -100%). */
   deltas: {
     events_of_interest: number;
     correlation_instances: number;
@@ -3805,13 +3823,22 @@ export type GraphNodeKind =
   | 'alert'
   | 'asset';
 
+/**
+ * A tenant-level attack-graph node as returned by `graphApi.getOverview`.
+ *
+ * `kind` is one of the small visual-vocabulary set above for the frontend
+ * color/shape maps; when the backend returns an ingest label (e.g. `"endpoint"`)
+ * the consumer normalizes it via `normalizeKind`. `properties` carries the raw
+ * Neo4j node properties (canonical source); `riskScore`/`severity` are
+ * best-effort derived fields.
+ */
 export interface GraphNode {
   id: string;
   label: string;
   kind: GraphNodeKind;
   riskScore?: number;
   severity?: AlertSeverity;
-  attributes?: Record<string, unknown>;
+  properties?: Record<string, unknown>;
 }
 
 export interface GraphEdge {
@@ -3819,8 +3846,6 @@ export interface GraphEdge {
   source: string;
   target: string;
   label: string;
-  weight?: number;
-  attributes?: Record<string, unknown>;
 }
 
 export interface AttackGraph {
@@ -4081,6 +4106,7 @@ export interface DetectionRule {
   updatedAt: string;
   lastTriggeredAt?: string;
   hitCount?: number;
+  isBuiltin?: boolean;
 }
 
 // ─── Detection management UI (WS-B3) ─────────────────────────────────────────

@@ -205,7 +205,7 @@ def _select_blast_targets(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         "entity_type": "host",
                         "entity_id": nid,
                         "label": "Host",
-                        "name": props.get("hostname", nid),
+                        "name": props.get("hostname") or nid,
                     },
                 )
             )

@@ -58,6 +58,8 @@ func ExtractFromOCSF(eventID, tenantID, connectorType string, ocsf map[string]in
 		extractFromOkta(ev, ocsf)
 	case "kubernetes_audit":
 		extractFromKubernetes(ev, ocsf)
+	case "elastic_search":
+		extractFromElasticSearch(ev, ocsf)
 
 	// TODO(T1.1+): wire up real extractors for the remaining v8.0 source
 	// types. Until then they fall through to extractGeneric which still
@@ -119,7 +121,7 @@ func extractGeneric(ev *Event, ocsf map[string]interface{}) {
 	}
 	if srcIP := getString(ocsf, "src_endpoint.ip"); srcIP != "" {
 		srcKey = fmt.Sprintf("netpath:%s:%s", ev.TenantID, srcIP)
-		if devKey == "" { // 👈 장비(demo)가 없을 때만 생성 (1줄 추가)                                       
+		if devKey == "" {                                       
 		ev.Nodes = append(ev.Nodes, Node{                                                                 
 			Label:      NodeNetworkPath,                                                                   
 			NaturalKey: srcKey,                                                                            
@@ -162,6 +164,114 @@ func extractGeneric(ev *Event, ocsf map[string]interface{}) {
 	}
 }
 
+func extractFromElasticSearch(ev *Event, ocsf map[string]interface{}) {
+	var userKey, devKey, srcKey, dstKey, alertKey string
+
+	// 1. User Entity
+	if user := getString(ocsf, "actor.user.name"); user != "" {
+		userKey = fmt.Sprintf("user:%s:%s", ev.TenantID, user)
+		ev.Nodes = append(ev.Nodes, Node{
+			Label:      NodeUser,
+			NaturalKey: userKey,
+			TenantID:   ev.TenantID,
+			Properties: map[string]interface{}{"name": user, "provider": "elasticsearch"},
+		})
+	}
+
+	// 2. Endpoint Entity
+	if dev := getString(ocsf, "device.name"); dev != "" {
+		devKey = fmt.Sprintf("endpoint:%s:%s", ev.TenantID, dev)
+		ev.Nodes = append(ev.Nodes, Node{
+			Label:      NodeEndpoint,
+			NaturalKey: devKey,
+			TenantID:   ev.TenantID,
+			Properties: map[string]interface{}{"name": dev, "ip": getString(ocsf, "src_endpoint.ip"), "provider": "elasticsearch"},
+		})
+	}
+
+	// 3. Network Path Entities
+	if srcIP := getString(ocsf, "src_endpoint.ip"); srcIP != "" {
+		srcKey = fmt.Sprintf("netpath:%s:%s", ev.TenantID, srcIP)
+		if devKey == "" {
+			ev.Nodes = append(ev.Nodes, Node{
+				Label:      NodeNetworkPath,
+				NaturalKey: srcKey,
+				TenantID:   ev.TenantID,
+				Properties: map[string]interface{}{"src_ip": srcIP, "role": "src"},
+			})
+		}
+	}
+
+	if dstIP := getString(ocsf, "dst_endpoint.ip"); dstIP != "" {
+		dstKey = fmt.Sprintf("netpath:%s:%s", ev.TenantID, dstIP)
+		ev.Nodes = append(ev.Nodes, Node{
+			Label:      NodeNetworkPath,
+			NaturalKey: dstKey,
+			TenantID:   ev.TenantID,
+			Properties: map[string]interface{}{"dst_ip": dstIP, "role": "dst"},
+		})
+	}
+
+	// 4. Event/Alert Entity (👈 finding.uid 제거, _id 및 event.id 탐색)
+	alertID := getString(ocsf, "event_id")
+	if alertID == "" {
+		alertID = getString(ocsf, "external_id")
+	}
+
+	if alertID != "" {
+		alertKey = fmt.Sprintf("alert:%s:%s", ev.TenantID, alertID)
+		ev.Nodes = append(ev.Nodes, Node{
+			Label:      NodeAlert,
+			NaturalKey: alertKey,
+			TenantID:   ev.TenantID,
+			Properties: map[string]interface{}{
+				"title":      getString(ocsf, "message"),
+				"severity":   getString(ocsf, "severity"),
+				"risk_score": ocsf["risk_score"],
+				"provider":   "elasticsearch",
+			},
+		})
+	}
+
+	// --- 엣지(Edge/연결선) 생성 로직 ---
+
+	// 사용자 -> 장비 (User -[:ACCESSES]-> Endpoint)
+	if userKey != "" && devKey != "" {
+		ev.Edges = append(ev.Edges, Edge{
+			Type:      RelAccesses,
+			FromLabel: NodeUser, FromKey: userKey,
+			ToLabel: NodeEndpoint, ToKey: devKey,
+		})
+	}
+
+	// 출발지 -> 목적지 (Accesses Edge)
+	fromKey, fromLabel := devKey, NodeEndpoint
+	if fromKey == "" {
+		fromKey, fromLabel = srcKey, NodeNetworkPath
+	}
+	if fromKey != "" && dstKey != "" {
+		ev.Edges = append(ev.Edges, Edge{
+			Type:      RelAccesses,
+			FromLabel: fromLabel, FromKey: fromKey,
+			ToLabel: NodeNetworkPath, ToKey: dstKey,
+		})
+	}
+
+	// 알람 -> 대상 장비/네트워크 (Alert -[:OCCURRED_ON]-> Endpoint or NetworkPath)
+	if alertKey != "" {
+		targetKey, targetLabel := devKey, NodeEndpoint
+		if targetKey == "" {
+			targetKey, targetLabel = srcKey, NodeNetworkPath
+		}
+		if targetKey != "" {
+			ev.Edges = append(ev.Edges, Edge{
+				Type:      RelOccurredOn,
+				FromLabel: NodeAlert, FromKey: alertKey,
+				ToLabel: targetLabel, ToKey: targetKey,
+			})
+		}
+	}
+}
 // extractFromAWS handles AWS Security Hub findings.
 //
 // Entity model:

@@ -34,6 +34,7 @@ from sqlalchemy import and_, or_, select, update
 
 from app.api.v1.deps import AuthUser, DBSession, require_permission
 from app.models.detection_rule import DetectionRule
+from app.services.detections.compiler import apply_compile_and_reload
 from app.services.rule_engine import execute_rule
 from app.core.mitre import resolve_tactic
 from app.core.mitre import total_techniques_count
@@ -60,6 +61,7 @@ class FrontendDetectionRule(BaseModel):
     updatedAt: str
     lastTriggeredAt: str | None = None
     hitCount: int = 0
+    isBuiltin: bool = False
 
 
 class ListResponse(BaseModel):
@@ -134,6 +136,7 @@ def _to_frontend(rule: DetectionRule) -> FrontendDetectionRule:
         updatedAt=rule.updated_at.isoformat() if rule.updated_at else datetime.now(UTC).isoformat(),
         lastTriggeredAt=rule.last_triggered.isoformat() if rule.last_triggered else None,
         hitCount=rule.total_hits or 0,
+        isBuiltin=bool(rule.is_builtin),
     )
 
 
@@ -238,6 +241,7 @@ async def create_rule_compat(
     db.add(rule)
     await db.commit()
     await db.refresh(rule)
+    await apply_compile_and_reload(rule, db)
     return _to_frontend(rule)
 
 
@@ -268,18 +272,34 @@ async def update_rule_compat(
     current_user: Annotated[AuthUser, Depends(require_permission("rules:write"))],
     db: DBSession,
 ) -> FrontendDetectionRule:
-    """Update a tenant-owned rule using the frontend shape."""
-    stmt = select(DetectionRule).where(
-        DetectionRule.id == rule_id,
-        DetectionRule.tenant_id == current_user.tenant_id,
-    )
+    """Update a detection rule using the frontend shape."""
+    stmt = select(DetectionRule).where(DetectionRule.id == rule_id)
     rule = (await db.execute(stmt)).scalar_one_or_none()
     if rule is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Rule not found",
+        )
+
+    is_platform_admin = current_user.role == "platform_admin"
+
+    if rule.tenant_id is None:
+        if not is_platform_admin:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Built-in platform detection rules can only be modified by a platform administrator",
+            )
+    elif rule.tenant_id != current_user.tenant_id and not is_platform_admin:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Rule not found or cannot be modified",
         )
 
+    # Capture the pre-update state before the setattr loop below mutates
+    # `rule` (the compile hook runs after db.refresh() and would otherwise
+    # only see the new values).
+    prev_status = rule.status
+    prev_body = rule.rule_body
     updates: dict[str, Any] = {}
     if body.name is not None:
         updates["name"] = body.name
@@ -301,12 +321,21 @@ async def update_rule_compat(
     if updates:
         updates["updated_at"] = datetime.now(UTC)
         updates["version"] = (rule.version or 1) + 1
+        for k, v in updates.items():
+            setattr(rule, k, v)
         await db.execute(
-            update(DetectionRule).where(DetectionRule.id == rule_id, DetectionRule.tenant_id == current_user.tenant_id).values(**updates)
+            update(DetectionRule)
+            .where(DetectionRule.id == rule_id, DetectionRule.tenant_id == current_user.tenant_id)
+            .values(**updates)
         )
         await db.commit()
         await db.refresh(rule)
-
+        await apply_compile_and_reload(
+            rule,
+            db,
+            prev_status=prev_status,
+            prev_body_changed=(body.body is not None and body.body != prev_body),
+        )
     return _to_frontend(rule)
 
 
@@ -320,13 +349,24 @@ async def delete_rule_compat(
     current_user: Annotated[AuthUser, Depends(require_permission("rules:write"))],
     db: DBSession,
 ) -> None:
-    """Delete a tenant-owned rule."""
-    stmt = select(DetectionRule).where(
-        DetectionRule.id == rule_id,
-        DetectionRule.tenant_id == current_user.tenant_id,
-    )
+    """Delete a detection rule."""
+    stmt = select(DetectionRule).where(DetectionRule.id == rule_id)
     rule = (await db.execute(stmt)).scalar_one_or_none()
     if rule is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Rule not found",
+        )
+
+    is_platform_admin = current_user.role == "platform_admin"
+
+    if rule.tenant_id is None:
+        if not is_platform_admin:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Built-in platform detection rules can only be modified by a platform administrator",
+            )
+    elif rule.tenant_id != current_user.tenant_id and not is_platform_admin:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Rule not found or cannot be deleted",
@@ -965,13 +1005,23 @@ async def bulk_toggle_rules(
 
     target_status = "active" if body.enabled else "inactive"
 
-    # Look up which of the requested IDs are actually tenant-owned. Built-in
-    # rules (tenant_id IS NULL) and other-tenant rules get pushed onto
-    # ``skipped`` rather than mutated.
-    stmt = select(DetectionRule.id).where(
-        DetectionRule.id.in_(parsed.keys()),
-        DetectionRule.tenant_id == current_user.tenant_id,
-    )
+    # Look up which of the requested IDs are actually eligible for mutation.
+    # Platform admins can toggle tenant-owned or platform (tenant_id IS NULL) rules.
+    # Regular tenant users can only toggle their own tenant's rules; platform rules
+    # and other-tenant rules get pushed onto ``skipped``.
+    if current_user.role == "platform_admin":
+        stmt = select(DetectionRule.id).where(
+            DetectionRule.id.in_(parsed.keys()),
+            or_(
+                DetectionRule.tenant_id == current_user.tenant_id,
+                DetectionRule.tenant_id.is_(None),
+            ),
+        )
+    else:
+        stmt = select(DetectionRule.id).where(
+            DetectionRule.id.in_(parsed.keys()),
+            DetectionRule.tenant_id == current_user.tenant_id,
+        )
     owned_ids: list[uuid.UUID] = list((await db.execute(stmt)).scalars().all())
     owned_set = set(owned_ids)
 

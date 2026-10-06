@@ -1,5 +1,5 @@
 id: det-cloud-212
-name: Azure Key Vault Purge Protection Disabled
+name: Azure Key Vault Purge Protection Disabled (Activity Log)
 description: Purge protection was disabled on an Azure Key Vault. Without purge
   protection, soft-deleted secrets, keys, and certificates can be permanently
   destroyed before the retention period expires, enabling evidence destruction.
