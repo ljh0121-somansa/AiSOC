@@ -85,6 +85,13 @@ _CACHE_TTL_S = float(os.getenv("AISOC_TRIAGE_IDENTITY_TTL_S", "300"))
 
 _cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
+#: context_status values that mean "the graph did not answer", not "no
+#: directory context". These are not cached, so a graph that is down does not
+#: freeze an empty lookup onto every follow-up triage for the full TTL.
+_UNCACHEABLE_STATUSES: frozenset[str] = frozenset(
+    {"unavailable", "degraded", "graph_vocabulary_missing"}
+)
+
 
 def enabled() -> bool:
     return os.getenv("AISOC_TRIAGE_IDENTITY_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
@@ -191,6 +198,13 @@ async def fetch_identity_context(
         return IdentityContext()
 
     if not isinstance(payload, dict):
+        return IdentityContext()
+    # A missing field means an older API that never published a status; keep
+    # the historical behaviour (cache it). A published uncacheable status means
+    # the graph did not answer, so return empty rather than caching an empty
+    # result as "no directory context" for a full TTL.
+    status = payload.get("context_status")
+    if status in _UNCACHEABLE_STATUSES:
         return IdentityContext()
     _cache[cache_key] = (now, payload)
     return _shape(payload, limit=limit)

@@ -256,7 +256,7 @@ export function SOCMetricsDashboard() {
     () => metricsApi.getSOC(),
     {
       refreshInterval: 60_000,
-      fallbackData: demoFallback(MOCK_SOC_METRICS),
+      fallbackData: demoFallback(DEFAULT_SOC_METRICS),
       shouldRetryOnError: true,
       errorRetryCount: 3,
       errorRetryInterval: 4000,
@@ -267,7 +267,7 @@ export function SOCMetricsDashboard() {
 
   const refresh = useCallback(() => mutate(), [mutate]);
 
-  // `MOCK_SOC_METRICS` is reachable only through the `demoFallback` above,
+  // `DEFAULT_SOC_METRICS` is reachable only through the `demoFallback` above,
   // which is `undefined` outside the hosted demo.
   //
   // It used to also be substituted here, unconditionally, whenever `data` was

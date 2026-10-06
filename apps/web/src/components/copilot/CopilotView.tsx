@@ -22,6 +22,7 @@ import {
   copilotApi,
   type CopilotConversation,
   type CopilotMessage,
+  ApiError,
 } from '@/lib/api';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { canUseDemoData } from '@/lib/demoFallback';
@@ -423,7 +424,13 @@ export function CopilotView() {
   const [failedPrompt, setFailedPrompt] = useState<string | null>(null);
   const [everSucceeded, setEverSucceeded] = useState(false);
   const scrollerRef = useRef<HTMLDivElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
+  useEffect(() => {
+    return () => {
+      abortControllerRef.current?.abort();
+    };
+  }, []);
   const conversationsState = useSWR(
     'copilot.conversations',
     () => copilotApi.listConversations(),
@@ -446,6 +453,10 @@ export function CopilotView() {
     const trimmed = prompt.trim();
     if (!trimmed || sending) return;
 
+    abortControllerRef.current?.abort();
+    const ac = new AbortController();
+    abortControllerRef.current = ac;
+
     if (!replay) {
       const userMsg: CopilotMessage = {
         id: `u-${Date.now()}`,
@@ -460,45 +471,104 @@ export function CopilotView() {
     setError(null);
     setFailedPrompt(null);
 
+    const assistantMsgId = `a-${Date.now()}`;
+    // Placeholder assistant message for live streaming
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: assistantMsgId,
+        role: 'assistant',
+        content: '',
+        createdAt: new Date().toISOString(),
+      },
+    ]);
+
+    let assistantContent = '';
+    let streamSource = 'llm';
+
     try {
-      const res = await copilotApi.chat({
-        conversationId,
-        message: trimmed,
-        context: { page: 'copilot' },
-      });
-      setConversationId(res.conversationId);
-      // A 200 does not mean a model answered. When no LLM key is configured,
-      // or the call fails, the backend falls back to a canned paragraph and
-      // now says so with `source: "template"`. Without this the analyst reads
-      // generic claims — "this IP was seen in 3 other alerts" — as real
-      // analysis of their own environment, and the honest fallback below never
-      // fires because the request technically succeeded.
-      const source = (res as { source?: string }).source;
-      const notice = (res as { notice?: string }).notice;
-      const reply =
-        source === 'template'
-          ? {
-              ...res.reply,
-              content: [
-                notice ??
-                  'This reply came from a built-in template, not a language model, and is not analysis of your environment.',
-                '',
-                '---',
-                '',
-                res.reply.content,
-              ].join('\n'),
+      const response = await copilotApi.streamChat(
+        {
+          conversationId,
+          message: trimmed,
+          context: { page: 'copilot' },
+        },
+        ac.signal,
+      );
+
+      if (!response.ok || !response.body) {
+        const text = await response.text().catch(() => '');
+        throw new ApiError(`API ${response.status}`, response.status, text);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        let nl = buffer.indexOf('\n');
+        while (nl !== -1) {
+          const line = buffer.slice(0, nl).trim();
+          buffer = buffer.slice(nl + 1);
+          nl = buffer.indexOf('\n');
+          if (!line) continue;
+
+          try {
+            const frame = JSON.parse(line) as {
+              source?: string;
+              delta?: string;
+              done?: boolean;
+              conversationId?: string;
+              messageId?: string;
+              error?: string;
+            };
+
+            if (frame.source) {
+              streamSource = frame.source;
             }
-          : res.reply;
-      setMessages((prev) => [...prev, reply]);
+            if (frame.conversationId) {
+              setConversationId(frame.conversationId);
+            }
+            if (frame.delta) {
+              assistantContent += frame.delta;
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantMsgId ? { ...m, content: assistantContent } : m,
+                ),
+              );
+            }
+          } catch {
+            continue;
+          }
+        }
+      }
+
+      if (streamSource === 'template') {
+        const templateNotice =
+          'This reply came from a built-in template, not a language model, and is not analysis of your environment.';
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantMsgId
+              ? {
+                  ...m,
+                  content: [templateNotice, '', '---', '', assistantContent].join('\n'),
+                }
+              : m,
+          ),
+        );
+      }
       setEverSucceeded(true);
     } catch (err) {
-      // This used to substitute `buildDemoReply(trimmed)` unconditionally, so
-      // a backend outage produced an invented investigation — a named host, a
-      // named user, ATT&CK techniques and three alert "citations" — rendered
-      // in the same style as a real answer. An analyst had no way to tell.
-      //
-      // Outside demo mode the error is now surfaced as an error. The dock
-      // feeling alive is not worth a fabricated verdict.
+      if ((err as Error)?.name === 'AbortError') {
+        return;
+      }
+      if (!assistantContent) {
+        setMessages((prev) => prev.filter((m) => m.id !== assistantMsgId));
+      }
       if (canUseDemoData()) {
         setMessages((prev) => [...prev, buildDemoReply(trimmed)]);
       }

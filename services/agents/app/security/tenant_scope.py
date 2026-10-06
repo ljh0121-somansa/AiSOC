@@ -298,16 +298,22 @@ async def require_console_or_service_auth(
     Order matters only for clarity — the two credential shapes are disjoint. A
     console token carries its own tenant; a service token must declare one.
     """
+    # Dev mode is an explicit opt-out of tenant-scoped auth. Gate ONLY on
+    # _dev_mode(), NOT on whether credentials are configured, so that injecting
+    # SECRET_KEY into the service (parity with api/connectors/etc.) does not
+    # silently turn a previously-serving dev request into a 401 — e.g. an
+    # anonymous console user in a non-demo build with no stored JWT.
+    if _dev_mode():
+        return TenantPrincipal(
+            tenant_ids=frozenset({DEV_TENANT_ID}),
+            subject="dev",
+            delegated=False,
+        )
+
     console_secret = resolve_console_secret()
     service_token = resolve_service_token()
 
     if not console_secret and not service_token:
-        if _dev_mode():
-            return TenantPrincipal(
-                tenant_ids=frozenset({DEV_TENANT_ID}),
-                subject="dev",
-                delegated=False,
-            )
         # No credential material configured at all: refuse to serve rather
         # than serve openly. This is the same fail-closed posture as
         # ``require_service_auth``.

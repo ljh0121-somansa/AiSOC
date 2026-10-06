@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 import structlog
 
-from app.agents.dispositions import BENIGN, BENIGN_TRUE_POSITIVE, FALSE_POSITIVE, NEEDS_REVIEW
+from app.agents.dispositions import AUTO_CLOSEABLE_DISPOSITIONS, BENIGN, BENIGN_TRUE_POSITIVE, FALSE_POSITIVE, NEEDS_REVIEW, normalize_disposition
 from app.confidence import score_investigation
 from app.context.bundle import ContextBundle
 from app.investigator.deep_investigation import run_deep_investigation
@@ -58,6 +58,20 @@ def _bundle_findings(bundle: dict[str, Any] | None) -> list[str]:
         findings.append(f"{len(historical)} similar historical case(s) resolved as: {verdicts}.")
     return findings
 
+MIN_SUCCESS_RATIO = 0.5
+DEGRADED_CONFIDENCE_CAP = 0.5
+
+
+def _is_dismissive_verdict(verdict: str | None) -> bool:
+    """Whether a verdict is dismissive after normalization, in raw or canonical form.
+
+    ``score_investigation`` returns the raw string (``likely_false_positive``)
+    while the dispositions map it to ``false_positive`` later; the guard keys on
+    the canonical value so neither dialect slips past. An unset/blank verdict is
+    treated as dismissive — the safe direction is to escalate, never auto-dismiss.
+    """
+    normalized = normalize_disposition(verdict, default=NEEDS_REVIEW)
+    return normalized in AUTO_CLOSEABLE_DISPOSITIONS
 
 async def run_investigation(state: InvestigationState) -> InvestigationState:
     """
@@ -171,7 +185,24 @@ async def run_investigation(state: InvestigationState) -> InvestigationState:
     if splunk_evidence.applicable and not splunk_evidence.queried and verdict in (FALSE_POSITIVE, BENIGN, BENIGN_TRUE_POSITIVE):
         state.add_finding("Splunk evidence unavailable — cannot confirm a benign/false-positive verdict; escalating to needs_review.")
         verdict = NEEDS_REVIEW
-
+    # #611: never let an investigation that gathered no pivots reach a dismissive
+    # verdict. Only meaningful when the deep loop actually ran; with no LLM
+    # gateway configured it errors out and carries no pivots, so this guard is
+    # inert and the deterministic path stands.
+    depth = getattr(state, "investigation_depth", None) or {}
+    if depth.get("error") is None:
+        ok_n = len(depth.get("pivots", []))
+        bad_n = len(depth.get("unavailable_data", []))
+        total = ok_n + bad_n
+        ratio = (ok_n / total) if total else 0.0
+        if ratio < MIN_SUCCESS_RATIO and _is_dismissive_verdict(verdict):
+            state.add_finding(
+                f"Investigation evidence unavailable: {ok_n} ok, {bad_n} failed "
+                f"(ratio={ratio:.2f} < {MIN_SUCCESS_RATIO}); cannot confirm a "
+                f"benign/false-positive verdict, escalating to needs_review."
+            )
+            verdict = NEEDS_REVIEW
+            confidence = min(confidence, DEGRADED_CONFIDENCE_CAP)
     state.confidence = confidence
     state.confidence_basis = basis
     state.verdict = verdict

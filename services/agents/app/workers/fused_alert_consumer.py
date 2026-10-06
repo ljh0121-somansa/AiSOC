@@ -712,6 +712,7 @@ class FusedAlertTriageWorker:
                 "alert": raw_alert,
                 "severity": normalize_severity(raw_alert.get("severity")),
                 "confidence": conf_val,
+                "tenant_id": str(state.tenant_id or raw_alert.get("tenant_id") or ""),
             }
             matching_playbooks = store.find_matching("alert", ctx)                                         
             engine = PlaybookEngine()                                                                      

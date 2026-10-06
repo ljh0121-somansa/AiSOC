@@ -62,7 +62,7 @@ aiokafka = ">=0.10,<0.15"
 qdrant-client = {extras = ["fastembed"], version = "^1.9.0"}
 markdown = "^3.5"
 # `<70` held this at 69.0, which carries PYSEC-2026-3940 (fixed in 70.0).
-weasyprint = {version = ">=62,<71", optional = true}
+weasyprint = ">=62,<71"          # required: investigate report PDFs render via weasyprint, same as the api service (was optional; `poetry install --only main --no-root` skipped it)
 opentelemetry-sdk = "^1.24.0"
 opentelemetry-instrumentation-fastapi = "^0.45b0"
 opentelemetry-instrumentation-httpx = "^0.45b0"

@@ -27,15 +27,19 @@ in production this stays on by default.
 
 from __future__ import annotations
 
+import json
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
+import structlog
 from typing import Any
 
 from langchain_core.messages import AIMessage
 
 from app.core.cost_telemetry import record_llm_call
 from app.llm.response_cache import ResponseCache
+logger = structlog.get_logger(__name__)
+
 
 # Wave 1 — content-addressed response cache in the LLM hot path. Identical
 # (model + prompt + input) calls are served from cache instead of paid for
@@ -217,10 +221,88 @@ async def safe_chat_completions_request(
     body: dict[str, Any] = {"model": model, "messages": materialised}
     body.update(extra_body)
 
-    url = f"{url}/chat/completions" if url.endswith("/v1") else f"{url}/v1/chat/completions"
+    clean_url = url.rstrip("/")
+    if not clean_url.endswith("/chat/completions"):
+        if clean_url.endswith("/v1"):
+            url = f"{clean_url}/chat/completions"
+        else:
+            url = f"{clean_url}/v1/chat/completions"
+    else:
+        url = clean_url
     logger.info("safe_chat_completions_request debug", url=url, headers={k: (v[:15] + "...") if k == "Authorization" else v for k, v in headers.items()}, body=body)
 
     async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
         resp = await client.post(url, headers=headers, json=body)
         resp.raise_for_status()
         return resp.json()
+
+
+async def safe_chat_completions_stream(
+    *,
+    api_key: str,
+    model: str,
+    messages: Iterable[Any],
+    url: str = DEFAULT_OPENAI_CHAT_COMPLETIONS_URL,
+    timeout: float | None = None,
+    extra_headers: dict[str, str] | None = None,
+    **extra_body: Any,
+) -> AsyncIterator[str]:
+    """Validate ``messages`` against the contract, then stream content deltas.
+
+    Enforces the contract before initiating the network connection.
+    Emits token deltas as they arrive via Server-Sent Events (SSE).
+    """
+    if not api_key:
+        raise ValueError("api_key is required for safe_chat_completions_stream")
+
+    materialised = list(messages)
+    LLMInputContract.validate(materialised)
+
+    try:
+        import httpx
+    except ImportError as exc:
+        raise RuntimeError("httpx is required for safe_chat_completions_stream") from exc
+
+    headers: dict[str, str] = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+
+    body: dict[str, Any] = {"model": model, "messages": materialised, "stream": True}
+    body.update(extra_body)
+
+    clean_url = url.rstrip("/")
+    if not clean_url.endswith("/chat/completions"):
+        if clean_url.endswith("/v1"):
+            url = f"{clean_url}/chat/completions"
+        else:
+            url = f"{clean_url}/v1/chat/completions"
+    else:
+        url = clean_url
+
+    # Connect fast (10s), read stream chunks with generous idle timeout (60s)
+    client_timeout = httpx.Timeout(timeout if timeout is not None else 60.0, connect=10.0)
+
+    async with httpx.AsyncClient(timeout=client_timeout, verify=False) as client:
+        async with client.stream("POST", url, headers=headers, json=body) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line:
+                    continue
+                trimmed = line.strip()
+                if trimmed.startswith("data:"):
+                    raw_data = trimmed[5:].strip()
+                    if raw_data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(raw_data)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = chunk.get("choices") or []
+                    if choices:
+                        delta = choices[0].get("delta") or {}
+                        content = delta.get("content")
+                        if content:
+                            yield content

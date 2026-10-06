@@ -699,7 +699,8 @@ class ContextBundleBuilder:
         entities: list[EntityRef],
     ) -> dict[str, UEBABaseline]:
         """Pull per-entity UEBA baselines from the UEBA service."""
-        ueba_url = os.getenv("AISOC_UEBA_URL", "http://ueba:8086")
+        # UEBA listens internally on 8004 (see compose `ueba` port mapping).
+        ueba_url = os.getenv("AISOC_UEBA_URL", "http://ueba:8004")
         principals = [e for e in entities if e.type in ("user", "email", "host", "ip")]
         if not principals:
             self._record_source("ueba")
@@ -713,10 +714,22 @@ class ContextBundleBuilder:
                 # The UEBA list endpoint takes tenant + entity_type, then we
                 # filter client-side. We accept that this is over-fetching
                 # for now; the bundle is still bounded by ``history_limit``.
+                token = (
+                    os.getenv("AISOC_AGENTS_SERVICE_TOKEN", "").strip()
+                    or os.getenv("AISOC_SERVICE_TOKEN", "").strip()
+                )
+                headers = {"X-AiSOC-Tenant-ID": tenant_id}
+                if token:
+                    # UEBA's require_console_or_service_auth needs the bearer on
+                    # an Authorization header, and the service-token branch
+                    # refuses with 403 unless the tenant is declared on
+                    # X-AiSOC-Tenant-ID as well.
+                    headers["Authorization"] = f"Bearer {token}"
                 try:
                     resp = await client.get(
                         f"{ueba_url}/api/v1/ueba/baselines",
-                        params={"tenant_id": tenant_id, "entity_type": entity.type, "limit": 50},
+                        params={"entity_type": entity.type, "limit": 50},
+                        headers=headers,
                     )
                     resp.raise_for_status()
                     rows = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else []
@@ -770,9 +783,17 @@ class ContextBundleBuilder:
 
         api_url = os.getenv("AISOC_API_URL", "http://api:8000")
         async with httpx.AsyncClient(timeout=self.per_source_timeout) as client:
+            token = (
+                os.getenv("AISOC_AGENTS_SERVICE_TOKEN", "").strip()
+                or os.getenv("AISOC_SERVICE_TOKEN", "").strip()
+            )
+            headers = {"X-Tenant-ID": tenant_id}
+            if token:
+                # api's require_graph_auth compares this against AISOC_AGENTS_SERVICE_TOKEN.
+                headers["X-AiSOC-Service-Token"] = token
             response = await client.get(
                 f"{api_url}/api/v1/graph/incident-context/{alert_id}",
-                headers={"X-Tenant-ID": tenant_id},
+                headers=headers,
             )
             response.raise_for_status()
             payload = response.json()

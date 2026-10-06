@@ -14,6 +14,7 @@ unset so the demo path never breaks.
 
 from __future__ import annotations
 
+import os
 import itertools
 import json
 import uuid
@@ -100,6 +101,30 @@ def _synthetic_reply(user_msg: str) -> str:
 def _title_from_message(msg: str) -> str:
     return msg[:60] + ("…" if len(msg) > 60 else "")
 
+def _build_copilot_messages(
+    conversation: dict[str, Any],
+    user_message: str,
+) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = [
+        {
+            "role": "system",
+            "content": (
+                "You are AiSOC Copilot, an AI assistant for security operations. "
+                "Help analysts investigate alerts, correlate events, and respond to threats. "
+                "Be concise, technical, and actionable. Reference MITRE ATT&CK techniques "
+                "when relevant. Format recommendations as numbered steps when appropriate."
+                "Always respond in Korean, but keep technical terms (e.g., MITRE ATT&CK, "
+                "log names, security tools, commands) in English where natural for SOC analysts."
+            ),
+        }
+    ]
+    raw_history = conversation.get("messages", [])[-10:]
+    for m in raw_history:
+        messages.append({"role": m["role"], "content": m["content"]})
+    if not raw_history or raw_history[-1].get("content") != user_message:
+        messages.append({"role": "user", "content": user_message})
+    return messages
+
 
 async def _get_openai_reply(
     conversation: dict[str, Any],
@@ -116,8 +141,6 @@ async def _get_openai_reply(
     from app.llm.factory import resolve_api_key, resolve_model_alias
 
     model = resolve_model_alias("copilot")
-    # Resolved with the route, not from OPENAI_API_KEY directly: when the call
-    # goes to the bundled gateway the bearer has to be the gateway's master key.
     api_key = resolve_api_key(model) or ""
     if not api_key:
         return "⚠️ [오류] OPENAI_API_KEY가 설정되지 않았습니다.", "template"
@@ -126,28 +149,14 @@ async def _get_openai_reply(
         from app.llm.contract import safe_chat_completions_request
         from app.llm.factory import chat_completions_url
 
-        messages: list[dict[str, str]] = [
-            {
-                "role": "system",
-                "content": (
-                    "You are AiSOC Copilot, an AI assistant for security operations. "
-                    "Help analysts investigate alerts, correlate events, and respond to threats. "
-                    "Be concise, technical, and actionable. Reference MITRE ATT&CK techniques "
-                    "when relevant. Format recommendations as numbered steps when appropriate."
-                    "Always respond in Korean, but keep technical terms (e.g., MITRE ATT&CK, "
-                    "log names, security tools, commands) in English where natural for SOC analysts."
-                ),
-            }
-        ]
-        for m in conversation.get("messages", [])[-10:]:  # last 10 for context
-            messages.append({"role": m["role"], "content": m["content"]})
-        messages.append({"role": "user", "content": user_message})
+        messages = _build_copilot_messages(conversation, user_message)
 
         body = await safe_chat_completions_request(
             api_key=api_key,
             model=model,
             messages=messages,
             url=chat_completions_url(model),
+            timeout=60.0,
             max_tokens=int(os.getenv("AISOC_COPILOT_MAX_TOKENS", "4000")),
         )
         raw_content = body["choices"][0]["message"]["content"]
@@ -156,7 +165,6 @@ async def _get_openai_reply(
     except Exception as exc:
         logger.warning("copilot.openai_error", error=str(exc))
         return f"⚠️ [LLM 호출 실패] {str(exc)}", "template"
-
 
 # ---------------------------------------------------------------------------
 # Endpoints
@@ -245,7 +253,7 @@ async def chat(req: CopilotChatRequest) -> CopilotChatResponse:
 
 @router.post("/chat/stream")
 async def chat_stream(req: CopilotChatRequest) -> StreamingResponse:
-    """Stream a chat reply as NDJSON deltas."""
+    """Stream a chat reply as NDJSON deltas in real-time."""
 
     conv_id = req.conversationId or str(uuid.uuid4())
     now = datetime.now(UTC).isoformat()
@@ -267,40 +275,107 @@ async def chat_stream(req: CopilotChatRequest) -> StreamingResponse:
     }
     conv["messages"].append(user_msg)
 
-    reply_text, reply_source = await _get_openai_reply(conv, req.message)
+    from app.llm.factory import resolve_api_key, resolve_model_alias, chat_completions_url
+
+    model = resolve_model_alias("copilot")
+    api_key = resolve_api_key(model) or ""
     msg_id = str(uuid.uuid4())
 
     async def _stream() -> AsyncIterator[bytes]:
         # Provenance first: a consumer must be able to label the answer before
         # it starts rendering tokens, not after.
-        yield (json.dumps({"source": reply_source, "delta": "", "done": False}) + "\n").encode()
-        words = reply_text.split(" ")
-        for i, word in enumerate(words):
-            chunk = word + (" " if i < len(words) - 1 else "")
-            yield (json.dumps({"delta": chunk, "done": False}) + "\n").encode()
-            # tiny delay to simulate streaming
-            import asyncio
+        if not api_key:
+            yield (json.dumps({"source": "template", "delta": "", "done": False}) + "\n").encode()
+            fallback_text = "⚠️ [오류] OPENAI_API_KEY가 설정되지 않았습니다."
+            yield (json.dumps({"delta": fallback_text, "done": False}) + "\n").encode()
+            assistant_msg: dict[str, Any] = {
+                "id": msg_id,
+                "role": "assistant",
+                "content": fallback_text,
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+            conv["messages"].append(assistant_msg)
+            conv["updatedAt"] = assistant_msg["timestamp"]
+            yield (
+                json.dumps(
+                    {
+                        "done": True,
+                        "conversationId": conv_id,
+                        "messageId": msg_id,
+                    }
+                )
+                + "\n"
+            ).encode()
+            return
 
-            await asyncio.sleep(0.01)
+        yield (json.dumps({"source": "llm", "delta": "", "done": False}) + "\n").encode()
+        accumulated_chunks: list[str] = []
 
-        assistant_msg: dict[str, Any] = {
-            "id": msg_id,
-            "role": "assistant",
-            "content": reply_text,
-            "timestamp": datetime.now(UTC).isoformat(),
-        }
-        conv["messages"].append(assistant_msg)
-        conv["updatedAt"] = assistant_msg["timestamp"]
+        try:
+            from app.llm.contract import safe_chat_completions_stream
 
-        yield (
-            json.dumps(
-                {
-                    "done": True,
-                    "conversationId": conv_id,
-                    "messageId": msg_id,
-                }
-            )
-            + "\n"
-        ).encode()
+            messages = _build_copilot_messages(conv, req.message)
+            url = chat_completions_url(model)
+            max_tokens = int(os.getenv("AISOC_COPILOT_MAX_TOKENS", "4000"))
 
-    return StreamingResponse(_stream(), media_type="application/x-ndjson")
+            async for token in safe_chat_completions_stream(
+                api_key=api_key,
+                model=model,
+                messages=messages,
+                url=url,
+                max_tokens=max_tokens,
+            ):
+                accumulated_chunks.append(token)
+                yield (json.dumps({"delta": token, "done": False}) + "\n").encode()
+
+            full_reply = "".join(accumulated_chunks)
+            clean_reply = full_reply.split("</think>", 1)[-1]
+            assistant_msg: dict[str, Any] = {
+                "id": msg_id,
+                "role": "assistant",
+                "content": clean_reply,
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+            conv["messages"].append(assistant_msg)
+            conv["updatedAt"] = assistant_msg["timestamp"]
+            yield (
+                json.dumps(
+                    {
+                        "done": True,
+                        "conversationId": conv_id,
+                        "messageId": msg_id,
+                    }
+                )
+                + "\n"
+            ).encode()
+        except Exception as exc:
+            err_detail = str(exc) or type(exc).__name__
+            logger.warning("copilot.stream_error", error=err_detail)
+            err_msg = f"⚠️ [LLM 호출 실패] {err_detail}"
+            yield (json.dumps({"delta": f"\n\n{err_msg}", "done": False, "error": err_msg}) + "\n").encode()
+            assistant_msg = {
+                "id": msg_id,
+                "role": "assistant",
+                "content": "".join(accumulated_chunks) + f"\n\n{err_msg}",
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+            conv["messages"].append(assistant_msg)
+            conv["updatedAt"] = assistant_msg["timestamp"]
+            yield (
+                json.dumps(
+                    {
+                        "done": True,
+                        "conversationId": conv_id,
+                        "messageId": msg_id,
+                        "error": err_msg,
+                    }
+                )
+                + "\n"
+            ).encode()
+
+    response_headers = {
+        "X-Accel-Buffering": "no",
+        "Cache-Control": "no-cache, no-transform",
+        "Content-Type": "application/x-ndjson",
+    }
+    return StreamingResponse(_stream(), media_type="application/x-ndjson", headers=response_headers)

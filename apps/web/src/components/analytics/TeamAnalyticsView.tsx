@@ -115,7 +115,7 @@ export function TeamAnalyticsView() {
       }
     });
 
-  if (!demoActive && analystsList.length === 0) {
+  if (!hasData) {
     return (
       <div className="space-y-6">
         <div>
@@ -124,7 +124,7 @@ export function TeamAnalyticsView() {
         </div>
         <div className="rounded-xl border border-gray-800 bg-gray-900/40 p-12">
           <EmptyState
-            icon={EmptyStateIcons.cases}
+            icon={EmptyStateIcons.case}
             title="No Team Analytics Data Yet"
             description="Analyst performance metrics, closed cases, and achievements will appear here as your team handles alerts and cases."
           />

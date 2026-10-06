@@ -356,7 +356,7 @@ async def embed_techniques_into_qdrant(
         return
 
     oai, embed_model = _embedding_client(openai, openai_api_key)
-    qdrant = AsyncQdrantClient(url=qdrant_url)
+    qdrant = AsyncQdrantClient(url=qdrant_url, check_compatibility=False)
     logger.info(
         "ATT&CK embedding target",
         base_url=os.getenv("AISOC_EMBEDDING_BASE_URL", "").strip() or "provider default",
@@ -410,8 +410,14 @@ async def embed_techniques_into_qdrant(
                 total=total,
             )
         except Exception as exc:
-            logger.warning("Batch embedding error", batch_start=i, error=str(exc))
-
+            err_str = str(exc)
+            if "404" in err_str or "Not Found" in err_str:
+                logger.warning(
+                    "ATT&CK Qdrant embedding disabled: embedding endpoint (/v1/embeddings) not supported by the LLM proxy",
+                    error=err_str[:200],
+                )
+                break
+            logger.warning("Batch embedding error", batch_start=i, error=err_str)
     logger.info("ATT&CK embedding complete", total_embedded=embedded)
     await qdrant.close()
 
@@ -434,7 +440,7 @@ async def semantic_technique_search(
         return []
 
     oai, embed_model = _embedding_client(openai, openai_api_key)
-    qdrant = AsyncQdrantClient(url=qdrant_url)
+    qdrant = AsyncQdrantClient(url=qdrant_url, check_compatibility=False)
 
     try:
         emb_resp = await oai.embeddings.create(

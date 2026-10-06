@@ -73,7 +73,10 @@ def service_token_valid(presented: str | None) -> bool:
     Returns False when no token is configured: an unset secret disables the
     service path rather than opening it to everybody.
     """
-    configured = os.getenv(_SERVICE_TOKEN_ENV, "").strip()
+    configured = (
+        os.getenv(_SERVICE_TOKEN_ENV, "").strip()
+        or os.getenv("AISOC_SERVICE_TOKEN", "").strip()
+    )
     if not configured or not presented:
         return False
     return hmac.compare_digest(configured, presented.strip())

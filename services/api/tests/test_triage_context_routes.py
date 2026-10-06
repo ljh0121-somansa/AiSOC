@@ -193,7 +193,7 @@ class TestIdentityContextRoute:
     def _graph(self, monkeypatch):
         rows: list[dict[str, Any]] = []
 
-        async def _fake(tenant_id: str, accounts: list[str], *, limit: int = 5, session: Any = None) -> list[dict[str, Any]]:
+        async def _fake(tenant_id: str, accounts: list[str], *, limit: int = 5, session: Any = None, errors: list[str] | None = None) -> list[dict[str, Any]]:
             return list(rows)
 
         monkeypatch.setenv("AISOC_AGENTS_SERVICE_TOKEN", SERVICE_TOKEN)
@@ -268,3 +268,32 @@ class TestIdentityContextRoute:
         assert len(body["identities"]) == 1
         assert body["excluded_after_cutoff"] == 0
         assert body["without_timestamp"] == 1
+
+    def test_a_graph_failure_populates_context_status_unavailable(self, monkeypatch) -> None:
+        """The single identity query either answers or dies, so a dead query
+        must publish ``unavailable`` rather than an empty identities list,
+        which the agents service would cache as "no directory context"."""
+        from app.services import incident_context as module
+
+        async def _boom(tenant_id: str, accounts: list[str], *, limit: int = 5, session: Any = None, errors: list[str] | None = None) -> list[dict[str, Any]]:
+            if errors is not None:
+                errors.append("connection refused")
+            return []
+
+        monkeypatch.setenv("AISOC_AGENTS_SERVICE_TOKEN", SERVICE_TOKEN)
+        monkeypatch.setattr(module, "get_identity_context_for_accounts", _boom)
+        client = TestClient(_app())
+        body = client.get(_IDENTITY_URL, params={"tenant_id": str(TENANT), "accounts": "a"}, headers=HEADERS).json()
+
+        assert body["identities"] == []
+        assert body["context_status"] == "unavailable"
+
+    def test_an_empty_but_answered_query_reports_ok_not_unavailable(self, _graph) -> None:
+        """A query that ran but found nothing is genuine "no directory
+        context", which the agents service is allowed to cache as such; it is
+        not a gap, so the status is ``ok`` and there is nothing to unpollute."""
+        client = TestClient(_app())
+        body = client.get(_IDENTITY_URL, params={"tenant_id": str(TENANT), "accounts": "a"}, headers=HEADERS).json()
+
+        assert body["identities"] == []
+        assert body["context_status"] == "ok"

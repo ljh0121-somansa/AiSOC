@@ -60,7 +60,10 @@ def writeback_enabled() -> bool:
 
 def _service_token() -> str:
     """Shared secret for the internal route. Empty means "do not call"."""
-    return os.getenv("AISOC_AGENTS_SERVICE_TOKEN", "").strip()
+    return (
+        os.getenv("AISOC_AGENTS_SERVICE_TOKEN", "").strip()
+        or os.getenv("AISOC_SERVICE_TOKEN", "").strip()
+    )
 
 
 async def write_back_disposition(

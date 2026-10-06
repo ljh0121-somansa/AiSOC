@@ -33,6 +33,8 @@ unset, so the demo path never breaks.
 from __future__ import annotations
 
 import json
+import os
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -390,17 +392,34 @@ async def _call_llm(system: str, user: str, model: str) -> tuple[str, int]:
         model_kwargs={"response_format": {"type": "json_object"}},
     )
     response = await safe_ainvoke(llm, [SystemMessage(content=system), HumanMessage(content=user)])
-    text = response.content if isinstance(response.content, str) else str(response.content)
-    try:
-        data = json.loads(text)
-        if isinstance(data, dict) and "response" in data:
-            text = str(data["response"])
-    except Exception:
-        pass
+    raw_text = response.content if isinstance(response.content, str) else str(response.content)
+    text = _extract_response_from_llm_output(raw_text)
     tokens = 0
     if hasattr(response, "response_metadata"):
         tokens = response.response_metadata.get("token_usage", {}).get("total_tokens", 0) or 0
     return text, tokens
+
+def _extract_response_from_llm_output(text: str) -> str:
+    """Extract Markdown response from model output, handling thinking traces and JSON wrappers."""
+    clean = text.strip()
+    if "</think>" in clean:
+        clean = clean.split("</think>", 1)[-1].strip()
+
+    starts = [m.start() for m in re.finditer(r"\{", clean)]
+    for start in reversed(starts):
+        sub = clean[start:]
+        try:
+            decoder = json.JSONDecoder()
+            data, _ = decoder.raw_decode(sub)
+            if isinstance(data, dict) and "response" in data:
+                return str(data["response"]).strip()
+        except Exception:
+            continue
+
+    clean = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", clean).strip()
+    clean = re.sub(r"^```(?:json)?\s*", "", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"\s*```$", "", clean).strip()
+    return clean
 
 
 async def _stream_llm(system: str, user: str, model: str) -> AsyncIterator[str]:
@@ -437,16 +456,7 @@ async def _stream_llm(system: str, user: str, model: str) -> AsyncIterator[str]:
         buffer += text
 
     # Parse complete JSON response and extract markdown from "response" key
-    try:
-        data = json.loads(buffer)
-        if isinstance(data, dict) and "response" in data:
-            final_text = str(data["response"])
-            yield final_text
-            return
-    except Exception:
-        pass
-
-    yield buffer
+    yield _extract_response_from_llm_output(buffer)
 
 def _fallback_response(system: str, user: str) -> str:
     """Deterministic offline response so the contextual UI works without an LLM."""

@@ -35,6 +35,12 @@ import { demoFallback } from '@/lib/demoFallback';
 import { FailureBanner } from '@/components/ui/FailureBanner';
 import { describeApiFailure } from '@/lib/failure';
 
+// Demo-mode sample connector list for the primary /api/v1/connectors query,
+// gated behind demoFallback (returns the value only in the hosted demo,
+// undefined elsewhere). The list is intentionally empty so a self-hosted
+// deployment never renders fabricated connector instances as if real.
+const DEMO_CONNECTORS: Connector[] = [];
+
 export function ConnectorsView() {
   const [modalOpen, setModalOpen] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);

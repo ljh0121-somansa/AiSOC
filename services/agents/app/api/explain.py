@@ -617,11 +617,17 @@ async def _llm_summary(
             model=model,
             messages=messages,
             url=url,
-            timeout=20.0,
-            max_tokens=320,
+            timeout=30.0,
+            max_tokens=max(1500, int(os.getenv("AISOC_MAX_TOKENS", "2048"))),
         )
         raw_content = str(body["choices"][0]["message"]["content"]).strip()
-        clean_content = raw_content.split("</think>", 1)[-1]
+        if "</think>" in raw_content:
+            clean_content = raw_content.split("</think>", 1)[-1].strip()
+        elif "<think>" in raw_content:
+            import re
+            clean_content = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", raw_content).strip()
+        else:
+            clean_content = raw_content
         return clean_content
 
     except LLMContractViolation as exc:

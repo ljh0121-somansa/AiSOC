@@ -21,11 +21,13 @@ activates the RLS policies defined in ``migrations/002_rls.sql``.
         ...
 """
 
+import hmac
+import os
 import uuid
 from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, Request, Security, status
+from fastapi import Depends, Header, HTTPException, Request, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import PyJWTError
 from sqlalchemy import select, text, update
@@ -293,6 +295,50 @@ async def get_current_user(
         role=user.role,
         email=user.email,
     )
+
+
+async def require_graph_auth(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Security(bearer_scheme)],
+    request: Request,
+    x_aisoc_service_token: str | None = Header(default=None, alias="X-AiSOC-Service-Token"),
+    x_aisoc_tenant_id: str | None = Header(default=None, alias="X-AiSOC-Tenant-ID"),
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    db: AsyncSession = Depends(get_db),
+) -> CurrentUser:
+    """Console JWT OR the agents' M2M service token (property-compatible).
+
+    The agents worker talks to the four ``/api/v1/graph/*`` routes with a
+    shared service token, not a browser JWT, so both credential shapes must
+    be accepted here. Console callers are unchanged: when the bearer does not
+    present the service token we delegate to get_current_user exactly as before.
+    """
+    # --- M2M service-token path (agents worker) ---
+    if x_aisoc_service_token:
+        expected = (os.getenv("AISOC_AGENTS_SERVICE_TOKEN") or "").strip()
+        if not expected:
+            expected = (os.getenv("AISOC_SERVICE_TOKEN") or "").strip()
+        if expected and hmac.compare_digest(
+            x_aisoc_service_token.strip(), expected
+        ):
+            raw = (x_aisoc_tenant_id or x_tenant_id or "").strip()
+            try:
+                tenant_id = uuid.UUID(raw)
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="X-AiSOC-Tenant-ID must be a UUID",
+                ) from None
+            return CurrentUser(
+                user_id=uuid.UUID("00000000-0000-0000-0000-000000000002"),
+                tenant_id=tenant_id,
+                role="service:agents",
+                email="service:agents",
+                scopes=None,
+            )
+        # token present but not valid: fall through to console path
+
+    # --- Console JWT path (unchanged) ---
+    return await get_current_user(credentials=credentials, db=db, request=request)
 
 
 async def get_current_active_user(

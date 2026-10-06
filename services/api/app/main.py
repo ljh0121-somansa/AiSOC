@@ -2,7 +2,9 @@
 
 import asyncio
 import hmac
+import os
 import time
+import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
@@ -334,7 +336,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # release_command still yields a populated demo. Plain dev keeps the fast
     # synchronous path (local Postgres, no seed).
     demo_bootstrap_task: asyncio.Task | None = None
-    if settings.AISOC_DEMO_MODE:
+    if settings.AISOC_DEMO_MODE and os.getenv("AISOC_AUTO_SEED", "false").lower() == "true":
         demo_bootstrap_task = asyncio.create_task(_demo_self_heal_bootstrap(), name="demo_bootstrap")
         logger.info("demo self-heal bootstrap scheduled")
     elif settings.is_dev:
@@ -346,6 +348,34 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         except Exception as exc:
             logger.warning("SQL migration run failed", error=str(exc))
 
+    # Seed / sync internal agent API key if configured
+    try:
+        agent_api_key = (os.getenv("AISOC_AGENTS_API_KEY") or "").strip()
+        if agent_api_key.startswith("aisoc_"):
+            import hashlib
+            from app.db.database import AsyncSessionLocal
+            from app.models.tenant import ApiKey
+            from sqlalchemy import select
+            _prefix = agent_api_key[:12]
+            _hashed = hashlib.sha256(agent_api_key.encode()).hexdigest()
+            async with AsyncSessionLocal() as session:
+                res = await session.execute(select(ApiKey).where(ApiKey.name == "aisoc-agents-internal"))
+                existing = res.scalar_one_or_none()
+                if not existing:
+                    key = ApiKey(
+                        id=uuid.UUID("33b90a7e-e5fc-4357-80cf-56cb281f1dde"),
+                        tenant_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+                        name="aisoc-agents-internal",
+                        key_prefix=_prefix,
+                        hashed_key=_hashed,
+                        scopes=["*"],
+                        is_active=True,
+                    )
+                    session.add(key)
+                    await session.commit()
+                    logger.info("Internal agent API key seeded successfully")
+    except Exception as exc:
+        logger.warning("Internal agent API key seeding skipped", error=str(exc))
     # Initialize Neo4j graph layer
     try:
         await init_neo4j()

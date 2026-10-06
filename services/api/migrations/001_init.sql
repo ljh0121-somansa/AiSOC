@@ -215,7 +215,7 @@ INSERT INTO users (id, tenant_id, email, username, hashed_password, role, is_act
 VALUES (
     '00000000-0000-0000-0000-000000000002',
     '00000000-0000-0000-0000-000000000001',
-    'admin@omansa.com',
+    'admin@somansa.com',
     'admin',
     '$2b$12$b4lDfeFRZFPAoW.0ccPl..kxZarIgm4NrwFvXjJS65phRFv46nILK',
     'platform_admin',

@@ -381,7 +381,15 @@ async def agent_alert_investigate(body: AgentAlertInvestigateRequest) -> dict[st
     alert_payload = body.alert or {}
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-    user_input_data = {"alertId": alert_id, "alert": alert_payload}
+    safe_keys = {
+        "title", "name", "severity", "source", "connector_type",
+        "category", "description", "host", "hostname", "user",
+        "user_name", "src_ip", "source_ip", "dest_ip", "destination_ip",
+        "src_port", "dest_port", "process_name", "process", "file_hash",
+        "domain", "url", "tags", "mitre_techniques", "mitre_attack",
+    }
+    safe_alert = {k: v for k, v in alert_payload.items() if k in safe_keys and v not in (None, "", [], {})}
+    user_input_data = {"alertId": alert_id, "alert": safe_alert}
     user_input_str = json.dumps(user_input_data, sort_keys=True, default=str)
 
     # 1. ResponseCache lookup (unless reinvestigate is True)

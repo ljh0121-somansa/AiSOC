@@ -37,7 +37,7 @@ COPY pyproject.toml poetry.lock ./
 # 2026-09-24 the api image shipped FastAPI 0.111.1 and died at import. A build
 # that fails is recoverable; an image that boots on untested versions is not.
 RUN poetry install --no-interaction --no-ansi --only main --no-root
-
+RUN pip install --no-cache-dir --trusted-host pypi.org --trusted-host files.pythonhosted.org weasyprint
 # Smoke-import the modules the orchestrator pulls in at module load time.
 # Catches "image built but broken" cases at build time instead of runtime.
 # Also assert that the langgraph version on disk exposes the ``START``

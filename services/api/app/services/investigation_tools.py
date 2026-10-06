@@ -288,14 +288,14 @@ async def network_connections(
             reason="Supply either hostname or source_ip.",
         )
     hours, limit = _clamp_hours(hours), _clamp_rows(limit)
-    clause = "src_hostname = %(hostname)s" if hostname else "source_ip = %(source_ip)s"
+    clause = "src_hostname = %(hostname)s" if hostname else "toString(source_ip) = %(source_ip)s"
     sql = f"""
         SELECT dest_ip, dst_hostname, dst_port, protocol,
                count() AS connections, max(event_time) AS last_seen
         FROM {LAKE_TABLE}
         WHERE tenant_id = %(tenant_id)s
           AND {clause}
-          AND dest_ip != ''
+          AND toString(dest_ip) != '' AND toString(dest_ip) != '::'
           AND event_time >= now() - INTERVAL %(hours)s HOUR
         GROUP BY dest_ip, dst_hostname, dst_port, protocol
         ORDER BY connections DESC
@@ -334,7 +334,7 @@ async def authentication_events(
         FROM {LAKE_TABLE}
         WHERE tenant_id = %(tenant_id)s
           AND user_name = %(user_name)s
-          AND source_ip != ''
+          AND toString(source_ip) != '' AND toString(source_ip) != '::'
           AND event_time >= now() - INTERVAL %(hours)s HOUR
         ORDER BY event_time DESC
         LIMIT %(limit)s
@@ -371,8 +371,8 @@ async def fleet_ioc_hunt(
         WHERE tenant_id = %(tenant_id)s
           AND event_time >= now() - INTERVAL %(days)s DAY
           AND (
-            source_ip = %(indicator)s
-            OR dest_ip = %(indicator)s
+            toString(source_ip) = %(indicator)s
+            OR toString(dest_ip) = %(indicator)s
             OR dst_hostname = %(indicator)s
             OR hash_sha256 = %(indicator)s
             OR has(iocs, %(indicator)s)

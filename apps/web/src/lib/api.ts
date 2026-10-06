@@ -3435,7 +3435,7 @@ export interface HuntResult {
   timestamp: string;
   source: string;
   severity?: AlertSeverity;
-  raw: Record<string, unknown>;
+  fields: Record<string, unknown>;
   highlight?: string;
 }
 

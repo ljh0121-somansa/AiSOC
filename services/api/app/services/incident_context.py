@@ -360,6 +360,7 @@ async def get_identity_context_for_accounts(
     *,
     limit: int = LIMIT_IDENTITIES,
     session: Any | None = None,
+    errors: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Who is behind these account names, for this tenant. Never raises.
 
@@ -395,9 +396,10 @@ async def get_identity_context_for_accounts(
         async with get_session() as sess:
             return await _run(sess)
     except Exception as exc:  # noqa: BLE001 - identity context is advisory
+        if errors is not None:
+            errors.append(f"graph unavailable ({type(exc).__name__})")
         logger.warning("identity_context.unavailable error=%s", str(exc).replace("\r", "").replace("\n", " ")[:300])
         return []
-
 
 async def get_incident_context(
     alert_id: str,

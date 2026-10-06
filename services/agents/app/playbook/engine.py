@@ -551,9 +551,11 @@ def _make_response_handler(step_type: StepType):
     """
 
     async def _handler(step: PlaybookStep, context: dict[str, Any], http: httpx.AsyncClient) -> dict:
+        alert = context.get("alert") if isinstance(context.get("alert"), dict) else {}
+        tenant_id = str(context.get("tenant_id") or alert.get("tenant_id") or "")
         report = await action_bridge.dispatch_step(
             capability=step_type.value,
-            tenant_id=str(context.get("tenant_id") or ""),
+            tenant_id=tenant_id,
             target=_resolve_target(step, context),
             params=dict(step.params),
             vendor_id=str(step.params.get("vendor") or step.params.get("vendor_id") or ""),
@@ -613,7 +615,7 @@ async def _handle_create_ticket(step: PlaybookStep, context: dict[str, Any], htt
             confidence = confidence / 100.0  # normalize 0..100 to 0.0..1.0
 
         policy = await GuardrailPolicy.load(tenant_id)
-        decision = policy.decide("create_case", confidence)
+        decision = policy.decide("create_case", confidence, severity=sev)
         if decision.decision is not AutonomyDecision.AUTO:
             logger.info(
                 "playbook.create_ticket.gated_by_policy: tenant=%s confidence=%.2f < auto_threshold=%.2f (decision=%s)",
@@ -629,6 +631,15 @@ async def _handle_create_ticket(step: PlaybookStep, context: dict[str, Any], htt
     except Exception as exc:
         logger.warning("playbook.create_ticket.guardrail_check_failed: %s", exc)
 
+    mitre_raw = alert.get("mitre_techniques") or []
+    if isinstance(mitre_raw, str):
+        try:
+            import json as _j
+            mitre_raw = _j.loads(mitre_raw)
+        except Exception:
+            mitre_raw = [mitre_raw] if mitre_raw else []
+    mitre_tech = mitre_raw if isinstance(mitre_raw, list) else []
+
     payload = {                                                                                            
         "tenant_id": tenant_id,                                                                            
         "title": title[:500],                                                                              
@@ -636,14 +647,25 @@ async def _handle_create_ticket(step: PlaybookStep, context: dict[str, Any], htt
         "severity": sev if sev in ("critical", "high", "medium", "low", "info") else "high",               
         "status": "investigating",                                                                         
         "alert_ids": [alert_id] if alert_id else [],                                                       
-        "mitre_techniques": alert.get("mitre_techniques") or [],                                           
+        "mitre_techniques": mitre_tech,                                           
         "tags": ["auto-promoted"],                                                                         
-    }                                                                                                      
-    headers = {"X-Tenant-ID": tenant_id, "Content-Type": "application/json"}                               
+    }
+    headers = {"X-Tenant-ID": tenant_id, "Content-Type": "application/json"}
+    token = (os.getenv("AISOC_AGENTS_SERVICE_TOKEN") or os.getenv("AISOC_SERVICE_TOKEN") or "").strip()
+    if token:
+        headers["X-AiSOC-Service-Token"] = token
     try:                                                                                                   
         resp = await http.post(f"{_API_URL}/api/v1/cases/auto-create", json=payload, headers=headers, timeout=step.timeout_seconds)                                                                                
-        if resp.status_code in (200, 201):                                                                 
-            return resp.json()                                                                             
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            return {
+                "action": "create_ticket",
+                "status": "executed",
+                "executed": True,
+                "case_id": data.get("id"),
+                "case_number": data.get("case_number"),
+                "case": data,
+            }
     except Exception as exc:                                                                               
         logger.warning("playbook.create_ticket.failed: %s", exc)                                           
                                                                                                             
@@ -788,6 +810,7 @@ _HANDLERS = {
     StepType.CLOSE_CASE: _handle_close_case,
     StepType.OSQUERY_LIVE_QUERY: _handle_osquery_live_query,
     **{step_type: _make_response_handler(step_type) for step_type in sorted(RESPONSE_STEP_TYPES, key=lambda s: s.value)},
+    StepType.CREATE_TICKET: _handle_create_ticket,
 }
 
 

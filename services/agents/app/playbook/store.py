@@ -48,9 +48,14 @@ def _resolve_repo_root() -> Path:
         return candidates[4]
     return candidates[-1]
 
-
 _REPO_ROOT = _resolve_repo_root()
-_DEFAULT_PACK_ROOT = _REPO_ROOT / "playbooks" / "packs" / "v1"
+_CANDIDATE_ROOTS = [
+    _REPO_ROOT / "playbooks" / "packs-demo" / "v1",
+    _REPO_ROOT / "playbooks" / "packs" / "packs-demo" / "v1",
+    _REPO_ROOT / "playbooks" / "packs" / "v1",
+    # Repo-local demo playbooks (services/agents/data/playbooks-demo).
+    _REPO_ROOT / "services" / "agents" / "data" / "playbooks-demo",
+]
 
 def normalize_severity(sev: Any) -> str:                                                                   
     """Normalize severity (Enum, int, or string) to standard lowercase string:                             
@@ -83,13 +88,9 @@ class PlaybookStore:
     def __init__(
         self,
         store_dir: Path | None = None,
-        pack_root: Path | None = None,
     ) -> None:
         self._dir = store_dir or Path(os.getenv("PLAYBOOK_STORE_DIR", str(_DEFAULT_STORE_DIR)))
         self._dir.mkdir(parents=True, exist_ok=True)
-        # Optional canonical pack tree (playbooks/packs/v1/<category>/<slug>.playbook.json).
-        # Loaded read-only — mutations always go to self._dir/index.json.
-        self._pack_root = pack_root or Path(os.getenv("PLAYBOOK_PACK_ROOT", str(_DEFAULT_PACK_ROOT)))
         self._manifest_path = self._dir / "index.json"
         self._playbooks: dict[str, Playbook] = {}
         self._load()
@@ -110,32 +111,42 @@ class PlaybookStore:
     # Persistence
     # ------------------------------------------------------------------
 
-    def _load_one(self, fixture: Path) -> None:
+    def _load_one(self, fixture: Path, seen_ids: set[str]) -> None:
         try:
             data = json.loads(fixture.read_text())
             pb = Playbook.model_validate(data)
-            if pb.id not in self._playbooks:
-                self._playbooks[pb.id] = pb
+            if pb.id in seen_ids:
+                return  # first-win dedup across candidate roots
+            self._playbooks[pb.id] = pb
+            seen_ids.add(pb.id)
         except Exception as exc:
             logger.warning("Skipping invalid fixture %s: %s", fixture.name, exc)
 
     def _load(self) -> None:
+        seen_ids: set[str] = set()
+
         # 1) Load individual *.playbook.json fixture files shipped with the runtime dir
         for fixture in sorted(self._dir.glob("*.playbook.json")):
-            self._load_one(fixture)
+            self._load_one(fixture, seen_ids)
 
-        # 2) Load the canonical v1 production pack (playbooks/packs/v1/**/*.playbook.json)
-        #    if present. These ship with the repo and are read-only here.
-        if self._pack_root.exists():
+        # 2) Load demo/production packs. We walk a list of candidate roots in
+        #    order, preferring the repo-local demo playbook tree, then any
+        #    production packs if they ever materialise at playbooks/packs.
+        #    First-Win dedup across roots: once an id is registered it is not
+        #    overwritten by a later root (so a production pack, when present,
+        #    still wins by ordering ahead of the demo tree if it ever ships).
+        for root in _CANDIDATE_ROOTS:
+            if not root.exists():
+                continue
             pack_count_before = len(self._playbooks)
-            for fixture in sorted(self._pack_root.rglob("*.playbook.json")):
-                self._load_one(fixture)
+            for fixture in sorted(root.rglob("*.playbook.json")):
+                self._load_one(fixture, seen_ids)
             pack_count = len(self._playbooks) - pack_count_before
             if pack_count:
                 logger.info(
-                    "Loaded %d playbooks from production pack %s",
+                    "Loaded %d playbooks from %s",
                     pack_count,
-                    self._pack_root,
+                    root,
                 )
 
         # 3) Load/merge from the mutable index.json (user-created / API-created playbooks)

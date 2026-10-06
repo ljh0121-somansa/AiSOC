@@ -257,7 +257,44 @@ class TestIdentityContext:
         monkeypatch.setattr(httpx, "AsyncClient", lambda **_: _Boom())
         assert not await ident.fetch_identity_context("t-1", accounts=["svc_backup"])
 
+    @pytest.mark.asyncio
+    async def test_an_uncacheable_status_is_not_cached_across_calls(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A ``context_status`` that means "the graph did not answer" must be
+        returned live every time rather than cached as "no directory context".
 
+        Two calls in a row: the first publishes an uncacheable status, the
+        second must reach the API again, not return a cached empty lookup.
+        """
+        monkeypatch.setenv("AISOC_AGENTS_SERVICE_TOKEN", "tok")
+        ident.clear_cache()
+
+        calls = {"n": 0}
+
+        class _Resp:
+            status_code = 200
+
+            def json(self) -> Any:
+                return {"tenant_id": "t", "identities": [], "context_status": "degraded"}
+
+        class _Client:
+            async def __aenter__(self) -> "_Client":
+                return self
+
+            async def __aexit__(self, *exc: Any) -> None:
+                return None
+
+            async def get(self, *a: Any, **k: Any) -> Any:
+                calls["n"] += 1
+                return _Resp()
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **_: _Client())
+
+        first = await ident.fetch_identity_context("t-1", accounts=["svc_backup"])
+        second = await ident.fetch_identity_context("t-1", accounts=["svc_backup"])
+
+        assert calls["n"] == 2, "second call should not be served from cache"
+        assert not first
+        assert not second
 # --------------------------------------------------------------------------
 # The prompt the agent actually builds
 # --------------------------------------------------------------------------

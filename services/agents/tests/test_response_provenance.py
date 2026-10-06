@@ -69,3 +69,39 @@ class TestCopilotProvenance:
         msg = copilot_mod.CopilotMessage(id="m1", role="assistant", content="hi", timestamp="2026-01-01T00:00:00Z")
         templated = copilot_mod.CopilotChatResponse(conversationId="c1", reply=msg, source="template", notice="canned")
         assert templated.source == "template"
+
+    @pytest.mark.asyncio
+    async def test_stream_no_api_key_yields_template(self, monkeypatch: pytest.MonkeyPatch):
+        import json
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        resp = await copilot_mod.chat_stream(copilot_mod.CopilotChatRequest(message="hello"))
+        frames = []
+        async for chunk in resp.body_iterator:
+            for line in chunk.decode().splitlines():
+                if line.strip():
+                    frames.append(json.loads(line))
+        assert len(frames) >= 2
+        assert frames[0]["source"] == "template"
+        assert frames[-1]["done"] is True
+
+    @pytest.mark.asyncio
+    async def test_stream_llm_success_yields_deltas(self, monkeypatch: pytest.MonkeyPatch):
+        import json
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+        monkeypatch.setenv("LLM_GATEWAY_URL", "http://litellm:4000")
+        async def _mock_stream(*args, **kwargs):
+            yield "Hello "
+            yield "analyst!"
+
+        monkeypatch.setattr("app.llm.contract.safe_chat_completions_stream", _mock_stream, raising=False)
+        resp = await copilot_mod.chat_stream(copilot_mod.CopilotChatRequest(message="hi"))
+        frames = []
+        async for chunk in resp.body_iterator:
+            for line in chunk.decode().splitlines():
+                if line.strip():
+                    frames.append(json.loads(line))
+        assert frames[0]["source"] == "llm"
+        deltas = [f.get("delta") for f in frames if "delta" in f]
+        assert "Hello " in deltas
+        assert "analyst!" in deltas
+        assert frames[-1]["done"] is True

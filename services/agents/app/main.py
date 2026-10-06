@@ -72,7 +72,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Embed into Qdrant for RAG (only if configured)
     qdrant_url = os.getenv("QDRANT_URL", "")
     openai_key = os.getenv("OPENAI_API_KEY", "")
-    if qdrant_url and openai_key:
+    embedding_enabled = os.getenv("AISOC_ATTACK_EMBEDDING_ENABLED", "false").strip().lower() not in ("0", "false", "no", "off")
+    if qdrant_url and openai_key and embedding_enabled:
         try:
             await embed_techniques_into_qdrant(
                 qdrant_url=qdrant_url,
@@ -197,8 +198,8 @@ instrument_app(app)
 # Unprefixed: Prometheus scrapes /metrics, not /api/v1/metrics, and the
 # scrape config is shared shape across services.
 app.include_router(metrics_router)
-app.include_router(router, prefix="/api/v1")
 app.include_router(investigate_router)  # prefix already set in investigate.py
+app.include_router(router, prefix="/api/v1")
 app.include_router(triage_router)  # prefix: /api/v1  (POST /cases/{id}/triage — router topology, T2.2)
 app.include_router(playbook_router)  # prefix: /api/v1/playbooks
 app.include_router(contextual_router)  # prefix: /api/v1/contextual

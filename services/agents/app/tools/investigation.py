@@ -39,6 +39,13 @@ TOOL_TIMEOUT_SECONDS = 20.0
 def _api_url() -> str:
     return os.getenv("AISOC_API_URL", "http://api:8000").rstrip("/")
 
+def _service_token() -> str:
+    return (
+        os.getenv("AISOC_AGENTS_SERVICE_TOKEN", "").strip()
+        or os.getenv("AISOC_SERVICE_TOKEN", "").strip()
+    )
+
+
 
 async def call_investigation_tool(tool: str, tenant_id: str, **args: Any) -> dict[str, Any]:
     """Run one pivot through the API.
@@ -50,20 +57,42 @@ async def call_investigation_tool(tool: str, tenant_id: str, **args: Any) -> dic
     """
     try:
         async with httpx.AsyncClient(timeout=TOOL_TIMEOUT_SECONDS) as client:
+            headers = {"X-Tenant-ID": tenant_id}
+            token = _service_token()
+            if token:
+                headers["X-AiSOC-Service-Token"] = token
             response = await client.post(
                 f"{_api_url()}/api/v1/graph/investigate/query",
                 json={"tool": tool, "args": args},
-                headers={"X-Tenant-ID": tenant_id},
+                headers=headers,
             )
             response.raise_for_status()
             return response.json()
     except Exception as exc:
-        logger.warning("investigation_tool.failed", tool=tool, error=type(exc).__name__)
+        # 401/403/500 carry an httpx.HTTPStatusError with .status_code / .response
+        # so operators can tell a bad credential apart from an outage. The
+        # response body is logged only at DEBUG: it may mix in tenant data or
+        # query parameters and has no shared redaction util.
+        status_code = getattr(exc, "status_code", None)
+        logger.warning(
+            "investigation_tool.failed",
+            tool=tool,
+            error=type(exc).__name__,
+            status_code=status_code,
+        )
+        response = getattr(exc, "response", None)
+        if response is not None:
+            logger.debug(
+                "investigation_tool.failed.response",
+                tool=tool,
+                status_code=status_code,
+                body=response.text[:200],
+            )
+        # Worded for the model. "No results" and "the lookup failed" must
+        # not read the same, or the second becomes evidence of absence.
         return {
             "tool": tool,
             "available": False,
-            # Worded for the model. "No results" and "the lookup failed" must
-            # not read the same, or the second becomes evidence of absence.
             "reason": (
                 f"Could not reach the investigation service ({type(exc).__name__}). "
                 f"This is a lookup failure, not an absence of evidence — do not "

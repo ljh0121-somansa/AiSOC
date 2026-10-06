@@ -36,6 +36,7 @@ import {
   tenantsApi,
   type AirgapStatus,
   type ApiKeyRecord,
+  type AuthUser,
   type Connector,
   type ConnectorStatus,
   type FullTenant,
@@ -876,6 +877,10 @@ function WorkspacePanel() {
     { revalidateOnFocus: false },
   );
 
+  // FullTenant exposes the profile fields below (plan, status, created_at)
+  // that the lightweight MyTenant variant omits; read through a cast here.
+  const tenantInfo = (tenant as FullTenant | null);
+
   const { data: users, mutate: mutateUsers } = useSWR(
     'settings:tenant:users',
     () => tenantsApi.listUsers().catch(() => []),
@@ -1026,7 +1031,7 @@ function WorkspacePanel() {
     }
   };
 
-  const { data: meUser } = useSWR<AuthUser>(
+  const { data: meUser } = useSWR<AuthUser | null>(
     '/api/v1/auth/me',
     () => request<AuthUser>('/api/v1/auth/me').catch(() => null),
     { revalidateOnFocus: false },
@@ -1156,22 +1161,22 @@ function WorkspacePanel() {
       <div className="grid gap-5 px-6 py-5 sm:grid-cols-2">
         <InfoTile
           label="Tenant ID"
-          value={tenant?.id || '—'}
+          value={tenantInfo?.id || '—'}
           mono
         />
         <InfoTile
           label="Plan"
-          value={tenant?.plan ? tenant.plan.toUpperCase() : 'ENTERPRISE'}
+          value={tenantInfo?.plan ? tenantInfo.plan.toUpperCase() : 'ENTERPRISE'}
         />
         <InfoTile
           label="Status"
-          value={tenant?.is_active !== false ? 'Active' : 'Inactive'}
+          value={tenantInfo?.is_active !== false ? 'Active' : 'Inactive'}
         />
         <InfoTile
           label="Created"
           value={
-            tenant?.created_at
-              ? format(new Date(tenant.created_at), 'PPP')
+            tenantInfo?.created_at
+              ? format(new Date(tenantInfo.created_at), 'PPP')
               : '—'
           }
         />
@@ -3116,7 +3121,7 @@ function AuditPanel() {
       ) : events.length === 0 ? (
         <div className="p-8">
           <EmptyState
-            icon={EmptyStateIcons.history}
+            icon={EmptyStateIcons.audit}
             title="No Audit Events Recorded"
             description="Administrative, authentication, and settings modification audit logs will appear here in real time."
           />

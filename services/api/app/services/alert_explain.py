@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -816,8 +817,8 @@ async def _call_llm_for_summary(
             model=llm_config.model,
             messages=messages,
             url=url,
-            timeout=20.0,
-            max_tokens=360,
+            timeout=30.0,
+            max_tokens=max(1500, int(os.getenv("AISOC_MAX_TOKENS", "2048"))),
         )
     except LLMContractViolation as exc:
         # Reported as its own error string rather than folded into the
@@ -848,8 +849,10 @@ async def _call_llm_for_summary(
         # 🟢 1. Qwen / DeepSeek 모델의 <think>...</think> 추론 태그 정제
         if "</think>" in raw_text:
             cleaned_text = raw_text.split("</think>", 1)[1].strip()
+        elif "<think>" in raw_text:
+            cleaned_text = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", raw_text).strip()
         else:
-            cleaned_text = re.sub(r"<think>[\s\S]*?</think>", "", raw_text).strip()
+            cleaned_text = raw_text.strip()
 
         # 🟢 2. 마크다운 펜스(```json ... ``` 또는 ``` ... ```) 제거
         cleaned_text = re.sub(r"^```(?:json)?\s*", "", cleaned_text, flags=re.IGNORECASE)
@@ -900,10 +903,13 @@ async def _record_llm_cost(
         # operators still see them in the audit trail.
         return
 
-    cost_usd = _impute_public_cost(
-        call.model,
-        call.prompt_tokens,
-        call.completion_tokens,
+    cost_usd = (
+        _impute_public_cost(
+            call.model,
+            call.prompt_tokens,
+            call.completion_tokens,
+        )
+        or 0.0
     )
 
     run_id = f"alert:{alert_id}"

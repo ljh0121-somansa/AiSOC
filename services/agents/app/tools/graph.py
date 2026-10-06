@@ -20,8 +20,31 @@ _API_URL = os.getenv("API_SERVICE_URL", "http://api:8000")
 _TIMEOUT = float(os.getenv("AGENTS_API_TIMEOUT", "10.0"))
 
 
-def _headers(api_token: str | None) -> dict[str, str]:
-    return {"Authorization": f"Bearer {api_token}"} if api_token else {}
+def _service_token() -> str:
+    # Read dynamically (never at import time) so the secret injected after the
+    # process starts is picked up — see the incident fix in docker-compose.yml.
+    return (
+        os.getenv("AISOC_AGENTS_SERVICE_TOKEN", "").strip()
+        or os.getenv("AISOC_SERVICE_TOKEN", "").strip()
+    )
+
+
+def _headers() -> dict[str, str]:
+    tenant_id = os.getenv("AISOC_TENANT_ID", "").strip()
+    if not tenant_id:
+        dev_mode = os.getenv("AISOC_DEV_MODE", "0").strip().lower() in ("1", "true", "yes", "on")
+        if dev_mode:
+            tenant_id = "00000000-0000-0000-0000-000000000001"
+        else:
+            logger.warning("AISOC_TENANT_ID is not set in non-dev mode")
+    headers = {}
+    if tenant_id:
+        headers["X-Tenant-ID"] = tenant_id
+    token = _service_token()
+    if token:
+        # api's require_graph_auth compares this against AISOC_AGENTS_SERVICE_TOKEN.
+        headers["X-AiSOC-Service-Token"] = token
+    return headers
 
 
 async def get_attack_path(
@@ -35,7 +58,7 @@ async def get_attack_path(
             resp = await client.get(
                 f"{_API_URL}/api/v1/graph/attack-path/{case_id}",
                 params={"max_depth": max_depth},
-                headers=_headers(api_token),
+                headers=_headers(),
             )
             resp.raise_for_status()
             return resp.json()
@@ -61,7 +84,7 @@ async def get_blast_radius(
             resp = await client.get(
                 f"{_API_URL}/api/v1/graph/blast-radius/{entity_type}/{entity_id}",
                 params={"hops": hops},
-                headers=_headers(api_token),
+                headers=_headers(),
             )
             resp.raise_for_status()
             return resp.json()
@@ -93,7 +116,7 @@ async def get_entity_neighbors(
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             resp = await client.get(
                 f"{_API_URL}/api/v1/graph/neighbors/{entity_type}/{entity_id}",
-                headers=_headers(api_token),
+                headers=_headers(),
             )
             resp.raise_for_status()
             return resp.json()

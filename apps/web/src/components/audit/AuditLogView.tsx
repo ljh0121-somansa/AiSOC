@@ -5,7 +5,7 @@ import useSWR from 'swr';
 import toast from 'react-hot-toast';
 import { EmptyState, EmptyStateIcons } from '@/components/ui/EmptyState';
 import { ErrorState } from '@/components/ui/ErrorState';
-import { auditApi, ApiError, type AuditExportFilters } from '@/lib/api';
+import { auditApi, ApiError, request, type AuditExportFilters } from '@/lib/api';
 import { demoFallback } from '@/lib/demoFallback';
 
 interface AuditEvent {

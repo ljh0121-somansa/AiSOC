@@ -17,6 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     shared-mime-info \
     && rm -rf /var/lib/apt/lists/*
 
+RUN pip install weasyprint
+
 RUN pip install poetry==2.4.1 && \
     poetry config virtualenvs.create false
 

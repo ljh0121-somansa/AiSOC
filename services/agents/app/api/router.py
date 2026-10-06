@@ -97,6 +97,9 @@ async def get_investigation(run_id: str, principal: ScopedPrincipal):
     """Get the status and results of an investigation run."""
     run = _runs.get(run_id)
     if not run:
+        from app.api.investigate import _load_run
+        run = await _load_run(run_id)
+    if not run:
         raise HTTPException(status_code=404, detail="Investigation run not found")
     return run
 

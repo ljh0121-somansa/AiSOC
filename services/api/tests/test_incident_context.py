@@ -23,13 +23,13 @@ from typing import Any
 import pytest
 from app.services import incident_context as module
 from app.services.incident_context import (
+    DIMENSION_NAMES,
     _DIMENSIONS,
     GLOBAL_LABELS,
     LIMIT_ASSETS,
     IncidentContext,
     get_incident_context,
 )
-
 
 def _bound_variables(cypher: str) -> dict[str, str]:
     """Variables bound by MATCH / OPTIONAL MATCH, mapped to their label."""
@@ -271,3 +271,117 @@ async def test_each_dimension_populates_its_own_slot(dimension: str) -> None:
     ctx = await get_incident_context(ALERT, TENANT, session=session)
     assert getattr(ctx, dimension), f"{dimension} query ran but its slot stayed empty"
     assert ctx.dimensions_resolved == 1
+
+
+class _DriftResult(FakeResult):
+    """A result that returns rows AND whose consume() reports a gql_status,
+    so _has_schema_drift can be exercised end to end."""
+
+    def __init__(self, status: str = "01N42") -> None:
+        super().__init__([])
+        self._gql_status = status
+
+    def _summary(self) -> Any:
+        class _Status:
+            gql_status = self._gql_status
+
+        class _Summary:
+            gql_status_objects = [_Status()]
+            notifications = []
+
+        return _Summary()
+
+    async def consume(self) -> Any:
+        return self._summary()
+
+
+class _RowDriftResult(FakeResult):
+    """A result that returns real rows whose consume() reports a 01N42 gap."""
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        super().__init__(rows)
+
+    async def consume(self) -> Any:
+        class _Status:
+            gql_status = "01N42"
+
+        class _Summary:
+            gql_status_objects = [_Status()]
+            notifications = []
+
+        return _Summary()
+
+
+class TestOccurredOnPipeRemoved:
+    def test_generated_queries_no_longer_reference_INVOLVES_or_variable_length(self) -> None:
+        """A missing OCCURRED_ON edge used to be masked by an INVOLVES union
+        (`[:OCCURRED_ON|INVOLVES*1..2]`); if that shape ever returns to the
+        Cypher it would hide the same production-only vocab gap again."""
+        session = FakeSession()
+        asyncio.run(get_incident_context(ALERT, TENANT, session=session))
+        for cypher, _ in session.queries:
+            assert "INVOLVES" not in cypher, "OCCURRED_ON union was reintroduced"
+            assert "*1..2" not in cypher, "variable-length hop reintroduced"
+
+
+class TestSchemaDrift:
+    async def test_absent_edge_populates_vocabulary_gaps_and_missing_status(self) -> None:
+        """A warning that a relationship type exists in no edge (01N42) must
+        surface as named vocabulary gaps and a ``graph_vocabulary_missing``
+        headline, never as a silent "no context"."""
+
+        class _MissingSession(FakeSession):
+            """Answers empty rows; consume() reports the 01N42 gap."""
+
+            async def run(self, cypher: str, **params: Any) -> FakeResult:
+                self.queries.append((cypher, params))
+                return _RowDriftResult([])
+
+        ctx = await get_incident_context(ALERT, TENANT, session=_MissingSession())
+        assert ctx.vocabulary_gaps == sorted(DIMENSION_NAMES), (
+            "every dimension named the absent edge, so all five are gaps"
+        )
+        assert ctx.context_status == "graph_vocabulary_missing"
+
+    async def test_a_missing_token_that_still_returns_rows_is_not_forced_missing(self) -> None:
+        """01N42 is a WARNING, not an error: a dimension that answered rows
+        counts as success even when it named an absent token, so the status
+        is not forced to ``graph_vocabulary_missing``."""
+
+        class _AnsweredDrift(FakeSession):
+            """Answers real rows for every dimension; consume() reports a gap."""
+
+            def __init__(self) -> None:
+                super().__init__(
+                    {
+                        "identities": [{"account": "svc"}],
+                        "assets": [{"id": "h1"}],
+                        "cloud": [{"account_id": "1"}],
+                        "business": [{"name": "app"}],
+                        "threat": [{"ioc": "1.2.3.4"}],
+                    }
+                )
+
+            async def run(self, cypher: str, **params: Any) -> FakeResult:
+                for token, key in (
+                    ("Employee)-[:AUTHENTICATES_AS]", "identities"),
+                    ("AFFECTED_BY", "assets"),
+                    ("IN_ACCOUNT", "cloud"),
+                    (":RUNS]->(app:Application)", "business"),
+                    ("OBSERVED_IOC", "threat"),
+                ):
+                    if token in cypher:
+                        return _RowDriftResult(self.answers.get(key, []))
+                return _RowDriftResult([])
+
+        ctx = await get_incident_context(ALERT, TENANT, session=_AnsweredDrift())
+        assert ctx.dimensions_resolved == 5
+        assert ctx.context_status != "graph_vocabulary_missing"
+
+
+async def test_vocabulary_gap_is_named_in_the_narrative() -> None:
+    """The agent must not mistake a gap for "nothing to find"."""
+    ctx = IncidentContext(alert_id=ALERT, tenant_id=TENANT)
+    ctx.vocabulary_gaps = ["cloud"]
+    text = "\n".join(ctx.narrative_lines())
+    assert "cloud" in text and "edge" in text.lower()

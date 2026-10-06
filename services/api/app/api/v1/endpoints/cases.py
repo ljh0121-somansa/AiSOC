@@ -42,7 +42,7 @@ from typing import Annotated, Any, Literal
 from urllib.parse import quote
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import HTMLResponse
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
@@ -1098,13 +1098,24 @@ async def update_task(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _agents_service_token() -> str:
+    return (
+        os.getenv("AISOC_AGENTS_SERVICE_TOKEN", "").strip()
+        or os.getenv("AISOC_SERVICE_TOKEN", "").strip()
+    )
+
+
 async def _agents_proxy(method: str, path: str, **kwargs: Any) -> httpx.Response:
     safe_path = _validate_agents_path(path)
     url = f"{_AGENTS_URL}{safe_path}"
     timeout = kwargs.pop("timeout", 30.0)
+    headers = dict(kwargs.pop("headers", None) or {})
+    token = _agents_service_token()
+    if token and "Authorization" not in headers:
+        headers["Authorization"] = f"Bearer {token}"
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            return await client.request(method, url, **kwargs)
+            return await client.request(method, url, headers=headers, **kwargs)
     except httpx.HTTPError as exc:
         logger.exception(
             "agents_proxy.request_failed",
@@ -1482,8 +1493,8 @@ class AutoCreateCaseRequest(BaseModel):
     severity: str = "high"                                                                                 
     status: str = "investigating"                                                                          
     alert_ids: list[str] = []                                                                              
-    mitre_techniques: list[str] = []                                                                       
-    tags: list[str] = [] 
+    mitre_techniques: Any = []                                                                       
+    tags: Any = [] 
 
 @router.post("/auto-create", response_model=CaseResponse, status_code=status.HTTP_201_CREATED, summary="Auto create case for internal agents/playbooks")                                                    
 async def auto_create_case(body: AutoCreateCaseRequest, request: Request, db: DBSession) -> CaseResponse:  
@@ -1513,25 +1524,35 @@ async def auto_create_case(body: AutoCreateCaseRequest, request: Request, db: DB
         while (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")) or (s.startswith('\\"') and s.endswith('\\"')) or (s.startswith('\\') or s.endswith('\\')):
             s = s.strip(' \t\r\n"\'\\')
         return s
+    def _clean_list(val: Any) -> list:
+        if isinstance(val, list):
+            return val
+        if isinstance(val, str) and val.strip():
+            try:
+                parsed = _json.loads(val)
+                return parsed if isinstance(parsed, list) else [val]
+            except Exception:
+                return [val]
+        return []
+
 
     if alert_row:                                                                                          
         tenant_uuid = alert_row.tenant_id                                                                  
         title = _clean_str(alert_row.title)                                                                           
         description = _clean_str(alert_row.description or getattr(alert_row, "narrative", None) or alert_row.title)
         severity = alert_row.severity                                                                      
-        mitre_tech = alert_row.mitre_techniques or body.mitre_techniques or []                             
+        mitre_tech = _clean_list(alert_row.mitre_techniques or body.mitre_techniques)
         alert_ids = [str(alert_row.id)]                                                                    
-        tags = alert_row.tags if getattr(alert_row, "tags", None) else (body.tags or ["auto-created"])
+        tags = _clean_list(getattr(alert_row, "tags", None) or body.tags or ["auto-created"])
 
         # Check if an open case already exists for this alert/tenant
         existing_open_case = (await db.execute(
             text("""
                 SELECT * FROM aisoc_cases
                 WHERE tenant_id = :tenant_id
-                  AND status IN ('open', 'investigating', 'in_progress', 'pending')
-                  AND (:aid = ANY(alert_ids) OR alert_ids ?| :aids)
+                  AND :aid = ANY(alert_ids)
                 ORDER BY created_at DESC LIMIT 1
-            """).bindparams(tenant_id=tenant_uuid, aid=uuid.UUID(alert_ids[0]), aids=alert_ids)
+            """).bindparams(tenant_id=tenant_uuid, aid=uuid.UUID(alert_ids[0]))
         )).fetchone()
         if existing_open_case:
             cid = existing_open_case.id
@@ -1612,9 +1633,9 @@ async def auto_create_case(body: AutoCreateCaseRequest, request: Request, db: DB
         title = body.title                                                                                 
         description = body.description or body.title                                                       
         severity = body.severity                                                                           
-        mitre_tech = body.mitre_techniques or []                                                           
+        mitre_tech = _clean_list(body.mitre_techniques)
         alert_ids = list(map(str, body.alert_ids)) or []                                                   
-        tags = body.tags or ["auto-created"]                                                               
+        tags = _clean_list(body.tags or ["auto-created"])
         observable_graph = {"nodes": [], "edges": []}                                                      
         evidence_chain = []                                                                                
                                                                                                             

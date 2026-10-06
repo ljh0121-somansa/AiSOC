@@ -123,7 +123,7 @@ async def safe_chat_completions_request(
         response.raise_for_status()
         return dict(response.json())
 
-    async with httpx.AsyncClient(timeout=timeout) as owned:
+    async with httpx.AsyncClient(timeout=timeout, verify=False) as owned:
         response = await owned.post(url, headers=headers, json=payload)
         response.raise_for_status()
         return dict(response.json())

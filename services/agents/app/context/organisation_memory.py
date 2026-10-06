@@ -82,7 +82,10 @@ async def fetch_statements(tenant_id: str | None) -> list[dict[str, Any]]:
     if cached is not None and now - cached[0] < _CACHE_TTL_S:
         return cached[1]
 
-    token = os.getenv("AISOC_AGENTS_SERVICE_TOKEN", "").strip()
+    token = (
+        os.getenv("AISOC_AGENTS_SERVICE_TOKEN", "").strip()
+        or os.getenv("AISOC_SERVICE_TOKEN", "").strip()
+    )
     if not token:
         # Loud, like siem_writeback's equivalent: without the shared secret the
         # API refuses the service path, so every triage would silently run

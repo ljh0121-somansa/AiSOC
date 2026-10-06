@@ -25,6 +25,7 @@
     "@aisoc/report-card": "workspace:*",
     "@aisoc/types": "workspace:*",
     "@aisoc/ui": "workspace:*",
+    "@monaco-editor/loader": "^1.5.0",
     "@monaco-editor/react": "^4.6.0",
     "@xyflow/react": "^12.11.2",
     "clsx": "^2.1.0",

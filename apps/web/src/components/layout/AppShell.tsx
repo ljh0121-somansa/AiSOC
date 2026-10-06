@@ -12,6 +12,15 @@ import { DemoAutoLogin } from '@/components/demo/DemoAutoLogin';
 import { ClientOnly } from '@/components/util/ClientOnly';
 import { isDemoMode } from '@/lib/demoMode';
 
+// Single bootstrap: configure @monaco-editor/loader to serve Monaco from the
+// project's bundled same-origin assets (/monaco/vs) before ANY editor mounts.
+// Imported for its side effect only (the loader's config() is a module-persistent
+// singleton); @monaco-editor/react reads this config when it calls loader.init().
+// Applied once in the client layout so /hunt, the detection RuleEditor, and the
+// business-context editor all skip the remote cdn.jsdelivr.net default — which
+// silently breaks in closed/air-gapped/restricted networks (the F12 init error).
+import '@/lib/monaco';
+
 interface AppShellProps {
   children: React.ReactNode;
   /**

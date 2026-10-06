@@ -24,6 +24,13 @@ interface Role {
   permissions: Permission[];
 }
 
+// Demo-mode sample fixtures for the RBAC role/permission queries, gated behind
+// demoFallback (returns the value only in the hosted demo, undefined elsewhere).
+// Empty on purpose: a non-empty fixture would render fabricated roles as if
+// they were the tenant's real access control.
+const MOCK_ROLES: Role[] = [];
+
+const MOCK_PERMISSIONS: Permission[] = [];
 const fetcher = jsonFetcher;
 
 const CATEGORY_COLORS: Record<string, string> = {

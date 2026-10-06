@@ -404,9 +404,33 @@ class GuardrailPolicy:
 
     # -- new three-tier API --------------------------------------------------
 
-    def decide(self, action: str, confidence: float) -> DecisionResult:
+    def decide(self, action: str, confidence: float, severity: str | None = None) -> DecisionResult:
         thresholds = self.thresholds.get(action, _REJECT_DEFAULT)
         decision = thresholds.decide(confidence)
+
+        # create_case gate: an alert auto-creates a case only when its
+        # severity is high/critical AND confidence >= 0.85. Fail closed —
+        # missing/unknown severity or below-threshold confidence holds the
+        # action for analyst review instead of auto-creating a case.
+        if action == "create_case" and not _create_case_severity_ok(severity, confidence):
+            logger.info(
+                "policy.guardrails.decision",
+                action=action,
+                decision=AutonomyDecision.REVIEW.value,
+                confidence=confidence,
+                severity=severity,
+                auto=thresholds.auto,
+                review=thresholds.review,
+                escalation=thresholds.escalation,
+                tenant_id=self.tenant_id,
+            )
+            return DecisionResult(
+                decision=AutonomyDecision.REVIEW,
+                action=action,
+                confidence=confidence,
+                thresholds=thresholds,
+                reason="create_case held: severity not high/critical or confidence below 0.85.",
+            )
         reason = ""
         if decision is AutonomyDecision.REVIEW:
             reason = f"Confidence {confidence:.2f} below auto threshold {thresholds.auto:.2f} for '{action}' — analyst review required."
@@ -437,9 +461,9 @@ class GuardrailPolicy:
 
     # -- backward-compat binary API -----------------------------------------
 
-    def evaluate(self, action: str, confidence: float) -> ActionResult:
+    def evaluate(self, action: str, confidence: float, severity: str | None = None) -> ActionResult:
         """Return a binary :class:`ActionResult` (``allowed`` ⇔ ``AUTO``)."""
-        decision = self.decide(action, confidence)
+        decision = self.decide(action, confidence, severity=severity)
         thresholds = decision.thresholds
         allowed = decision.decision is AutonomyDecision.AUTO
         return ActionResult(
@@ -469,3 +493,16 @@ def default_thresholds() -> dict[str, ActionThresholds]:
 def yaml_thresholds() -> dict[str, ActionThresholds]:
     """Return a copy of the currently-loaded YAML thresholds (loads if needed)."""
     return dict(_load_yaml_overrides())
+
+def _create_case_severity_ok(severity: str | None, confidence: float) -> bool:
+    """Return True when an alert may auto-create a case.
+
+    An alert auto-creates a case only when its severity is ``high`` or
+    ``critical`` AND confidence is at least 0.85. Anything else — missing,
+    unknown, or below-threshold — returns False so the caller holds the
+    action for analyst review (fail-closed).
+    """
+    if confidence < 0.85:
+        return False
+    sev = str(severity or "").strip().lower()
+    return sev in ("critical", "high")

@@ -232,6 +232,9 @@ async def resolve_splunk_credentials(state: InvestigationState) -> SplunkCreds |
         token = str(merged.get("token") or "").strip()
         if not base_url or not token:
             return None
+        if token.startswith("vault:"):
+            logger.warning("splunk_evidence.credentials_encrypted", reason="AISOC_CREDENTIAL_KEY is unset or cannot decrypt token")
+            return None
         return SplunkCreds(
             base_url=base_url,
             token=token,
@@ -281,7 +284,21 @@ async def collect_splunk_evidence(state: InvestigationState) -> SplunkEvidenceRe
     try:
         results = await _make_client(creds).search(spl, earliest=earliest, latest=latest)
     except Exception as exc:  # noqa: BLE001 — treat as missing evidence, escalate safely
-        logger.warning("splunk_evidence.query_failed", error=type(exc).__name__)
+        # 401/403/500 carry an httpx.HTTPStatusError with .status_code so
+        # operators can tell an auth problem apart from an outage.
+        response = getattr(exc, "response", None)
+        status_code = response.status_code if response is not None else getattr(exc, "status_code", None)
+        logger.warning(
+            "splunk_evidence.query_failed",
+            error=type(exc).__name__,
+            status_code=status_code,
+        )
+        if response is not None:
+            logger.debug(
+                "splunk_evidence.query_failed.response",
+                status_code=status_code,
+                body=response.text[:200],
+            )
         state.add_finding(f"Splunk evidence query failed ({type(exc).__name__}) — treating as missing evidence, escalating.")
         return SplunkEvidenceResult(applicable=True, queried=False, error=str(exc), query=spl)
 

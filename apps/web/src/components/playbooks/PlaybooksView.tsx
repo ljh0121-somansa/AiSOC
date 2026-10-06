@@ -391,6 +391,10 @@ function CommunityPlaybookCard({ playbook }: { playbook: CommunityPlaybook }) {
 
 const DEFAULT_PLAYBOOKS: Playbook[] = [];
 
+// Demo-mode sample list for the primary /api/v1/playbooks query, gated behind
+// demoFallback (returns the value only in the hosted demo, undefined elsewhere).
+const MOCK_PLAYBOOKS: Playbook[] = [];
+
 /* ─────────────────────────── Main ─────────────────────────── */
 
 export function PlaybooksView() {

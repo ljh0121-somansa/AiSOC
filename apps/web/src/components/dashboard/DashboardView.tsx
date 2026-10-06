@@ -408,7 +408,7 @@ export function DashboardView() {
     'dashboard-metrics',
     () => metricsApi.getDashboard(),
     {
-      fallbackData: demoFallback(MOCK_METRICS),
+      fallbackData: demoFallback(DEFAULT_METRICS),
       refreshInterval: 60000,
       revalidateOnMount: true,
       revalidateOnFocus: false,
@@ -429,12 +429,12 @@ export function DashboardView() {
         ? String(metricsError)
         : null;
 
-  // `MOCK_METRICS` reaches this component through exactly one door: the
+  // `DEFAULT_METRICS` reaches this component through exactly one door: the
   // `demoFallback` above, which returns `undefined` outside the hosted demo.
   //
   // It used to reach it through a second door as well — a per-section merge
   // that substituted the mock whenever the API omitted a section, plus a
-  // blanket `: MOCK_METRICS` when the call failed. That published a fabricated
+  // blanket `: DEFAULT_METRICS` when the call failed. That published a fabricated
   // connector inventory ("CrowdStrike EDR · 412 events"), a fabricated MITRE
   // tactic ranking, and a fabricated 24h volume curve as tenant state on any
   // self-hosted install whose API was reachable but whose lake was empty.

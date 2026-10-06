@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
-from app.api.v1.deps import CurrentUser, DBSession, get_current_user, require_permission
+from app.api.v1.deps import CurrentUser, DBSession, get_current_user, require_graph_auth, require_permission
 from app.api.v1.endpoints.alert_writeback import service_token_valid
 from app.services import graph_service
 from app.services.context_import import import_context
@@ -733,7 +733,7 @@ async def get_blast_radius(
     entity_type: str,
     entity_id: str,
     hops: Annotated[int, Query(ge=1, le=6)] = 3,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser = Depends(require_graph_auth),
 ) -> BlastRadiusResponse:
     """
     Compute the blast radius starting from a Host, User, or IOC node.
@@ -782,7 +782,10 @@ class IncidentContextResponse(BaseModel):
     dimensions_resolved: int = 0
     partial: bool = False
     errors: list[str] = Field(default_factory=list)
+    context_status: str = "ok"
+    vocabulary_gaps: list[str] = Field(default_factory=list)
     narrative: list[str] = Field(default_factory=list)
+
 
 
 @router.get(
@@ -792,7 +795,7 @@ class IncidentContextResponse(BaseModel):
 )
 async def incident_context(
     alert_id: str,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser = Depends(require_graph_auth),
 ) -> IncidentContextResponse:
     """Resolve one alert into the five dimensions an investigation needs.
 
@@ -851,7 +854,7 @@ async def list_investigation_tools(
 )
 async def run_investigation_tool(
     request: InvestigationToolRequest,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser = Depends(require_graph_auth),
 ) -> dict[str, Any]:
     """Execute one pivot. Tenant comes from the session, never the request."""
     result = await dispatch(request.tool, str(current_user.tenant_id), request.args)
@@ -906,7 +909,7 @@ async def import_graph_context(
 async def get_entity_neighbors(
     entity_type: str,
     entity_id: str,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser = Depends(require_graph_auth),
 ) -> EntityNeighborsResponse:
     """Return all nodes directly connected (depth 1) to the specified entity."""
     try:
@@ -1144,6 +1147,10 @@ class IdentityContextResponse(BaseModel):
     #: docstring: an ``Employee`` node carries when it was imported, never
     #: when the fact it records became true.
     without_timestamp: int
+    #: When the single identity query could not be read at all (the graph was
+    #: unreachable). The agents service keeps this to avoid caching an empty
+    #: result as "no directory context" for a full TTL while the graph is down.
+    context_status: str = "ok"
 
 
 @router.get(
@@ -1192,7 +1199,13 @@ async def identity_context_for_triage(
             detail="this route is reachable only by an AiSOC service holding the shared service token",
         )
 
-    rows = await get_identity_context_for_accounts(str(tenant_id), list(accounts), limit=limit)
+    errors: list[str] = []
+    rows = await get_identity_context_for_accounts(
+        str(tenant_id),
+        list(accounts),
+        limit=limit,
+        errors=errors,
+    )
 
     kept: list[dict[str, Any]] = []
     excluded = 0
@@ -1212,6 +1225,11 @@ async def identity_context_for_triage(
         # docstring: the stamp that exists does not answer the question the
         # cutoff is asking.
         without_timestamp=len(kept),
+        # The single identity query never has a partial result, so it is
+        # either answered (ok) or it died entirely. An empty identities list
+        # from an answered query is genuine "no directory context", not a
+        # gap, and the agents service must not confuse the two when caching.
+        context_status="unavailable" if errors else "ok",
     )
 
 

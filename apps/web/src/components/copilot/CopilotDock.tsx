@@ -17,7 +17,7 @@ import { usePathname } from 'next/navigation';
 import Link from 'next/link';
 import { clsx } from 'clsx';
 import { motion, AnimatePresence } from 'framer-motion';
-import { copilotApi, type CopilotMessage } from '@/lib/api';
+import { copilotApi, type CopilotMessage, ApiError } from '@/lib/api';
 import { canUseDemoData } from '@/lib/demoFallback';
 
 const QUICK_PROMPTS = [
@@ -71,7 +71,13 @@ export function CopilotDock() {
   const [offline, setOffline] = useState(false);
   const pathname = usePathname() ?? '/';
   const scrollerRef = useRef<HTMLDivElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
+  useEffect(() => {
+    return () => {
+      abortControllerRef.current?.abort();
+    };
+  }, []);
   // Hide the dock on the dedicated /copilot page — it would just duplicate UI.
   const onCopilotPage = pathname.startsWith('/copilot');
 
@@ -111,6 +117,10 @@ export function CopilotDock() {
     const trimmed = prompt.trim();
     if (!trimmed || sending) return;
 
+    abortControllerRef.current?.abort();
+    const ac = new AbortController();
+    abortControllerRef.current = ac;
+
     const userMsg: CopilotMessage = {
       id: `u-${Date.now()}`,
       role: 'user',
@@ -121,19 +131,103 @@ export function CopilotDock() {
     setInput('');
     setSending(true);
 
+    const assistantMsgId = `a-${Date.now()}`;
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: assistantMsgId,
+        role: 'assistant',
+        content: '',
+        createdAt: new Date().toISOString(),
+      },
+    ]);
+
+    let assistantContent = '';
+    let streamSource = 'llm';
+
     try {
-      const res = await copilotApi.chat({
-        conversationId,
-        message: trimmed,
-        context: { page: pathname },
-      });
-      setConversationId(res.conversationId);
-      setMessages((prev) => [...prev, res.reply]);
+      const response = await copilotApi.streamChat(
+        {
+          conversationId,
+          message: trimmed,
+          context: { page: pathname },
+        },
+        ac.signal,
+      );
+
+      if (!response.ok || !response.body) {
+        const text = await response.text().catch(() => '');
+        throw new ApiError(`API ${response.status}`, response.status, text);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        let nl = buffer.indexOf('\n');
+        while (nl !== -1) {
+          const line = buffer.slice(0, nl).trim();
+          buffer = buffer.slice(nl + 1);
+          nl = buffer.indexOf('\n');
+          if (!line) continue;
+
+          try {
+            const frame = JSON.parse(line) as {
+              source?: string;
+              delta?: string;
+              done?: boolean;
+              conversationId?: string;
+              messageId?: string;
+              error?: string;
+            };
+
+            if (frame.source) {
+              streamSource = frame.source;
+            }
+            if (frame.conversationId) {
+              setConversationId(frame.conversationId);
+            }
+            if (frame.delta) {
+              assistantContent += frame.delta;
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantMsgId ? { ...m, content: assistantContent } : m,
+                ),
+              );
+            }
+          } catch {
+            continue;
+          }
+        }
+      }
+
+      if (streamSource === 'template') {
+        const templateNotice =
+          'This reply came from a built-in template, not a language model, and is not analysis of your environment.';
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantMsgId
+              ? {
+                  ...m,
+                  content: [templateNotice, '', '---', '', assistantContent].join('\n'),
+                }
+              : m,
+          ),
+        );
+      }
       setOffline(false);
     } catch (err) {
-      // The hosted demo has no LLM behind it and says so in the reply body.
-      // Everywhere else the failure is reported as a failure: an assistant
-      // turn that reads like an answer is worse than no answer.
+      if ((err as Error)?.name === 'AbortError') {
+        return;
+      }
+      if (!assistantContent) {
+        setMessages((prev) => prev.filter((m) => m.id !== assistantMsgId));
+      }
       const sample = canUseDemoData() ? demoReply(trimmed, pathname) : null;
       setMessages((prev) => [...prev, sample ?? unavailableReply(err)]);
       setOffline(true);

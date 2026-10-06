@@ -245,6 +245,8 @@ async def agent_alert_investigate(
                 status_code=resp.status_code, 
                 detail="AI 에이전트 조사 서비스 응답에 실패했습니다."
             )
+    except HTTPException:
+        raise
     except Exception as exc:  # [상황 3] 통신 자체가 실패한 경우 (try 블록 내부에서 예외 발생)
         logger.error("agents.proxy.investigate_error err=%s", exc)
         raise HTTPException(

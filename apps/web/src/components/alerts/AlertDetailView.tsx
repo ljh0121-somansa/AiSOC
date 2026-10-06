@@ -21,6 +21,7 @@ import { clsx } from 'clsx';
 import { ContextualActions } from '@/components/copilot/ContextualActions';
 import { ExplainDrawer } from '@/components/alerts/ExplainDrawer';
 import { CreateCaseModal } from '@/components/alerts/CreateCaseModal';
+import { agentsApi, AgentInvestigation } from '@/lib/api';
 import { demoFallback } from '@/lib/demoFallback';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -107,10 +108,12 @@ function IOCBadge({ type, value, malicious }: { type: string; value: string; mal
 
 function ConfidenceChip({ label, score }: { label: ConfidenceLabel; score?: number }) {
   const cfg = CONFIDENCE_CONFIG[label];
-  const pct =
-    typeof score === 'number'
-      ? Math.max(0, Math.min(100, Math.round(score > 1 ? score : score * 100)))
-      : null;
+  // `score` is already the canonical 0-100 integer (see `normalizeAlert`).
+  // This multiplied it by 100 and printed a real confidence of 21 as "2100%",
+  // which the Investigation Rail was rendering correctly as "21/100" on the
+  // same page. Rendered as `N/100` rather than a percentage because the value
+  // is not a probability that the verdict is correct.
+  const points = typeof score === 'number' ? Math.round(score) : null;
   return (
     <span
       className={clsx(
@@ -369,20 +372,62 @@ function AIInvestigation({ alertId, alert }: { alertId: string; alert?: Alert })
         </div>
       )}
 
-      <button
-        onClick={startInvestigation}
-        disabled={isRunning}
-        className="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium px-6 py-2 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-      >
-        {isRunning ? (
-          <span className="flex items-center gap-2">
-            <span className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-            Starting investigation...
-          </span>
-        ) : (
-          'Start AI investigation'
-        )}
-      </button>
+      {/* Findings */}
+      {investigation.findings && (
+        <div className="bg-gray-950/70 border border-gray-800/80 rounded-xl p-4 text-xs text-gray-200 leading-relaxed whitespace-pre-wrap max-h-96 overflow-y-auto font-sans">
+          {investigation.findings}
+        </div>
+      )}
+
+      {/* Recommendations */}
+      {Array.isArray(investigation.recommendations) && investigation.recommendations.length > 0 && (
+        <div className="space-y-2 bg-gray-900/40 border border-gray-800/60 rounded-xl p-4">
+          <p className="text-xs font-semibold text-gray-300 uppercase tracking-wider">Recommended Actions</p>
+          <div className="space-y-1.5">
+            {investigation.recommendations.map((rec, i) => (
+              <div key={i} className="flex items-start gap-2 text-xs text-gray-300">
+                <span className="text-blue-400 font-bold shrink-0 mt-0.5">→</span>
+                <span>{rec}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Actions */}
+      {Array.isArray(investigation.actions) && investigation.actions.length > 0 && (
+        <div className="space-y-2 bg-gray-900/40 border border-gray-800/60 rounded-xl p-4">
+          <p className="text-xs font-semibold text-gray-300 uppercase tracking-wider">Automated Actions Available</p>
+          <div className="space-y-2">
+            {investigation.actions.map((action, i) => (
+              <div
+                key={i}
+                className="bg-gray-950/70 border border-gray-800/80 rounded-lg p-3 space-y-2"
+              >
+                {/* 상단: 액션 종류 뱃지와 실행 버튼 (양 끝 정렬, 침범 없음) */}
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs bg-blue-500/15 text-blue-300 border border-blue-500/30 px-2 py-0.5 rounded font-mono font-medium">
+                    {action.type}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => toast.success(`Action '${action.type}' queued for execution`)}
+                    className="text-xs bg-blue-600 hover:bg-blue-500 text-white font-medium px-2.5 py-1 rounded transition-colors shrink-0 shadow-sm"
+                  >
+                    Execute
+                  </button>
+                </div>
+
+                {/* 하단: 대상 타겟 전용 행 (가로폭 전체 확보, 긴 IP/호스트도 침범 방지) */}
+                <div className="flex items-center gap-1.5 text-xs text-gray-300 font-mono bg-gray-900/60 px-2 py-1 rounded border border-gray-800/60 min-w-0">
+                  <span className="text-gray-500 shrink-0 select-none">Target:</span>
+                  <span className="truncate select-all text-gray-200">{action.target}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
