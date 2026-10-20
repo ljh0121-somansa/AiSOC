@@ -102,6 +102,7 @@ from app.connectors.wiz import WizConnector
 from app.connectors.zeek_suricata import ZeekSuricataConnector
 from app.connectors.zscaler import ZscalerConnector
 from app.connectors.elastic_search import ElasticSearchConnector
+from app.connectors.edrserver import EdrServerConnector
 
 if TYPE_CHECKING:
     pass
@@ -195,6 +196,7 @@ _CONNECTOR_CLASSES: tuple[type[BaseConnector], ...] = (
     ZeekSuricataConnector,
     ZscalerConnector,
     ElasticSearchConnector,
+    EdrServerConnector,
 )
 
 
@@ -314,5 +316,6 @@ __all__ = [
     "ZscalerConnector",
     "get_connector_class",
     "list_connector_schemas",
-    "ElasticSearchConnector"
+    "ElasticSearchConnector",
+    "EdrServerConnector",
 ]

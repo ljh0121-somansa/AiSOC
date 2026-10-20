@@ -1,0 +1,40 @@
+{
+  "schema_version": "1.0",
+  "profile": "ecs-json-v1",
+  "items": [
+    {
+      "@timestamp": "2026-10-20T01:00:00Z",
+      "ecs": {"version": "9.5.0"},
+      "organization": {"id": "tenant-01"},
+      "event": {
+        "id": "det-001",
+        "kind": "alert",
+        "category": ["malware"],
+        "type": ["info"],
+        "action": "malware-detection",
+        "code": "6701",
+        "created": "2026-10-20T01:00:01Z",
+        "provider": "Somansa",
+        "module": "edr",
+        "dataset": "edr.detection",
+        "severity": 3
+      },
+      "host": {"name": "host-01", "ip": ["10.0.0.1"]},
+      "edr": {
+        "profile_version": "1.0",
+        "source_kind": "dynamic",
+        "action_type": 6701,
+        "severity_level": "low",
+        "exported_at": "2026-10-20T01:00:02Z",
+        "links": {
+          "detail": "/api/v2/ai-soc/detections/dynamic/det-001",
+          "lookup_hint": "hint-001"
+        }
+      }
+    }
+  ],
+  "has_more": false,
+  "next_cursor": null,
+  "warnings": [],
+  "request_id": "req-001"
+}

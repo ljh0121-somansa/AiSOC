@@ -1,0 +1,55 @@
+{
+  "schema_version": "1.0",
+  "profile": "ecs-json-v1",
+  "item": {
+    "@timestamp": "2026-10-20T01:00:00Z",
+    "ecs": {"version": "9.5.0"},
+    "organization": {"id": "tenant-01"},
+    "event": {
+      "id": "det-001",
+      "kind": "alert",
+      "category": ["malware"],
+      "type": ["info"],
+      "action": "malware-detection",
+      "code": "6701",
+      "created": "2026-10-20T01:00:01Z",
+      "provider": "Somansa",
+      "module": "edr",
+      "dataset": "edr.detection",
+      "severity": 3
+    },
+    "host": {"name": "host-01", "ip": ["10.0.0.1"]},
+    "user": {"name": "user01"},
+    "process": {
+      "entity_id": "proc-001",
+      "pid": 1234,
+      "name": "sample.exe",
+      "executable": "C:\\sample.exe",
+      "command_line": "<redacted>"
+    },
+    "file": {
+      "name": "sample.exe",
+      "hash": {"sha256": "abcdef1234567890"}
+    },
+    "rule": {
+      "name": "Malware detected",
+      "category": "malware"
+    },
+    "behavior": {
+      "tags": ["T1059", "TA0002"]
+    },
+    "edr": {
+      "profile_version": "1.0",
+      "source_kind": "dynamic",
+      "action_type": 6701,
+      "severity_level": "low",
+      "exported_at": "2026-10-20T01:00:02Z",
+      "links": {
+        "detail": "/api/v2/ai-soc/detections/dynamic/det-001",
+        "lookup_hint": "hint-001"
+      }
+    }
+  },
+  "warnings": [],
+  "request_id": "req-002"
+}
