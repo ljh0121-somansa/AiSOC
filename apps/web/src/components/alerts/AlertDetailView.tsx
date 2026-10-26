@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useMemo, useRef, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import useSWR from 'swr';
 import Link from 'next/link';
@@ -32,6 +32,23 @@ import {
   type FactorExplanation,
 } from '@/components/alerts/confidenceHelp';
 import { ContextualActions } from '@/components/copilot/ContextualActions';
+import { buildAlertView } from '@/lib/alertView';
+import { TACTIC_BY_ID, tacticsFor } from '@/lib/mitreTactics';
+import {
+  SummarySection,
+  JudgmentMetaSection,
+  ImpactedAssetSection,
+  DetectionBasisSection,
+  ContextSummarySection,
+  RelatedSignalsBadge,
+  RecommendedActionsSection,
+  RawDataSection,
+  type JudgmentMetaInfo,
+  type ImpactedAssetInfo,
+  type DetectionBasisInfo,
+  type IocGroupInfo,
+  type RecommendedActionItem,
+} from '@/components/alerts/AlertTemplateSections';
 import { ExplainDrawer } from '@/components/alerts/ExplainDrawer';
 import { CreateCaseModal } from '@/components/alerts/CreateCaseModal';
 import { agentsApi, AgentInvestigation } from '@/lib/api';
@@ -157,18 +174,214 @@ function signedContribution(contribution: number): string {
   return `${sign}${Math.abs(contribution).toFixed(2)}`;
 }
 
+function useTooltipState() {
+  const [isHovered, setIsHovered] = useState(false);
+  const [isPinned, setIsPinned] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!isPinned) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setIsPinned(false);
+        setIsHovered(false);
+      }
+    };
+    const handleClickOutside = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        setIsPinned(false);
+        setIsHovered(false);
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [isPinned]);
+
+  return {
+    isOpen: isHovered || isPinned,
+    isPinned,
+    containerRef: ref,
+    open: () => setIsHovered(true),
+    close: () => {
+      setIsHovered(false);
+      setIsPinned(false);
+    },
+    hoverStart: () => setIsHovered(true),
+    hoverEnd: () => setIsHovered(false),
+    togglePin: () => setIsPinned((p) => !p),
+  };
+}
+
+function ConfidenceFactorTooltip({
+  factor,
+  explanation,
+  onClose,
+}: {
+  factor: ConfidenceFactor;
+  explanation: FactorExplanation;
+  onClose?: () => void;
+}) {
+  const { meta, isPenalty, impact, reason, observedText, contributionText } = explanation;
+
+  return (
+    <div
+      role="tooltip"
+      onMouseEnter={(e) => e.stopPropagation()}
+      className="absolute right-0 bottom-full mb-2 z-50 w-80 sm:w-96 max-h-[85vh] overflow-y-auto max-w-[calc(100vw-2rem)] rounded-lg border border-gray-700 bg-gray-900/98 p-3.5 text-xs text-gray-200 shadow-2xl backdrop-blur-md pointer-events-auto"
+    >
+      <div className="flex items-start justify-between gap-2 pb-2 border-b border-gray-800">
+        <div>
+          <div className="font-semibold text-gray-100 flex items-center gap-1.5">
+            <span>{meta.label}</span>
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 font-mono">
+              Weight {(meta.weight * 100).toFixed(0)}%
+            </span>
+          </div>
+          <p className="text-[11px] text-gray-400 mt-0.5 leading-snug">{meta.description}</p>
+        </div>
+        {onClose && (
+          <button
+            type="button"
+            onClick={onClose}
+            className="p-1 rounded text-gray-400 hover:text-gray-200 hover:bg-gray-800 transition-colors"
+            aria-label="Close tooltip"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        )}
+      </div>
+
+      <div className="py-2.5 space-y-2">
+        <div
+          className={clsx(
+            'p-2.5 rounded-md border text-[11px] leading-relaxed',
+            isPenalty
+              ? 'bg-rose-950/40 border-rose-800/60 text-rose-200'
+              : impact === 'boost'
+              ? 'bg-emerald-950/40 border-emerald-800/60 text-emerald-200'
+              : 'bg-gray-800/60 border-gray-700 text-gray-300'
+          )}
+        >
+          <div className="flex items-center gap-1.5 font-medium mb-1">
+            {isPenalty ? (
+              <>
+                <TrendingDown className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                <span className="text-rose-400 font-semibold">Negative Contribution ({contributionText})</span>
+              </>
+            ) : impact === 'boost' ? (
+              <>
+                <TrendingUp className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                <span className="text-emerald-400 font-semibold">Positive Boost ({contributionText})</span>
+              </>
+            ) : (
+              <>
+                <Minus className="w-3.5 h-3.5 text-gray-400 shrink-0" />
+                <span className="text-gray-300 font-semibold">Neutral Baseline (0.00)</span>
+              </>
+            )}
+          </div>
+          <p>{reason}</p>
+        </div>
+
+        <div className="flex items-center justify-between py-1 px-2 rounded bg-gray-800/50 border border-gray-800 text-[11px]">
+          <span className="text-gray-400">Observed condition:</span>
+          <span className="font-mono text-gray-200 font-medium">{observedText}</span>
+        </div>
+
+        <div className="pt-1">
+          <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1.5">
+            Scoring Condition Matrix
+          </div>
+          <div className="rounded border border-gray-800 divide-y divide-gray-800/80 overflow-hidden text-[10px]">
+            {meta.rules.map((rule, idx) => (
+              <div
+                key={idx}
+                className={clsx(
+                  'px-2 py-1.5 flex items-center justify-between gap-2',
+                  rule.effect === 'penalty'
+                    ? 'hover:bg-rose-950/20'
+                    : rule.effect === 'boost'
+                    ? 'hover:bg-emerald-950/20'
+                    : 'hover:bg-gray-800/40'
+                )}
+              >
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <span
+                    className={clsx(
+                      'w-1.5 h-1.5 rounded-full shrink-0',
+                      rule.effect === 'penalty'
+                        ? 'bg-rose-400'
+                        : rule.effect === 'boost'
+                        ? 'bg-emerald-400'
+                        : 'bg-gray-500'
+                    )}
+                  />
+                  <span className="text-gray-300 truncate">{rule.condition}</span>
+                </div>
+                <div className="flex items-center gap-2 shrink-0 font-mono">
+                  <span
+                    className={clsx(
+                      'font-medium',
+                      rule.effect === 'penalty'
+                        ? 'text-rose-400'
+                        : rule.effect === 'boost'
+                        ? 'text-emerald-400'
+                        : 'text-gray-400'
+                    )}
+                  >
+                    {rule.contribution}
+                  </span>
+                  {rule.note && <span className="text-[9px] text-gray-500 font-sans hidden sm:inline">({rule.note})</span>}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ConfidenceFactorBar({ factor }: { factor: ConfidenceFactor }) {
-  // A factor can push the score down as well as up. The magnitude drives the
-  // bar width and the sign drives its colour, so a negative factor reads as
-  // "this argued against the verdict" rather than as an empty bar: clamping
-  // the signed ratio to [0, 1] rendered every negative factor at zero width.
+  const {
+    isOpen: showHelp,
+    containerRef,
+    hoverStart,
+    hoverEnd,
+    togglePin,
+    close,
+  } = useTooltipState();
+  const explanation = explainFactor(factor);
+  const isPenalty = explanation.isPenalty;
+  const isBoost = explanation.impact === 'boost';
+
   const magnitude = Math.min(1, Math.abs(factor.contribution) / Math.max(factor.weight, 0.001));
   const widthPct = Math.round(magnitude * 100);
   const negative = factor.contribution < 0;
   return (
-    <div>
+    <div ref={containerRef} className="relative">
       <div className="flex items-baseline justify-between gap-3 mb-1">
-        <span className="text-sm text-gray-200">{factor.label}</span>
+        <div className="flex items-center gap-1.5 min-w-0">
+          <span className="text-sm text-gray-200 truncate">{factor.label}</span>
+          <button
+            type="button"
+            aria-label={`Show scoring rules and conditions for ${factor.label}`}
+            aria-expanded={showHelp}
+            onClick={togglePin}
+            onMouseEnter={hoverStart}
+            onMouseLeave={hoverEnd}
+            onFocus={hoverStart}
+            onBlur={hoverEnd}
+            className="p-0.5 rounded text-gray-400 hover:text-gray-200 hover:bg-gray-800 transition-colors focus:outline-none focus:ring-1 focus:ring-blue-500 shrink-0"
+            title={`${explanation.meta.label}: ${explanation.observedText} (${explanation.contributionText} contribution)`}
+          >
+            <Info className="w-3.5 h-3.5" />
+          </button>
+        </div>
         <span className="text-xs font-mono text-gray-500 shrink-0">
           {`${signedContribution(factor.contribution)} / ${factor.weight.toFixed(2)}`}
         </span>
@@ -903,6 +1116,7 @@ export function AlertDetailView({ alertId }: { alertId: string }) {
     () => alertsApi.get(alertId),
     { fallbackData: undefined }
   );
+  const viewModel = useMemo(() => buildAlertView(alert as Alert), [alert]);
 
   const handleStatusChange = async (newStatus: Alert['status']) => {
     setStatus(newStatus);
@@ -951,6 +1165,7 @@ export function AlertDetailView({ alertId }: { alertId: string }) {
                 score={alert.confidenceScore}
               />
             )}
+            <RelatedSignalsBadge />
             <span className="text-xs text-gray-500">Risk Score: <span className="text-white font-bold">{alert.riskScore}</span></span>
           </div>
           <h1 className="text-lg font-semibold text-gray-100">{alert.title}</h1>
@@ -1052,9 +1267,15 @@ export function AlertDetailView({ alertId }: { alertId: string }) {
               eyebrow="Ask AiSOC about this alert"
             />
 
-            <Section title="Description">
-              <p className="text-sm text-gray-300 leading-relaxed break-words whitespace-pre-wrap overflow-x-auto">{alert.description}</p>
-            </Section>
+            <div className="space-y-4">
+              <SummarySection alert={alert} summary={viewModel.summary} />
+              <JudgmentMetaSection alert={alert} meta={viewModel.judgmentMeta as unknown as JudgmentMetaInfo} />
+              <ImpactedAssetSection alert={alert} asset={viewModel.impactedAsset as unknown as ImpactedAssetInfo} />
+              <DetectionBasisSection alert={alert} basis={viewModel.detectionBasis as unknown as DetectionBasisInfo} alertId={alert.id} parentProcess={viewModel.parentProcess} />
+              <ContextSummarySection alert={alert} contextGroup={viewModel.iocGroup as unknown as IocGroupInfo} iocs={alert.iocs} />
+              <RecommendedActionsSection alert={alert} actions={viewModel.recommendedActions as unknown as RecommendedActionItem[] | null} />
+              <RawDataSection alert={alert} rawEvent={alert.rawEvent} description={alert.description} />
+            </div>
 
             {alert.confidenceLabel && (
               <ConfidenceExplainability
