@@ -267,12 +267,6 @@ class EvidenceRef:
     observed: bool
 
 
-def _completed_non_detail_count(stage_results: list[StageResult]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for r in stage_results:
-        if r.stage in core_stages_for(r.source_kind) and r.outcome == "completed" and r.stage != "detail":
-            counts[r.alert_external_id] = counts.get(r.alert_external_id, 0) + 1
-    return counts
 
 
 def _all_core_completed(stage_results: list[StageResult]) -> bool:
