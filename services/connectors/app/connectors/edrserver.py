@@ -650,3 +650,111 @@ class EdrServerConnector(BaseConnector):
                 raise RuntimeError("EdrServer polling deadline reached before completing any chunk")
 
         return all_alerts
+
+    # --- Case-investigation methods (plan U2, spec §5 stages 2-5, §7) ---
+    # Distinct names: the polling path (fetch_alerts / _enrich / _list_chunk)
+    # and its callers are untouched.
+
+    async def _edr_get(self, client: httpx.AsyncClient, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """One GET with error-body parsing: 429/503 get a Retry-After backoff
+        (up to 3 attempts); any other error status is raised as EdrApiError
+        with the parsed error.code so callers can apply the §5 "unavailable"
+        strict rule (404 alone is NOT unavailable)."""
+        url = f"{self._base_url}/api/v2/ai-soc{path}"
+        for attempt in range(3):
+            resp = await client.get(url, params=params, headers=self._headers())
+            if resp.status_code == 200:
+                return resp.json()
+            if resp.status_code in (429, 503):
+                if attempt == 2:
+                    raise parse_edr_error_body(resp.text, resp.status_code, resp.headers.get("Retry-After"))
+                retry_after = resp.headers.get("Retry-After")
+                delay = min(float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else 2 ** attempt, 10)
+                await asyncio.sleep(delay)
+                continue
+            raise parse_edr_error_body(resp.text, resp.status_code, resp.headers.get("Retry-After"))
+        raise RuntimeError("EDR GET retry budget exhausted")
+
+    async def fetch_detection_detail(
+        self, source_kind: str, event_id: str, lookup_hint: str | None = None
+    ) -> dict[str, Any]:
+        """GET /detections/{source_kind}/{event_id} (spec §5 stage 2).
+
+        A 404 body is parsed: error.code = not_found -> incomplete;
+        feature_disabled -> unavailable. No call is skipped here (detail has
+        no source_kind pre-decision), so the error code decides.
+        """
+        params: dict[str, Any] = {}
+        if lookup_hint is not None:
+            params["lookup_hint"] = lookup_hint
+        async with httpx.AsyncClient(timeout=10.0, verify=self._ssl_verify()) as client:
+            return await self._edr_get(client, f"/detections/{source_kind}/{event_id}", params or None)
+
+    async def fetch_case_timeline(
+        self,
+        source_kind: str,
+        event_id: str,
+        *,
+        before: str = "PT10M",
+        after: str = "PT5M",
+        categories: list[str] | None = None,
+        action_types: list[int] | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """GET /investigations/{source_kind}/{event_id}/timeline (spec §5 stage 3).
+
+        static source_kind does not support timelines: skip the call and
+        report unavailable without touching the API (spec §5 "unavailable"
+        pre-decision rule).
+        """
+        if source_kind == "static":
+            return {"status": "unavailable", "reason_code": "timeline_unavailable(static)"}
+        params: dict[str, Any] = {"before": before, "after": after, "limit": limit}
+        if categories:
+            params["categories"] = ",".join(categories)
+        if action_types:
+            params["action_types"] = ",".join(str(a) for a in action_types)
+        async with httpx.AsyncClient(timeout=10.0, verify=self._ssl_verify()) as client:
+            return await self._edr_get(client, f"/investigations/{source_kind}/{event_id}/timeline", params)
+
+    async def fetch_case_graph(
+        self,
+        source_kind: str,
+        event_id: str,
+        *,
+        before: str = "PT10M",
+        after: str = "PT5M",
+        ancestor_depth: int = 2,
+        descendant_depth: int = 1,
+        max_nodes: int = 200,
+    ) -> dict[str, Any]:
+        """GET /investigations/{source_kind}/{event_id}/graph (spec §5 stage 4).
+
+        static: skip and report unavailable. If the first response is
+        truncated, retry once with max_nodes raised to 500 (spec "graph
+        truncated retry"); still truncated -> caller records
+        incomplete(graph_truncated).
+        """
+        if source_kind == "static":
+            return {"status": "unavailable", "reason_code": "graph_unavailable(static)"}
+        params: dict[str, Any] = {
+            "before": before,
+            "after": after,
+            "ancestor_depth": ancestor_depth,
+            "descendant_depth": descendant_depth,
+            "max_nodes": max_nodes,
+        }
+        async with httpx.AsyncClient(timeout=10.0, verify=self._ssl_verify()) as client:
+            data = await self._edr_get(client, f"/investigations/{source_kind}/{event_id}/graph", params)
+            if data.get("truncated"):
+                params["max_nodes"] = 500
+                data = await self._edr_get(client, f"/investigations/{source_kind}/{event_id}/graph", params)
+            return data
+
+    async def host_inventory_by_agent(self, agent_id: str) -> dict[str, Any]:
+        """GET /hosts/{agent_id} (spec §5 stage 5): latest inventory with
+        observed_at so callers can distinguish incident-time facts from the
+        current snapshot (AGENTS.md §9)."""
+        async with httpx.AsyncClient(timeout=10.0, verify=self._ssl_verify()) as client:
+            return await self._edr_get(client, f"/hosts/{agent_id}")
+

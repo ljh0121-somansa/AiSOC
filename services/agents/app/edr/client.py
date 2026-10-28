@@ -135,6 +135,7 @@ class EdrClient:
         headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         url = f"{self.base_url}/api/v2/ai-soc{path}" if not path.startswith("/api/v2/ai-soc") else f"{self.base_url}{path}"
+
         req_headers = self._default_headers()
         if headers:
             req_headers.update(headers)
@@ -175,7 +176,7 @@ class EdrClient:
                     continue
 
                 if resp.is_error:
-                    raise EdrClientError(f"EDR request failed ({resp.status_code}): {resp.text}")
+                    raise parse_edr_error_body(resp.text, resp.status_code, resp.headers.get("Retry-After"))
 
                 return resp.json()
 
@@ -260,3 +261,90 @@ class EdrClient:
             json_data=body,
             headers=headers,
         )
+
+    # --- Case-investigation methods (plan U2, spec §5 stages 0-5, §7) ---
+    # Distinct names; existing fetch_timeline / search_events / host_inventory
+    # and their callers are untouched. get_capabilities is reused as-is.
+
+    async def fetch_detection_detail(
+        self, source_kind: str, event_id: str, lookup_hint: str | None = None
+    ) -> dict[str, Any]:
+        """GET /detections/{source_kind}/{event_id} (spec §5 stage 2).
+
+        Error bodies are parsed into EdrApiError so callers can distinguish
+        error.code = not_found (incomplete) vs feature_disabled (unavailable).
+        """
+        params: dict[str, Any] = {}
+        if lookup_hint is not None:
+            params["lookup_hint"] = lookup_hint
+
+        return await self._request("GET", f"/detections/{source_kind}/{event_id}", params=params or None)
+
+    async def fetch_case_timeline(
+        self,
+        source_kind: str,
+        event_id: str,
+        *,
+        before: str = "PT10M",
+        after: str = "PT5M",
+        categories: list[str] | None = None,
+        action_types: list[int] | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """GET /investigations/{source_kind}/{event_id}/timeline (spec §5 stage 3).
+
+        static source_kind is not supported: skip the call and report
+        unavailable (spec §5 "unavailable" strict rule — pre-decision, no HTTP
+        call is made, so no error code is needed).
+        """
+        if source_kind == "static":
+            return {"status": "unavailable", "reason_code": "timeline_unavailable(static)"}
+
+        params: dict[str, Any] = {"before": before, "after": after, "limit": limit}
+        if categories:
+            params["categories"] = ",".join(categories)
+        if action_types:
+            params["action_types"] = ",".join(str(a) for a in action_types)
+
+        return await self._request(
+            "GET", f"/investigations/{source_kind}/{event_id}/timeline", params=params
+        )
+
+    async def fetch_case_graph(
+        self,
+        source_kind: str,
+        event_id: str,
+        *,
+        before: str = "PT10M",
+        after: str = "PT5M",
+        ancestor_depth: int = 2,
+        descendant_depth: int = 1,
+        max_nodes: int = 200,
+    ) -> dict[str, Any]:
+        """GET /investigations/{source_kind}/{event_id}/graph (spec §5 stage 4).
+
+        static: skip and report unavailable. When the response is truncated,
+        retry once with max_nodes raised to 500 (spec "graph truncated retry");
+        if still truncated the caller records incomplete(graph_truncated).
+        """
+        if source_kind == "static":
+            return {"status": "unavailable", "reason_code": "graph_unavailable(static)"}
+
+        params: dict[str, Any] = {
+            "before": before,
+            "after": after,
+            "ancestor_depth": ancestor_depth,
+            "descendant_depth": descendant_depth,
+            "max_nodes": max_nodes,
+        }
+        path = f"/investigations/{source_kind}/{event_id}/graph"
+        data = await self._request("GET", path, params=params)
+        if data.get("truncated"):
+            params["max_nodes"] = 500
+            data = await self._request("GET", path, params=params)
+
+        return data
+
+    async def host_inventory_by_agent(self, agent_id: str) -> dict[str, Any]:
+        """GET /hosts/{agent_id} (spec §5 stage 5)."""
+        return await self._request("GET", f"/hosts/{agent_id}")
