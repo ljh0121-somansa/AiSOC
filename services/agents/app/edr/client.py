@@ -348,3 +348,89 @@ class EdrClient:
     async def host_inventory_by_agent(self, agent_id: str) -> dict[str, Any]:
         """GET /hosts/{agent_id} (spec §5 stage 5)."""
         return await self._request("GET", f"/hosts/{agent_id}")
+
+    async def hunt(
+        self,
+        from_ts: str,
+        to_ts: str,
+        observables: list[dict[str, str]],
+        sources: list[str] | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """POST /hunt (spec §5 stage 6): do the same hash/IP/URL
+        re-appear on other hosts/users? Exact-match observables only;
+        chunking (20 per call, max 3 calls/case) is the caller's job (U8)."""
+        body: dict[str, Any] = {"from": from_ts, "to": to_ts, "observables": observables, "limit": limit}
+        if sources:
+            body["sources"] = sources
+        return await self._request("POST", "/hunt", json_data=body)
+
+    async def search_case_events(
+        self,
+        from_ts: str,
+        to_ts: str,
+        *,
+        categories: list[str] | None = None,
+        action_types: list[int] | None = None,
+        observables: list[dict[str, str]] | None = None,
+        file_paths: list[str] | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """POST /events/search (spec §5 stage 9, case-investigation variant).
+        Distinct from the legacy GET ``search_events`` (single ``query`` param),
+        which is left untouched. Filtered values <= 100, page <= 500 are
+        enforced by the caller (U8); unfiltered broad searches stay <= 60 min."""
+        body: dict[str, Any] = {"from": from_ts, "to": to_ts, "limit": limit}
+        if categories:
+            body["categories"] = categories
+        if action_types:
+            body["action_types"] = action_types
+        if observables:
+            body["observables"] = observables
+        if file_paths:
+            body["file_paths"] = file_paths
+        return await self._request("POST", "/events/search", json_data=body)
+
+    async def check_file_ingress(
+        self,
+        from_ts: str,
+        to_ts: str,
+        sha256: str,
+        *,
+        host_names: list[str] | None = None,
+        before: str = "PT10M",
+        after: str = "PT5M",
+        max_process_hops: int = 2,
+        max_evidence: int = 200,
+    ) -> dict[str, Any]:
+        """POST /investigations/file-ingress (spec §5 stage 7). ``observed`` is
+        confirmed, ``inferred`` stays a candidate (never a definitive answer);
+        hops <= 2, evidence <= 200, query count <= 32 (U8 enforces)."""
+        body: dict[str, Any] = {
+            "from": from_ts,
+            "to": to_ts,
+            "sha256": sha256,
+            "before": before,
+            "after": after,
+            "max_process_hops": max_process_hops,
+            "max_evidence": max_evidence,
+        }
+        if host_names:
+            body["host_names"] = host_names
+        return await self._request("POST", "/investigations/file-ingress", json_data=body)
+
+    async def lookup_process_range(
+        self,
+        process_id: str,
+        *,
+        from_ts: str,
+        to_ts: str,
+    ) -> dict[str, Any]:
+        """GET /processes/{process_id}?from&to (spec §5 stage 8).
+        Distinct from the legacy ``lookup_process`` (no time range), which is
+        left untouched. The range selects the index partition (<= 10080 min)."""
+        return await self._request(
+            "GET",
+            f"/processes/{process_id}",
+            params={"from": from_ts, "to": to_ts},
+        )

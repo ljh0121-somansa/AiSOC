@@ -675,6 +675,24 @@ class EdrServerConnector(BaseConnector):
             raise parse_edr_error_body(resp.text, resp.status_code, resp.headers.get("Retry-After"))
         raise RuntimeError("EDR GET retry budget exhausted")
 
+    async def _edr_post(self, client: httpx.AsyncClient, path: str, json_data: dict[str, Any]) -> dict[str, Any]:
+        """POST sibling of ``_edr_get``: 429/503 backoff, other errors raise
+        ``EdrApiError`` with parsed error.code (spec §7)."""
+        url = f"{self._base_url}/api/v2/ai-soc{path}"
+        for attempt in range(3):
+            resp = await client.post(url, json=json_data, headers=self._headers())
+            if resp.status_code in (200, 201, 202):
+                return resp.json()
+            if resp.status_code in (429, 503):
+                if attempt == 2:
+                    raise parse_edr_error_body(resp.text, resp.status_code, resp.headers.get("Retry-After"))
+                retry_after = resp.headers.get("Retry-After")
+                delay = min(float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else 2 ** attempt, 10)
+                await asyncio.sleep(delay)
+                continue
+            raise parse_edr_error_body(resp.text, resp.status_code, resp.headers.get("Retry-After"))
+        raise RuntimeError("EDR POST retry budget exhausted")
+
     async def fetch_detection_detail(
         self, source_kind: str, event_id: str, lookup_hint: str | None = None
     ) -> dict[str, Any]:
@@ -757,4 +775,93 @@ class EdrServerConnector(BaseConnector):
         current snapshot (AGENTS.md §9)."""
         async with httpx.AsyncClient(timeout=10.0, verify=self._ssl_verify()) as client:
             return await self._edr_get(client, f"/hosts/{agent_id}")
+
+    async def hunt(
+        self,
+        from_ts: str,
+        to_ts: str,
+        observables: list[dict[str, str]],
+        sources: list[str] | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """POST /hunt (spec §5 stage 6): does the same hash/IP/URL re-appear
+        on other hosts/users? Exact-match observables only. Chunking (20 per
+        call, max 3 calls/case) is the caller's job (U8)."""
+        body: dict[str, Any] = {"from": from_ts, "to": to_ts, "observables": observables, "limit": limit}
+        if sources:
+            body["sources"] = sources
+        async with httpx.AsyncClient(timeout=10.0, verify=self._ssl_verify()) as client:
+            return await self._edr_post(client, "/hunt", body)
+
+    async def search_case_events(
+        self,
+        from_ts: str,
+        to_ts: str,
+        *,
+        categories: list[str] | None = None,
+        action_types: list[int] | None = None,
+        observables: list[dict[str, str]] | None = None,
+        file_paths: list[str] | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """POST /events/search (spec §5 stage 9, case-investigation variant).
+        Distinct from the legacy GET ``search_events`` (single ``query``
+        param), which is left untouched. Filtered values <= 100, page <= 500
+        and unfiltered broad searches <= 60 min are enforced by the caller (U8)."""
+        body: dict[str, Any] = {"from": from_ts, "to": to_ts, "limit": limit}
+        if categories:
+            body["categories"] = categories
+        if action_types:
+            body["action_types"] = action_types
+        if observables:
+            body["observables"] = observables
+        if file_paths:
+            body["file_paths"] = file_paths
+        async with httpx.AsyncClient(timeout=10.0, verify=self._ssl_verify()) as client:
+            return await self._edr_post(client, "/events/search", body)
+
+    async def check_file_ingress(
+        self,
+        from_ts: str,
+        to_ts: str,
+        sha256: str,
+        *,
+        host_names: list[str] | None = None,
+        before: str = "PT10M",
+        after: str = "PT5M",
+        max_process_hops: int = 2,
+        max_evidence: int = 200,
+    ) -> dict[str, Any]:
+        """POST /investigations/file-ingress (spec §5 stage 7). ``observed`` is
+        confirmed, ``inferred`` stays a candidate (never a definitive answer).
+        ``404 feature_disabled`` / ``features.file_ingress=false`` -> unavailable;
+        hops <= 2, evidence <= 200, query count <= 32 enforced by caller (U8)."""
+        body: dict[str, Any] = {
+            "from": from_ts,
+            "to": to_ts,
+            "sha256": sha256,
+            "before": before,
+            "after": after,
+            "max_process_hops": max_process_hops,
+            "max_evidence": max_evidence,
+        }
+        if host_names:
+            body["host_names"] = host_names
+        async with httpx.AsyncClient(timeout=10.0, verify=self._ssl_verify()) as client:
+            return await self._edr_post(client, "/investigations/file-ingress", body)
+
+    async def lookup_process_range(
+        self,
+        process_id: str,
+        *,
+        from_ts: str,
+        to_ts: str,
+    ) -> dict[str, Any]:
+        """GET /processes/{process_id}?from&to (spec §5 stage 8). Distinct
+        from the legacy ``lookup_process`` (no time range), which is left
+        untouched. The range selects the index partition (<= 10080 min);
+        ``command_line`` may be ``<redacted>`` — never attempt to restore it."""
+        params = {"from": from_ts, "to": to_ts}
+        async with httpx.AsyncClient(timeout=10.0, verify=self._ssl_verify()) as client:
+            return await self._edr_get(client, f"/processes/{process_id}", params)
 
