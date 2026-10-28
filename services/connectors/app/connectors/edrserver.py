@@ -6,8 +6,9 @@ Polls detections from EdrServer REST API v2 with persistent watermarks, chunk sp
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import re
-
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -26,6 +27,96 @@ class EdrAuthError(RuntimeError):
 
 class PageCapReached(RuntimeError):
     """Raised when a chunk hits the 50-page collection limit."""
+
+class EdrApiError(RuntimeError):
+    """Structured error from an EdrServer error body (spec §7).
+
+    Carries the parsed ``error.code``, ``retryable``, ``details``,
+    ``request_id`` and ``Retry-After`` header. A ``code=None`` means the
+    body was not in the documented shape; callers must treat the call as
+    "incomplete", never "unavailable" (spec §5).
+    """
+
+    def __init__(
+        self,
+        status: int,
+        code: str | None,
+        message: str,
+        retryable: bool,
+        details: dict[str, Any] | None,
+        request_id: str | None,
+        retry_after: str | None,
+    ) -> None:
+        self.status = status
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+        self.details = details
+        self.request_id = request_id
+        self.retry_after = retry_after
+        super().__init__(f"EDR API error ({status}) code={code} {message[:120]}")
+
+
+def parse_edr_error_body(body: str, status: int, retry_after: str | None = None) -> EdrApiError:
+    """Parse an EdrServer error body (``{"error": {code,message,retryable,details}, "request_id"}``).
+
+    Unparseable or non-dict bodies yield ``code=None`` with the raw body
+    prefix as the message — callers must treat that as incomplete.
+    """
+    code: str | None = None
+    message = ""
+    retryable = False
+    details: dict[str, Any] | None = None
+    request_id: str | None = None
+
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        data = None
+
+    if isinstance(data, dict):
+        error = data.get("error")
+
+        if isinstance(error, dict):
+            raw_code = error.get("code")
+            code = str(raw_code) if raw_code is not None else None
+            raw_msg = error.get("message")
+            message = str(raw_msg) if raw_msg is not None else ""
+            raw_retryable = error.get("retryable")
+            retryable = raw_retryable is True
+            raw_details = error.get("details")
+
+            if isinstance(raw_details, dict):
+                details = raw_details
+        elif error is not None:
+            message = body[:200]
+
+        raw_request_id = data.get("request_id")
+        if raw_request_id is not None:
+            request_id = str(raw_request_id)
+
+    if not message:
+        message = body[:200]
+
+    return EdrApiError(status, code, message, retryable, details, request_id, retry_after)
+
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_BIDI_RE = re.compile(f"[‪-‮⁦-⁩‎‏​­]")
+def _safe_log_val(value: str) -> str:
+    """Strip ASCII control characters before logging, preventing log injection."""
+    return _CTRL_RE.sub("", str(value))
+
+
+def _strip_control_chars(value: Any) -> Any:
+    """Strip ASCII control chars and bidi/format chars from a string.
+
+    Names/paths come from a vendor the analyst cannot control. A CR/LF or
+    an embedding control char is an attack surface, not a filename.
+    Returns the input unchanged when it is not a string.
+    """
+    if not isinstance(value, str):
+        return value
+    return _BIDI_RE.sub("", _CTRL_RE.sub("", value))
 
 
 class EdrServerConnector(BaseConnector):
@@ -159,24 +250,52 @@ class EdrServerConnector(BaseConnector):
                 params["sources"] = sources
                 params["limit"] = 100
 
-            try:
-                resp = await client.get(url, params=params, headers=self._headers())
-                if resp.status_code == 410:
-                    restarts += 1
-                    if restarts > 2:
-                        raise RuntimeError("cursor_expired restart limit (2) exceeded")
-                    cursor = None
-                    items.clear()
-                    pages = 0
-                    continue
-                resp.raise_for_status()
-                data = resp.json()
-            except httpx.HTTPStatusError as exc:
-                logger.error("edrserver.list_chunk.http_error", status=exc.response.status_code, body=exc.response.text[:500])
-                if exc.response.status_code in (401, 403):
-                    raise EdrAuthError(f"Authentication failed: {exc.response.status_code}") from exc
-                raise
+            # ── 단일 페이지 요청 단위 재시도 루프 (최대 3회) ──
+            resp = None
+            for attempt in range(3):
+                try:
+                    resp = await client.get(url, params=params, headers=self._headers())
+                    
+                    # 410 Gone (Cursor 만료)은 기존대로 상위 페이징 재시작 로직으로 위임
+                    if resp.status_code == 410:
+                        break
 
+                    # 일시적 장애(429, 503, 502, 504)에 대한 백오프 재시도
+                    if resp.status_code in (429, 502, 503, 504):
+                        logger.warning(
+                            "edrserver.list_chunk.transient_error",
+                            status=resp.status_code,
+                            attempt=attempt + 1,
+                        )
+                        if attempt == 2:  # 마지막 시도 실패 시 즉시 에러 발생
+                            resp.raise_for_status()
+                        
+                        retry_after = int(resp.headers.get("Retry-After", 2 ** attempt))
+                        await asyncio.sleep(min(max(1, retry_after), 10))
+                        continue
+
+                    resp.raise_for_status()
+                    break  # 성공 시 재시도 루프 탈출
+
+                except (httpx.ConnectError, httpx.TimeoutException) as exc:
+                    logger.warning("edrserver.list_chunk.net_error", attempt=attempt + 1, exc=str(exc))
+                    if attempt == 2:
+                        raise
+                    await asyncio.sleep(2 ** attempt)
+
+            if resp is None:
+                raise RuntimeError("Failed to obtain response from EDR server")
+
+            if resp.status_code == 410:
+                restarts += 1
+                if restarts > 2:
+                    raise RuntimeError("cursor_expired restart limit (2) exceeded")
+                cursor = None
+                items.clear()
+                pages = 0
+                continue
+
+            data = resp.json()
             page_items = data.get("items", [])
             items.extend(page_items)
             pages += 1
@@ -223,7 +342,10 @@ class EdrServerConnector(BaseConnector):
         return url
 
     async def _enrich(self, client: httpx.AsyncClient, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        sem = asyncio.Semaphore(10)
+        # Default 4 (not 10): 10-way parallel detail calls exceed the EDR
+        # rate limit (token rate or query concurrency), so 200 and 429 come
+        # back mixed; lower it via EDR_DETAIL_MAX_CONCURRENCY if needed.
+        sem = asyncio.Semaphore(self._detail_concurrency())
 
         async def one(item: dict[str, Any]) -> dict[str, Any]:
             async with sem:
@@ -399,6 +521,106 @@ class EdrServerConnector(BaseConnector):
         except ValueError:
             logger.error("edrserver.timestamp_parse_failed", raw=raw)
             return None
+
+    @staticmethod
+    def _lookup_config() -> tuple[int, bool]:
+        """Lookup-path knobs, independent of the polling poller.
+
+        ``PARENT_LOOKUP_MAX_CONCURRENCY`` bounds how many EDR process
+        lookups run at once — the polling ``_enrich`` path keeps its own
+        semaphore(10) and 3x retry; this path must not touch them (AC-9).
+        """
+        max_concurrency = int(os.getenv("PARENT_LOOKUP_MAX_CONCURRENCY", "2") or "2")
+        include_cmd_line = os.getenv(
+            "PARENT_LOOKUP_INCLUDE_COMMAND_LINE", "false"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        return max(1, max_concurrency), include_cmd_line
+
+    @staticmethod
+    def _detail_concurrency() -> int:
+        """Detail-enrichment concurrency for the polling path.
+
+        Default 4 (not 10): 10-way parallel detail calls exceed the EDR
+        rate limit (token rate or query concurrency), so 200 and 429 come
+        back mixed. Raise via ``EDR_DETAIL_MAX_CONCURRENCY`` if the volume
+        needs it.
+        """
+        val = os.getenv("EDR_DETAIL_MAX_CONCURRENCY", "4")
+        try:
+            c = int(val)
+        except (TypeError, ValueError):
+            c = 4
+        return max(1, c)
+
+    async def process_lookup(
+        self,
+        *,
+        entity_id: str,
+        from_ts: str,
+        to_ts: str,
+    ) -> dict[str, Any]:
+        """One-shot parent-process lookup: a single EDR call, no retries.
+
+        The polling path and this lookup are deliberately separate. A
+        failed lookup must never block an analyst from reading an alert,
+        so every failure maps to ``unavailable`` (or ``not_found`` for a
+        clean 404), never raises. Only the parent's entity_id, name,
+        pid, executable and start are returned — command line is
+        opt-in (see ``_lookup_config``) so AC-13 holds by default.
+        """
+        max_concurrency, include_cmd_line = self._lookup_config()
+        url = f"{self._base_url}/api/v2/ai-soc/processes/{quote(str(entity_id))}"
+        params = {"from": str(from_ts), "to": str(to_ts)}
+        sem = asyncio.Semaphore(max_concurrency)
+
+        async with sem:
+            async with httpx.AsyncClient(
+                timeout=2.5, verify=self._ssl_verify()
+            ) as client:
+                try:
+                    resp = await client.get(
+                        url, params=params, headers=self._headers()
+                    )
+                except (httpx.ConnectError, httpx.TimeoutException):
+                    logger.warning(
+                        "edrserver.process_lookup.net_error",
+                        entity_id=_safe_log_val(entity_id),
+                    )
+                    return {"status": "unavailable", "entity_id": str(entity_id), "process": None}
+
+        status = resp.status_code
+        if status == 200:
+            try:
+                data = resp.json()
+            except ValueError:
+                logger.warning("edrserver.process_lookup.invalid_json", entity_id=str(entity_id))
+                return {"status": "unavailable", "entity_id": str(entity_id), "process": None}
+            proc = data.get("process", {}) if isinstance(data, dict) else {}
+            if not isinstance(proc, dict):
+                proc = {}
+            name = proc.get("name")
+            proc_id = proc.get("entity_id") or entity_id
+            if isinstance(name, str) and name.strip():
+                process = {
+                    "entity_id": str(proc_id),
+                    "name": _strip_control_chars(name),
+                    "pid": proc.get("pid"),
+                    "executable": (_strip_control_chars(proc.get("executable"))
+                                   if isinstance(proc.get("executable"), str) else None),
+                    "started_at": proc.get("start"),
+                }
+                if include_cmd_line and isinstance(proc.get("command_line"), str):
+                    process["command_line"] = proc["command_line"][:1024]
+                return {"status": "found", "entity_id": str(proc_id), "process": process}
+            return {"status": "not_found", "entity_id": str(proc_id), "process": None}
+        if status == 404:
+            return {"status": "not_found", "entity_id": str(entity_id), "process": None}
+        logger.warning(
+            "edrserver.process_lookup.http_error",
+            entity_id=_safe_log_val(entity_id),
+            status=status,
+        )
+        return {"status": "unavailable", "entity_id": str(entity_id), "process": None}
 
     async def fetch_alerts(self, since_seconds: int = 300) -> list[dict[str, Any]]:
         start, end = self._calculate_window(since_seconds)
