@@ -23,6 +23,7 @@ Design notes
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -406,6 +407,102 @@ async def complete_run(
             run_id=str(run_id),
             error=str(exc),
         )
+
+
+async def get_active_run(
+    case_id: str,
+    tenant_id: uuid.UUID,
+) -> dict[str, Any] | None:
+    """Return the currently-running run for ``case_id`` (plan U6, spec §2).
+
+    Uses ``idx_inv_runs_case``. Returns ``{"run_id", "status", "started_at"}``
+    or None when no running run exists. The start API's pre-flight checks
+    (U12) consult this before creating a new run; concurrent start requests
+    are serialized by an advisory lock so stale-run recovery stays atomic.
+    """
+    pool = await get_pool()
+    if pool is None:
+        return None
+
+    try:
+        async with pool.acquire() as conn:
+            await _set_rls_context(conn, tenant_id)
+            row = await conn.fetchrow(
+                """
+                SELECT id, status, started_at
+                FROM investigation_runs
+                WHERE case_id = $1 AND status = 'running'
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                case_id,
+            )
+            if row is None:
+                return None
+            return {"run_id": row["id"], "status": row["status"], "started_at": row["started_at"]}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ledger.get_active_run_failed", case_id=case_id, error=str(exc))
+        return None
+
+
+async def get_last_event_ts(
+    run_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+) -> datetime | None:
+    """Return the timestamp of the most recent ledger event for ``run_id``
+    (plan U6, spec §3).
+
+    Uses ``idx_inv_events_run_seq`` (``ORDER BY seq DESC``). U12's stale-run
+    recovery uses this: a running run whose last event is older than the
+    staleness threshold is considered stalled and recovered inside the lock.
+    """
+    pool = await get_pool()
+    if pool is None:
+        return None
+
+    try:
+        async with pool.acquire() as conn:
+            await _set_rls_context(conn, tenant_id)
+            row = await conn.fetchrow(
+                """
+                SELECT ts FROM investigation_events
+                WHERE run_id = $1
+                ORDER BY seq DESC
+                LIMIT 1
+                """,
+                run_id,
+            )
+            return row["ts"] if row else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ledger.get_last_event_ts_failed", run_id=str(run_id), error=str(exc))
+        return None
+
+
+class RunSequence:
+    """Single monotonically-increasing seq issuer for one run (plan U6, spec §3).
+
+    ``investigation_events`` enforces ``UNIQUE(run_id, seq)`` and
+    ``record_event`` uses ``ON CONFLICT (run_id, seq) DO NOTHING`` — so if the
+    runner, heartbeat and recorder each kept their own counters, two could
+    collide on the same seq and one event is silently dropped. A single
+    ``RunSequence`` instance per run is the root-cause fix: every writer asks
+    this one lock-protected counter for its next seq.
+    """
+
+    def __init__(self, start: int = 0) -> None:
+        self._next = start
+        self._lock = asyncio.Lock()
+
+    async def next(self) -> int:
+        """Return the next seq, advancing the counter under the lock."""
+        async with self._lock:
+            seq = self._next
+            self._next += 1
+            return seq
+
+    def peek(self) -> int:
+        """Return the next seq that would be issued (does not advance)."""
+        return self._next
 
 
 def _coerce_uuid(value: Any) -> uuid.UUID | None:
