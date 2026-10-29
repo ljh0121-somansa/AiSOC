@@ -29,6 +29,7 @@ import httpx
 import structlog
 from langchain_core.runnables.config import RunnableConfig
 
+from app.core.service_token import service_token
 import app.investigator.ledger as ledger
 from app.edr.client import (
     EdrApiError,
@@ -101,11 +102,8 @@ def parse_external_id(external_id: str | None) -> tuple[str, str] | None:
 
 
 def _service_token() -> str:
-    """Service token for the api-service graph routes (service-token only, spec §7.1)."""
-    return (
-        os.getenv("AISOC_AGENTS_SERVICE_TOKEN", "").strip()
-        or os.getenv("AISOC_SERVICE_TOKEN", "").strip()
-    )
+    """Service token for the api-service graph routes (delegated to app.core.service_token)."""
+    return service_token()
 
 
 async def fetch_case_investigation_context(case_id: str, tenant_ref: str) -> dict[str, Any]:

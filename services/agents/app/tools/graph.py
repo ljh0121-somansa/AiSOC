@@ -14,6 +14,8 @@ from typing import Any
 import httpx
 import structlog
 
+from app.core.service_token import service_token
+
 logger = structlog.get_logger()
 
 _API_URL = os.getenv("API_SERVICE_URL", "http://api:8000")
@@ -21,12 +23,8 @@ _TIMEOUT = float(os.getenv("AGENTS_API_TIMEOUT", "10.0"))
 
 
 def _service_token() -> str:
-    # Read dynamically (never at import time) so the secret injected after the
-    # process starts is picked up — see the incident fix in docker-compose.yml.
-    return (
-        os.getenv("AISOC_AGENTS_SERVICE_TOKEN", "").strip()
-        or os.getenv("AISOC_SERVICE_TOKEN", "").strip()
-    )
+    """Shared secret for the internal route (delegated to app.core.service_token)."""
+    return service_token()
 
 
 def _headers() -> dict[str, str]:

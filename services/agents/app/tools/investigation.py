@@ -26,6 +26,7 @@ from typing import Any
 import httpx
 import structlog
 
+from app.core.service_token import service_token
 from app.tools.registry import Tool
 
 logger = structlog.get_logger()
@@ -40,10 +41,8 @@ def _api_url() -> str:
     return os.getenv("AISOC_API_URL", "http://api:8000").rstrip("/")
 
 def _service_token() -> str:
-    return (
-        os.getenv("AISOC_AGENTS_SERVICE_TOKEN", "").strip()
-        or os.getenv("AISOC_SERVICE_TOKEN", "").strip()
-    )
+    """Shared secret for the internal route (delegated to app.core.service_token)."""
+    return service_token()
 
 
 

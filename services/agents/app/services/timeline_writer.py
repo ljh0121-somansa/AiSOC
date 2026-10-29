@@ -18,6 +18,8 @@ from typing import Any
 import httpx
 import structlog
 
+from app.core.service_token import service_token
+
 logger = structlog.get_logger()
 
 _API_URL = os.getenv("API_SERVICE_URL", "http://api:8000")
@@ -35,10 +37,8 @@ _VERDICTS = ("true_positive", "false_positive", "insufficient")
 
 
 def _service_token() -> str:
-    return (
-        os.getenv("AISOC_AGENTS_SERVICE_TOKEN", "").strip()
-        or os.getenv("AISOC_SERVICE_TOKEN", "").strip()
-    )
+    """Shared secret for the internal route (delegated to app.core.service_token)."""
+    return service_token()
 
 
 class CaseTimelineWriter:
