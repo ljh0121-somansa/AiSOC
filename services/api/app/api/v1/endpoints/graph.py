@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import structlog
 import uuid
+import os
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
@@ -16,6 +17,7 @@ from sqlalchemy import text
 
 from app.api.v1.deps import CurrentUser, DBSession, get_current_user, require_graph_auth, require_permission
 from app.api.v1.endpoints.alert_writeback import service_token_valid
+from app.db.rls import set_rls_context
 from app.services import graph_service
 from app.services.context_import import import_context
 from app.services.incident_context import get_identity_context_for_accounts, get_incident_context
@@ -818,6 +820,378 @@ async def incident_context(
     payload = context.as_dict()
     payload["narrative"] = context.narrative_lines()
     return IncidentContextResponse(**payload)
+
+class CaseAlertItem(BaseModel):
+    """One linked EDR alert in the case's investigation context."""
+
+    id: str
+    external_id: str | None = None
+    severity: str
+    event_time: datetime
+    raw_event: dict[str, Any] = Field(default_factory=dict)
+
+
+class CaseInvestigationContextResponse(BaseModel):
+    """Case investigation context: the case row plus its linked EDR alerts.
+
+    ``alerts_total`` is how many of the case's ``alert_ids`` resolve to
+    alerts owned by the calling tenant (before the cap). ``truncated`` is
+    true when the server-side cap clipped the returned alert list.
+    """
+
+    case_id: str
+    case_number: str
+    status: str
+    severity: str
+    mitre_techniques: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    alert_ids: list[str] = Field(default_factory=list)
+    alerts: list[CaseAlertItem] = Field(default_factory=list)
+    alerts_total: int = 0
+    truncated: bool = False
+
+
+class CaseInvestigationCommentRequest(BaseModel):
+    """Structured fields only — free-form narrative is NOT accepted (spec §5.3/§6).
+
+    The server assembles the comment body from a fixed template; the agent's
+    ``narrative`` (which may embed attacker-controlled data) never reaches the
+    case timeline. ``verdict`` is restricted to the three-value Case verdict
+    enum; ``limitation_codes`` is length/count-capped.
+    """
+
+    event_type: str
+    run_id: str | None = None
+    verdict: str | None = None
+    synthesis_performed: bool = False
+    confidence: float | None = None
+    limitation_codes: list[str] = Field(default_factory=list)
+    reason_code: str | None = None
+
+
+class CaseInvestigationCommentResponse(BaseModel):
+    created: bool
+    comment_id: str | None = None
+
+
+_EVENT_TYPES = {
+    "investigation_started",
+    "investigation_completed",
+    "investigation_failed",
+    "investigation_skipped",
+}
+_VERDICTS = {"true_positive", "false_positive", "insufficient"}
+_MAX_LIMITATIONS = 32
+_MAX_LIMITATION_LEN = 120
+
+
+def _comment_body(
+    event_type: str,
+    run_id: str | None,
+    verdict: str | None,
+    synthesis_performed: bool,
+    confidence: float | None,
+    limitation_codes: list[str],
+    reason_code: str | None,
+    case_number: str | None,
+) -> str:
+    """Assemble the fixed-template comment body (no free-form text)."""
+    if event_type == "investigation_started":
+        return (
+            f"[Investigation] run {run_id} started for case {case_number}. "
+            "Collecting EDR evidence."
+        )
+    if event_type == "investigation_completed":
+        parts = [f"[Investigation] run {run_id} completed for case {case_number}."]
+        if verdict:
+            parts.append(f" verdict={verdict}.")
+        if confidence is not None:
+            parts.append(f" confidence={confidence}.")
+        if not synthesis_performed:
+            parts.append(" LLM synthesis not performed.")
+        if limitation_codes:
+            parts.append(f" limitations: {', '.join(limitation_codes)}")
+        parts.append(f" [Report] /api/v1/investigations/{run_id}")
+        return " ".join(parts)
+    if event_type == "investigation_failed":
+        return (
+            f"[Investigation] run {run_id} failed for case {case_number} "
+            f"({reason_code or 'error'})."
+        )
+    if event_type == "investigation_skipped":
+        return (
+            f"[Investigation] skipped for case {case_number} "
+            f"({reason_code or 'skipped'}). No run created."
+        )
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="unknown event_type")
+
+
+def _require_case_service_token(
+    x_aisoc_service_token: str | None = Header(default=None, alias="X-AiSOC-Service-Token"),
+) -> None:
+    """Service-token-only gate for the Case-investigation graph routes.
+
+    Deliberately has NO console-JWT fallback: a regular user token must not
+    reach these internal routes. When no service token is configured the
+    route is closed to everyone (fail-closed).
+    """
+    if not service_token_valid(x_aisoc_service_token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="X-AiSOC-Service-Token required",
+        )
+
+
+@router.get(
+    "/case-investigation-context/{case_id}",
+    response_model=CaseInvestigationContextResponse,
+    include_in_schema=False,
+    summary="Case investigation context (case fields + linked EDR alerts) for the agents service",
+)
+async def case_investigation_context(
+    case_id: str,
+    db: DBSession,
+    x_aisoc_service_token: str | None = Header(default=None, alias="X-AiSOC-Service-Token"),
+    x_aisoc_tenant_id: str | None = Header(default=None, alias="X-AiSOC-Tenant-ID"),
+) -> CaseInvestigationContextResponse:
+    """Load the Case investigation context server-side (Pillar-2 runner input).
+
+    Service-token only. The agents worker must not feed Case/Alert content in
+    the request body — this route is the single tenant-scoped source of truth
+    for the case and its linked alerts.
+    """
+    _require_case_service_token(x_aisoc_service_token)
+
+    raw = (x_aisoc_tenant_id or "").strip()
+    if not raw:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="X-AiSOC-Tenant-ID required",
+        )
+    try:
+        tenant_id = uuid.UUID(raw)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="X-AiSOC-Tenant-ID must be a UUID",
+        ) from None
+
+    try:
+        case_uuid = uuid.UUID(case_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="case_id must be a UUID",
+        ) from None
+    await set_rls_context(db, tenant_id)
+
+    case_row = (
+        await db.execute(
+            text(
+                """
+                SELECT c.id, c.title, c.status, c.severity, c.mitre_techniques, c.tags, c.alert_ids
+                  FROM aisoc_cases c
+                 WHERE c.id = :case_id AND c.tenant_id = :tenant_id
+                """
+            ),
+            {"case_id": str(case_uuid), "tenant_id": str(tenant_id)},
+        )
+    ).fetchone()
+    if case_row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="case not found",
+        )
+
+    # Tolerate malformed stored ids: keep only valid UUIDs so a single bad
+    # entry cannot fail the whole context read.
+    alert_ids = []
+    for raw_id in (case_row.alert_ids or []):
+        try:
+            alert_ids.append(uuid.UUID(str(raw_id)))
+        except (ValueError, TypeError):
+            logger.warning(
+                "case_investigation_context.invalid_alert_id",
+                case_id=str(case_row.id),
+                value=str(raw_id)[:64],
+            )
+
+    # Server-side safety cap on the number of alerts returned (U4b). Default
+    # 100; override with AISOC_CASE_CTX_ALERT_LIMIT. When the cap clips the
+    # list, order by severity (critical>high>medium>low>info) then
+    # event_time ascending so high-risk alerts are kept, not cut.
+    alert_limit = int(os.getenv("AISOC_CASE_CTX_ALERT_LIMIT", "100"))
+    severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+
+    all_alerts: list[CaseAlertItem] = []
+    if alert_ids:
+        result = await db.execute(
+            text(
+                """
+                SELECT a.id, a.external_id, a.severity, a.event_time, a.raw_event
+                  FROM alerts a
+                 WHERE a.tenant_id = :tenant_id AND a.id = ANY(:alert_ids)
+                """
+            ),
+            {"tenant_id": str(tenant_id), "alert_ids": alert_ids},
+        )
+        all_alerts = [
+            CaseAlertItem(
+                id=str(r.id),
+                external_id=r.external_id,
+                severity=str(r.severity),
+                event_time=r.event_time,
+                raw_event=dict(r.raw_event or {}),
+            )
+            for r in result
+        ]
+    all_alerts.sort(
+        key=lambda a: (severity_order.get((a.severity or "").lower(), 99), a.event_time)
+    )
+    alerts_total = len(all_alerts)
+    truncated = alerts_total > alert_limit
+    alerts = all_alerts[:alert_limit]
+
+    return CaseInvestigationContextResponse(
+        case_id=str(case_row.id),
+        case_number=str(case_row.title or case_row.id),
+        status=str(case_row.status),
+        severity=str(case_row.severity),
+        mitre_techniques=list(case_row.mitre_techniques or []),
+        tags=list(case_row.tags or []),
+        alert_ids=[str(a) for a in (case_row.alert_ids or [])],
+        alerts=alerts,
+        alerts_total=alerts_total,
+        truncated=truncated,
+    )
+
+
+@router.post(
+    "/cases/{case_id}/investigation-comment",
+    response_model=CaseInvestigationCommentResponse,
+    include_in_schema=False,
+    summary="Post a structured case-investigation result comment (agents service, service-token only)",
+)
+async def post_case_investigation_comment(
+    case_id: str,
+    body: CaseInvestigationCommentRequest,
+    db: DBSession,
+    x_aisoc_service_token: str | None = Header(default=None, alias="X-AiSOC-Service-Token"),
+    x_aisoc_tenant_id: str | None = Header(default=None, alias="X-AiSOC-Tenant-ID"),
+) -> CaseInvestigationCommentResponse:
+    """Post a result/skip comment to the case timeline (U5, spec §6/§7.1).
+
+    Service-token only, same gate as the context API. The request carries
+    structured fields only; the server assembles the body from a fixed
+    template so attacker-controlled narrative never reaches the timeline.
+    Idempotent on (case_id, run_id, event_type); closed cases are still
+    accepted (no status gate).
+    """
+    _require_case_service_token(x_aisoc_service_token)
+
+    raw = (x_aisoc_tenant_id or "").strip()
+    if not raw:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="X-AiSOC-Tenant-ID required",
+        )
+    try:
+        tenant_id = uuid.UUID(raw)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="X-AiSOC-Tenant-ID must be a UUID",
+        ) from None
+    try:
+        case_uuid = uuid.UUID(case_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="case_id must be a UUID",
+        ) from None
+
+    if body.event_type not in _EVENT_TYPES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="unknown event_type")
+    if body.verdict is not None and body.verdict not in _VERDICTS:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid verdict")
+
+    await set_rls_context(db, tenant_id)
+
+    case_row = (
+        await db.execute(
+            text(
+                """
+                SELECT id, title FROM aisoc_cases
+                 WHERE id = :case_id AND tenant_id = :tenant_id
+                """
+            ),
+            {"case_id": str(case_uuid), "tenant_id": str(tenant_id)},
+        )
+    ).fetchone()
+    if case_row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="case not found")
+
+    # Cap the limitation list (spec §6: bounded count/length).
+    capped_limitations = [
+        str(code)[:_MAX_LIMITATION_LEN] for code in (body.limitation_codes or [])[:_MAX_LIMITATIONS]
+    ]
+
+    label = str(case_row.title or case_row.id)
+    expected_body = _comment_body(
+        event_type=body.event_type,
+        run_id=body.run_id,
+        verdict=body.verdict,
+        synthesis_performed=body.synthesis_performed,
+        confidence=body.confidence,
+        limitation_codes=capped_limitations,
+        reason_code=body.reason_code,
+        case_number=label,
+    )
+
+    # Idempotency (spec §6): an identical structured comment for the same
+    # (case_id, run_id, event_type) is a no-op. For run-less ``skipped``
+    # events, dedup within a 1-minute window.
+    existing = (
+        await db.execute(
+            text(
+                """
+                SELECT id, body, created_at
+                  FROM aisoc_case_comments
+                 WHERE case_id = :case_id AND tenant_id = :tenant_id AND is_system = TRUE
+                """
+            ),
+            {"case_id": str(case_uuid), "tenant_id": str(tenant_id)},
+        )
+    ).fetchall()
+    now = datetime.now(UTC)
+    for row in existing:
+        if str(row.body) != expected_body:
+            continue
+        if body.run_id is None and (now - row.created_at).total_seconds() > 60:
+            continue  # stale skip comment, allow a new one
+        return CaseInvestigationCommentResponse(created=False, comment_id=str(row.id))
+
+    comment_id = uuid.uuid4()
+    await db.execute(
+        text(
+            """
+            INSERT INTO aisoc_case_comments
+                (id, case_id, tenant_id, author, body, is_system, created_at)
+            VALUES
+                (:id, :case_id, :tenant_id, :author, :body, TRUE, :now)
+            """
+        ),
+        {
+            "id": str(comment_id),
+            "case_id": str(case_uuid),
+            "tenant_id": str(tenant_id),
+            "author": "aisoc",
+            "body": expected_body,
+            "now": now,
+        },
+    )
+    await db.commit()
+    return CaseInvestigationCommentResponse(created=True, comment_id=str(comment_id))
 
 
 class InvestigationToolRequest(BaseModel):
