@@ -227,12 +227,12 @@
 
 읽기 전용 검증(2026-10-29)에서 확인된, 본 기능 범위 밖이므로 별도 티켓으로 등록한다.
 
-| # | 티켓 | 근거 | 범위 |
+| # | 티켓 | 근거 | 상태 |
 |---|---|---|---|
-| T1 | `action_bridge.py`의 `_service_token` 통합 | `playbook/action_bridge.py:77-79`는 `AISOC_SERVICE_TOKEN` 폴백이 없는 변형 → U16에서 제외 | 소규모 단일 단위(1 파일)로 `app/core/service_token` 위임; 동작 불변 확인 필요 |
-| T2 | `app/api/hunt_search.py`의 `field_validator` 미import로 테스트 수집 에러 | `hunt_search.py:54`의 `@field_validator`가 `pydantic`에서 import되지 않아 `test_response_provenance.py`가 `NameError`로 수집 실패 | 기존 결함(본 기능과 무관) — `from pydantic import field_validator` 추가 |
-| T3 | 기존 실패 13건 (LLM 게이트웨이 미구성, playbook 응답 동사, detection FPR 상한, tenant_scope dev-mode) | 전체 스위트에서 `14 failed`(T2 포함) | 베이스라인(stash) 재실행으로 본 변경과 무관함을 확인. 별도 환경/설정 이슈로 분류 |
-| T4 | `case_timeline`/`case_timeline_events` 테이블명 불일치 + RLS 누락 | 명세 §10-3 선행 이슈 | `aisoc_case_comments`로만 의존해 본 기능은 영향받지 않음(계획 §0) |
+| T1 | `action_bridge.py`의 `_service_token` 통합 | `playbook/action_bridge.py:77-79`는 `AISOC_SERVICE_TOKEN` 폴백이 없는 변형 → U16에서 제외 | **해결** (`0ef2361b`): `service_token(strict=True)`로 위임해 기존 무폴백 동작 보존 |
+| T2 | `hunt_search`의 샘플 폴백 누락 | ClickHouse 실패 시 `hits`/`notice`를 채우지 않아 `test_response_provenance`가 실패 (원인은 import가 아니라 폴백 누락 — `field_validator`는 정상 import됨) | **해결** (`0ef2361b`): 라이브 lake 미도착 시 `_synthetic_hits`로 폴백 + `source="sample"` + human-readable `notice`. `test_response_provenance` 7 passed |
+| T3 | 기존 실패 13건 (LLM 게이트웨이 미구성, playbook 응답 동사, detection FPR 상한, tenant_scope dev-mode) | 전체 스위트에서 `14 failed`(T2 포함) | **미해결** — 베이스라인에도 존재하는 환경/설정 이슈. 본 기능과 무관 |
+| T4 | `case_timeline`/`case_timeline_events` 테이블명 불일치 + RLS 누락 | 명세 §10-3 선행 이슈 | **미해결** — `aisoc_case_comments`로만 의존해 본 기능은 영향받지 않음 |
 
 ## 2. 의존 그래프
 
