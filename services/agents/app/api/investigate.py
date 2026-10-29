@@ -285,13 +285,29 @@ async def _run_case_background(
     state: dict,
     tenant_id: str,
 ) -> None:
-    """Background task: run the U7/U9/U11 case graph, finalise the run."""
+    """Background task: run the U7/U9/U11 case graph, finalise the run (U13)."""
+    import json
     merged = await run_case_investigation(state, persist=True)
     status_value = "completed"
     error = None
     if merged.get("error") is not None:
         status_value = "failed"
         error = str(merged.get("error"))
+    # U13: persist the LLM synthesis report as a `case_report_json` artifact
+    # (spec §5 stage 11 / §7.1); the GET endpoint reads it back.
+    report = merged.get("report")
+    if report:
+        tenant_uuid = await case_ledger.resolve_tenant(state.get("tenant_ref", "default"))
+        if tenant_uuid is not None:
+            try:
+                await case_ledger.record_artifact(
+                    run_id=UUID(run_id),
+                    tenant_id=tenant_uuid,
+                    kind="case_report_json",
+                    content=json.dumps(report, ensure_ascii=False),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("case_report_artifact_failed", run_id=run_id, error=str(exc)[:200])
     await _update_run(run_id, {"status": status_value, "error": error})
 # ---------------------------------------------------------------------------
 # Redis-backed Run Store
@@ -681,12 +697,32 @@ async def launch_investigation(
 
 @router.get("/investigations/{run_id}")
 async def get_investigation(run_id: str, principal: ScopedPrincipal):
-    """Poll investigation status and results."""
+    """Poll investigation status and results (U13: Case runs also expose the
+    structured ``report`` loaded from the ``case_report_json`` artifact)."""
     run = await _load_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Investigation run not found")
     # Strip large fields from polling response — use dedicated endpoints instead
     slim = {k: v for k, v in run.items() if k not in ("report_md", "report_html")}
+    # U13 (spec §5 stage 11, §7.1): Case runs carry a structured report
+    # persisted as a ``case_report_json`` artifact. Additive key — non-case
+    # runs simply have no such artifact, so ``report`` stays None.
+    import json as _json
+    report_json = await _load_report_from_db(run_id, "case_report_json")
+    if report_json:
+        try:
+            report_data = _json.loads(report_json)
+        except ValueError:
+            report_data = None
+        if report_data:
+            slim["report"] = {
+                "verdict": report_data.get("verdict"),
+                "synthesis_performed": report_data.get("synthesis_performed"),
+                "confidence": report_data.get("confidence"),
+                "limitations": report_data.get("limitations") or [],
+                "entities": report_data.get("entities") or {},
+                "mitre_techniques": report_data.get("mitre_techniques") or [],
+            }
     return slim
 
 
