@@ -28,6 +28,10 @@ from pydantic import BaseModel
 from fastapi import status
 
 from app.investigator import InvestigatorOrchestrator
+from app.graph.runner import run_case_investigation
+from app.investigator import ledger as case_ledger
+from app.services.timeline_writer import CaseTimelineWriter
+from app.graph.case_workflow import CaseContextLoadError, fetch_case_investigation_context
 from app.orchestrator.router import RouterOrchestrator
 from app.security.tenant_scope import (
     TENANT_HEADER,
@@ -125,6 +129,170 @@ def is_router_investigate_enabled() -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on", "enabled"}
 
 
+# ---------------------------------------------------------------------------
+# U12: Case-dedicated start gate (flag default OFF)
+# ---------------------------------------------------------------------------
+CASE_INVESTIGATE_FLAG = "AISOC_CASE_INVESTIGATE"
+
+#: A running run whose last ledger event is older than this (spec §9.4:
+# 30 min) is considered stale and is recovered inside the advisory lock.
+STALE_AFTER_S = float(os.getenv("AISOC_CASE_STALE_AFTER_S", "1800"))
+
+
+def case_investigate_enabled() -> bool:
+    """True when the U12 start gate (plan U12, spec §2/§3) is enabled.
+
+    Default off: when off, ``launch_investigation`` keeps the existing
+    Pillar-1 path untouched (merge safety, plan U12 review point 1).
+    """
+    raw = os.environ.get(CASE_INVESTIGATE_FLAG)
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+async def _launch_case_investigation(
+    case_id: str,
+    body: InvestigateRequest,
+    background_tasks: BackgroundTasks,
+    principal: ScopedPrincipal,
+) -> InvestigateResponse:
+    """U12 start gate: pre-flight 4-checks, advisory lock, stale recovery.
+
+    1. Case exists & is owned by the caller's tenant (U4 context API;
+       foreign-tenant or missing -> 404, nothing logged or posted).
+    2. Case not closed -> 409 ``case_closed`` + ``skipped(closed_case)``
+       comment via CaseTimelineWriter.
+    3. At least one supported EDR alert (source_kind dynamic/static) ->
+       otherwise 422 ``no_edr_alert`` + ``skipped(no_edr_alert)`` comment.
+    4. No active non-stale running run -> 409 ``run_in_progress`` with the
+       existing run_id; a stale run is finalised inside the advisory lock
+       as failed(``stale_run_recovered``) before opening the new run.
+    """
+    body.tenant_id = str(scoped_tenant_or_403(principal, body.tenant_id))
+    tenant_uuid = await case_ledger.resolve_tenant(body.tenant_id)
+
+    tenant_header = str(tenant_uuid) if tenant_uuid is not None else str(body.tenant_id)
+    try:
+        ctx = await fetch_case_investigation_context(case_id, tenant_header)
+    except CaseContextLoadError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="case not found",
+        ) from None
+    if ctx.get("status") == "closed":
+        writer = CaseTimelineWriter()
+        await writer.post_investigation_comment(
+            case_id=case_id,
+            tenant_id=str(tenant_uuid or body.tenant_id),
+            event_type="investigation_skipped",
+            reason_code="closed_case",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"reason_code": "case_closed"},
+        )
+
+    alerts = ctx.get("alerts") or []
+    supported = [
+        a for a in alerts
+        if str(a.get("external_id") or "").split(":", 1)[0] in ("dynamic", "static")
+    ]
+    if not supported:
+        writer = CaseTimelineWriter()
+        await writer.post_investigation_comment(
+            case_id=case_id,
+            tenant_id=str(tenant_uuid or body.tenant_id),
+            event_type="investigation_skipped",
+            reason_code="no_edr_alert",
+        )
+        raise HTTPException(
+            status_code=422,
+            detail={"reason_code": "no_edr_alert"},
+        )
+
+    pool = await case_ledger.get_pool()
+    new_run_id = uuid4()
+    if pool is not None and tenant_uuid is not None:
+        lock_key = abs(hash(case_id)) & 0x7FFFFFFF
+        async with pool.acquire() as conn:
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
+            active = await case_ledger.get_active_run(case_id, tenant_uuid)
+            if active is not None:
+                last_ts = await case_ledger.get_last_event_ts(active["run_id"], tenant_uuid)
+                stale = last_ts is None or (datetime.utcnow() - last_ts).total_seconds() > STALE_AFTER_S
+                if stale:
+                    await case_ledger.complete_run(
+                        run_id=active["run_id"],
+                        tenant_id=tenant_uuid,
+                        status="failed",
+                        error="stale_run_recovered",
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={
+                            "reason_code": "run_in_progress",
+                            "existing_run_id": str(active["run_id"]),
+                        },
+                    )
+
+    run_id = str(new_run_id)
+    if tenant_uuid is not None:
+        await case_ledger.start_run(
+            run_id=new_run_id,
+            case_id=case_id,
+            tenant_ref=body.tenant_id,
+            alert_summary=str(body.alert_summary or "")[:8000],
+            raw_alert=body.raw_alert or {},
+            model_used="graph:case_investigation",
+        )
+
+    writer = CaseTimelineWriter()
+    await writer.post_investigation_comment(
+        case_id=case_id,
+        tenant_id=str(tenant_uuid or body.tenant_id),
+        event_type="investigation_started",
+        run_id=run_id,
+    )
+
+    state = {
+        "case_id": case_id,
+        "run_id": run_id,
+        "tenant_ref": body.tenant_id,
+        "alert_count": len(supported),
+        "case_summary": str(body.alert_summary or "")[:8000],
+        "raw_case": body.raw_alert or {},
+    }
+    background_tasks.add_task(_run_case_background, run_id, case_id, state, body.tenant_id)
+    logger.info(
+        "case_investigation.launched",
+        run_id=run_id,
+        case_id=case_id,
+        tenant=str(body.tenant_id),
+    )
+    return InvestigateResponse(
+        run_id=run_id,
+        case_id=case_id,
+        status="running",
+        message=f"Case investigation started. Poll GET /api/v1/investigations/{run_id}",
+    )
+
+
+async def _run_case_background(
+    run_id: str,
+    case_id: str,
+    state: dict,
+    tenant_id: str,
+) -> None:
+    """Background task: run the U7/U9/U11 case graph, finalise the run."""
+    merged = await run_case_investigation(state, persist=True)
+    status_value = "completed"
+    error = None
+    if merged.get("error") is not None:
+        status_value = "failed"
+        error = str(merged.get("error"))
+    await _update_run(run_id, {"status": status_value, "error": error})
 # ---------------------------------------------------------------------------
 # Redis-backed Run Store
 # ---------------------------------------------------------------------------
@@ -491,6 +659,8 @@ async def launch_investigation(
     principal: ScopedPrincipal,
 ):
     """Launch a Pillar-1 autonomous investigation for a case."""
+    if case_investigate_enabled():
+        return await _launch_case_investigation(case_id, body, background_tasks, principal)
     body.tenant_id = str(scoped_tenant_or_403(principal, body.tenant_id))
     run_id = str(uuid4())
     await _save_run(run_id, {
