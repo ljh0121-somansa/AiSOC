@@ -268,3 +268,94 @@ async def test_started_comment_carries_run_id(monkeypatch):
     assert posted.call_args.kwargs["event_type"] == "investigation_started"
     assert posted.call_args.kwargs["run_id"] == resp.run_id
     assert mon.add_task.called  # background runner was scheduled
+
+# ---------------------------------------------------------------------------
+# U15 regression tests (fix #1 failed-status, #2 result comments,
+# #3 single context fetch, #4 start_run inside advisory lock)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_background_failed_finalises_failed_and_posts_failed_comment(monkeypatch):
+    """#1/#2: a graph error sets merged['error'] -> run finalised as failed
+    + investigation_failed comment (spec §9.4 acceptance: failed run)."""
+    run_id = "aaaaaaa1-1111-1111-1111-111111111111"
+    state = {"case_id": CASE_ID, "run_id": run_id, "tenant_ref": "default"}
+    monkeypatch.setattr(
+        inv, "run_case_investigation",
+        mock.AsyncMock(return_value={"error": "graph exploded", "verdict": None,
+                                    "synthesis_performed": False, "confidence": 0,
+                                    "limitations": ["graph_error"]}),
+    )
+    monkeypatch.setattr(case_ledger, "resolve_tenant", mock.AsyncMock(return_value=TENANT))
+    monkeypatch.setattr(case_ledger, "record_artifact", mock.AsyncMock())
+    monkeypatch.setattr(tw.CaseTimelineWriter, "post_investigation_comment",
+                        mock.AsyncMock(return_value=True))
+    monkeypatch.setattr(inv, "_update_run", mock.AsyncMock())
+
+    await inv._run_case_background(run_id, CASE_ID, state, "default")
+
+    posted = tw.CaseTimelineWriter.post_investigation_comment
+    assert posted.called
+    assert posted.call_args.kwargs["event_type"] == "investigation_failed"
+    assert posted.call_args.kwargs["run_id"] == run_id
+    assert inv._update_run.call_args.args[1]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_background_completed_posts_completed_comment(monkeypatch):
+    """#2: a clean run posts investigation_completed carrying the LLM
+    verdict/confidence/limitations into the structured comment (spec §6)."""
+    run_id = "bbbbbbb2-2222-2222-2222-222222222222"
+    state = {"case_id": CASE_ID, "run_id": run_id, "tenant_ref": "default"}
+    monkeypatch.setattr(
+        inv, "run_case_investigation",
+        mock.AsyncMock(return_value={"error": None, "verdict": "insufficient",
+                                    "synthesis_performed": False, "confidence": 0,
+                                    "limitations": ["llm_unavailable"]}),
+    )
+    monkeypatch.setattr(case_ledger, "resolve_tenant", mock.AsyncMock(return_value=TENANT))
+    monkeypatch.setattr(case_ledger, "record_artifact", mock.AsyncMock())
+    monkeypatch.setattr(tw.CaseTimelineWriter, "post_investigation_comment",
+                        mock.AsyncMock(return_value=True))
+    monkeypatch.setattr(inv, "_update_run", mock.AsyncMock())
+
+    await inv._run_case_background(run_id, CASE_ID, state, "default")
+
+    posted = tw.CaseTimelineWriter.post_investigation_comment
+    assert posted.call_args.kwargs["event_type"] == "investigation_completed"
+    assert posted.call_args.kwargs["verdict"] == "insufficient"
+    assert posted.call_args.kwargs["limitation_codes"] == ["llm_unavailable"]
+    assert inv._update_run.call_args.args[1]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_gate_passes_context_into_runner_state(monkeypatch):
+    """#3: the U12 gate forwards the U4 context it already loaded into the
+    runner state so the U9 node does not re-fetch (single U4 fetch per run)."""
+    _run_case(monkeypatch, ctx=_ctx(alerts=[_supported_alert()]), pool=_Pool())
+    mon = mock.Mock()
+    resp = await launch_investigation(CASE_ID, _make_body(), mon, _make_principal())
+    # add_task(func, run_id, case_id, state, tenant_id) -> state is args[3].
+    add_args = mon.add_task.call_args.args
+    state = add_args[3]
+    assert state["case_id"] == CASE_ID
+    assert state["run_id"] == resp.run_id
+    assert state["case_context"]["case_id"] == CASE_ID
+    assert state["alerts"] == [_supported_alert()]
+    # The U4 context endpoint was fetched exactly once by the gate.
+    assert inv.fetch_case_investigation_context.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_start_run_runs_inside_advisory_lock(monkeypatch):
+    """#4: with a DB pool present, start_run now runs INSIDE the advisory-lock
+    block, making stale-recovery + new-run opening atomic (plan U12)."""
+    pool = _Pool()
+    _run_case(monkeypatch, ctx=_ctx(alerts=[_supported_alert()]), pool=pool)
+    mon = mock.Mock()
+    resp = await launch_investigation(CASE_ID, _make_body(), mon, _make_principal())
+    assert resp.status == "running"
+    # start_run was called and the advisory lock was taken on the shared conn.
+    assert case_ledger.start_run.called
+    assert any("advisory" in s[0] for s in pool.conn.executed)

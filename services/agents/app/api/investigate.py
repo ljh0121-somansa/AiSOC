@@ -213,7 +213,12 @@ async def _launch_case_investigation(
 
     pool = await case_ledger.get_pool()
     new_run_id = uuid4()
-    if pool is not None and tenant_uuid is not None:
+    run_id = str(new_run_id)
+    if tenant_uuid is None:
+        # No resolvable tenant: the run is not opened (matches the existing
+        # no-op behavior for unresolvable tenants).
+        pass
+    elif pool is not None:
         lock_key = abs(hash(case_id)) & 0x7FFFFFFF
         async with pool.acquire() as conn:
             await conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
@@ -236,9 +241,20 @@ async def _launch_case_investigation(
                             "existing_run_id": str(active["run_id"]),
                         },
                     )
-
-    run_id = str(new_run_id)
-    if tenant_uuid is not None:
+            # #4: open the new run INSIDE the advisory lock so a concurrent
+            # stale-recovery race is serialised and start_run is atomic with
+            # the stale finalisation (plan U12: "same lock, atomic").
+            await case_ledger.start_run(
+                run_id=new_run_id,
+                case_id=case_id,
+                tenant_ref=body.tenant_id,
+                alert_summary=str(body.alert_summary or "")[:8000],
+                raw_alert=body.raw_alert or {},
+                model_used="graph:case_investigation",
+            )
+    else:
+        # No DB pool: open the run without the lock (degraded path, existing
+        # behavior preserved).
         await case_ledger.start_run(
             run_id=new_run_id,
             case_id=case_id,
@@ -263,6 +279,10 @@ async def _launch_case_investigation(
         "alert_count": len(supported),
         "case_summary": str(body.alert_summary or "")[:8000],
         "raw_case": body.raw_alert or {},
+        # #3: forward the U4 context the gate already loaded so the U9 node
+        # does not re-fetch it (single U4 fetch per run, spec §2/§4).
+        "case_context": ctx,
+        "alerts": ctx.get("alerts") or [],
     }
     background_tasks.add_task(_run_case_background, run_id, case_id, state, body.tenant_id)
     logger.info(
@@ -293,21 +313,48 @@ async def _run_case_background(
     if merged.get("error") is not None:
         status_value = "failed"
         error = str(merged.get("error"))
+    tenant_uuid = await case_ledger.resolve_tenant(state.get("tenant_ref", "default"))
     # U13: persist the LLM synthesis report as a `case_report_json` artifact
     # (spec §5 stage 11 / §7.1); the GET endpoint reads it back.
     report = merged.get("report")
-    if report:
-        tenant_uuid = await case_ledger.resolve_tenant(state.get("tenant_ref", "default"))
-        if tenant_uuid is not None:
-            try:
-                await case_ledger.record_artifact(
-                    run_id=UUID(run_id),
-                    tenant_id=tenant_uuid,
-                    kind="case_report_json",
-                    content=json.dumps(report, ensure_ascii=False),
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("case_report_artifact_failed", run_id=run_id, error=str(exc)[:200])
+    if report and tenant_uuid is not None:
+        try:
+            await case_ledger.record_artifact(
+                run_id=UUID(run_id),
+                tenant_id=tenant_uuid,
+                kind="case_report_json",
+                content=json.dumps(report, ensure_ascii=False),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("case_report_artifact_failed", run_id=run_id, error=str(exc)[:200])
+    # #2: post the result comment (spec §6): completed -> investigation_completed,
+    # failed -> investigation_failed. A failed post does NOT invalidate the run
+    # (spec §6 review point 3); we only log it.
+    cmt_tenant = str(tenant_uuid or state.get("tenant_ref", "default"))
+    writer = CaseTimelineWriter()
+    if status_value == "failed":
+        posted = await writer.post_investigation_comment(
+            case_id=case_id,
+            tenant_id=cmt_tenant,
+            event_type="investigation_failed",
+            run_id=run_id,
+            reason_code=str(error or "graph_error")[:120],
+        )
+        if not posted:
+            logger.warning("case_investigation.failed_comment_post_failed", run_id=run_id)
+    else:
+        posted = await writer.post_investigation_comment(
+            case_id=case_id,
+            tenant_id=cmt_tenant,
+            event_type="investigation_completed",
+            run_id=run_id,
+            verdict=merged.get("verdict"),
+            synthesis_performed=bool(merged.get("synthesis_performed", False)),
+            confidence=merged.get("confidence"),
+            limitation_codes=merged.get("limitations") or [],
+        )
+        if not posted:
+            logger.warning("case_investigation.completed_comment_post_failed", run_id=run_id)
     await _update_run(run_id, {"status": status_value, "error": error})
 # ---------------------------------------------------------------------------
 # Redis-backed Run Store

@@ -305,6 +305,11 @@ async def run_case_investigation(
         logger.warning("case_investigation.budget_timeout", case_id=case_id, max_seconds=budget.max_seconds)
     except Exception as exc:  # noqa: BLE001
         had_error = exc
+        # #1: the background finaliser (_run_case_background) derives the
+        # failed status from merged["error"]; without this key every graph
+        # exception would be recorded as completed (spec §9.4 acceptance: a
+        # hard graph error finalises the run as failed).
+        merged["error"] = str(exc)
         logger.warning("case_investigation.graph_error", case_id=case_id, error=str(exc))
     finally:
         if hb_task is not None:
