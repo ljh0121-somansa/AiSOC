@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import structlog
 from langgraph.graph import END, StateGraph
+from typing import Any
 
 from app.agents.attack_path_agent import run_attack_path
 from app.agents.auto_triage_agent import AutoTriageError, run_auto_triage
@@ -148,3 +149,53 @@ def build_escalation_graph() -> StateGraph:
 # Module-level compiled graphs (singletons)
 investigation_graph = build_investigation_graph()
 escalation_graph = build_escalation_graph()
+
+# ---------------------------------------------------------------------------
+# Case Investigation graph (Pillar-2, plan U7, spec §3)
+# ---------------------------------------------------------------------------
+# A NEW graph, separate from the Alert-unit investigation/escalation graphs
+# (which stay untouched). The Case graph state is a plain dict carrying:
+# case_id, run_id, tenant_id, tenant_ref, edr_evidence, limitations, bundle,
+# report, synthesis_performed, verdict, confidence.
+#
+# Node bodies are skeletons (plan U7 "skeleton only"): edr_collect is a
+# passthrough that U9 will fill with the real collection; case_synthesis is
+# a passthrough that U11 will fill with the LLM synthesis call; persist is a
+# passthrough that U5/U13 will fill with the result-comment + report read.
+
+async def _case_edr_collect(state: dict, config: Any = None) -> dict:
+    """Case EDR collection node (skeleton — U9 wires the real logic)."""
+    return state
+
+
+async def _case_synthesis(state: dict, config: Any = None) -> dict:
+    """Case LLM synthesis node (skeleton — U11 wires the real logic)."""
+    return state
+
+
+async def _case_persist(state: dict, config: Any = None) -> dict:
+    """Case persist node (skeleton — U5/U13 wire result comment + report)."""
+    return state
+
+
+def build_case_investigation_graph():
+    """Build the Case-dedicated graph (spec §3):
+
+    edr_collect ──► case_synthesis ──► persist ──► END
+
+    Separate entry from the existing Alert-unit graphs; the existing
+    ``investigation_graph`` / ``escalation_graph`` are untouched.
+    """
+    graph = StateGraph(dict)
+    graph.add_node("edr_collect", _case_edr_collect)
+    graph.add_node("case_synthesis", _case_synthesis)
+    graph.add_node("persist", _case_persist)
+    graph.set_entry_point("edr_collect")
+    graph.add_edge("edr_collect", "case_synthesis")
+    graph.add_edge("case_synthesis", "persist")
+    graph.add_edge("persist", END)
+    return graph.compile()
+
+
+# Case graph singleton (new; does not affect the existing singletons above)
+case_graph = build_case_investigation_graph()

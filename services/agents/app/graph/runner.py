@@ -20,12 +20,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from dataclasses import dataclass
 
 import structlog
 
 from app.agents.dispositions import NEEDS_REVIEW
 from app.investigator import ledger as ledger_module
+from app.investigation_rules import collection_budget
 from app.models.state import AgentStatus, InvestigationState
 
 logger = structlog.get_logger()
@@ -151,3 +153,132 @@ async def run_escalation(
     from app.graph.workflow import escalation_graph  # noqa: PLC0415 — avoid import cycle
 
     return await _run(escalation_graph, state, budget=budget, persist=persist, seq_start=seq_start)
+
+
+async def _heartbeat_loop(
+    run_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    seq_issuer,
+    interval: float = 60.0,
+) -> None:
+    """Record a ``heartbeat`` ledger event every ``interval`` seconds (plan U7, spec §3).
+
+    Runs concurrently with the graph execution and is cancelled on normal
+    completion, timeout, or exception. Uses the shared per-run sequence issuer
+    (U6 ``RunSequence``) so heartbeat seq never collides with the graph-step
+    recorder.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        await ledger_module.record_event(
+            run_id=run_id,
+            tenant_id=tenant_id,
+            seq=await seq_issuer.next(),
+            kind="heartbeat",
+            agent="runner",
+            summary=f"heartbeat ({interval:.0f}s)",
+            payload={"interval_s": int(interval)},
+        )
+
+
+async def run_case_investigation(
+    state: dict,
+    *,
+    persist: bool = True,
+    heartbeat_interval: float = 60.0,
+    config: dict | None = None,
+) -> dict:
+    """Run the Case-dedicated graph (plan U7, spec §3).
+
+    Separate entry point from the Alert-unit ``run_full_investigation`` /
+    ``run_escalation`` (both untouched). Accepts a plain Case-state dict
+    (``case_id``, ``run_id``, ``tenant_ref``, …) and:
+
+    * opens the run in the Ledger (idempotent, ``ON CONFLICT DO NOTHING``),
+    * starts a 60s-interval heartbeat task that records ``heartbeat`` events,
+    * streams ``case_graph.astream(state, config)`` inside an
+      ``asyncio.timeout`` bounded by the collection budget,
+    * finalises the run as ``completed`` (or ``failed`` on a hard error).
+
+    The heartbeat task is always cancelled on every exit path (normal,
+    timeout, exception). The collection budget comes from U8's
+    :func:`collection_budget` (separate from the LLM budget).
+    """
+    from app.graph.workflow import case_graph
+
+    case_id = str(state.get("case_id", ""))
+    run_id = state.get("run_id") or uuid.uuid4()
+    tenant_ref = str(state.get("tenant_ref", "default"))
+    state["run_id"] = run_id
+
+    budget = collection_budget(int(state.get("alert_count", 1)))
+    tenant_uuid = await ledger_module.resolve_tenant(tenant_ref) if persist else None
+    seq_issuer = ledger_module.RunSequence()
+
+    if persist:
+        await ledger_module.start_run(
+            run_id=run_id,
+            case_id=case_id,
+            tenant_ref=tenant_ref,
+            alert_summary=str(state.get("case_summary", ""))[:8000],
+            raw_alert=state.get("raw_case") or {},
+            model_used="graph:case_investigation",
+        )
+
+    merged: dict = dict(state)
+    hb_task: asyncio.Task | None = None
+    timed_out = False
+    had_error: Exception | None = None
+    config = config or {}
+    config["run_id"] = run_id
+    config["tenant_id"] = tenant_uuid
+    config["seq_issuer"] = seq_issuer
+
+    try:
+        if persist and tenant_uuid is not None:
+            hb_task = asyncio.create_task(
+                _heartbeat_loop(run_id, tenant_uuid, seq_issuer, heartbeat_interval)
+            )
+        async with asyncio.timeout(budget.max_seconds):
+            async for step in case_graph.astream(state, config):
+                if not isinstance(step, dict):
+                    continue
+                for node, out in step.items():
+                    if isinstance(out, dict):
+                        merged.update(out)
+                    if tenant_uuid is not None:
+                        await ledger_module.record_event(
+                            run_id=run_id,
+                            tenant_id=tenant_uuid,
+                            seq=await seq_issuer.next(),
+                            kind="graph_step",
+                            agent=str(node),
+                            summary=f"case graph node '{node}' completed",
+                            payload={"node": str(node)},
+                        )
+    except TimeoutError:
+        timed_out = True
+        logger.warning("case_investigation.budget_timeout", case_id=case_id, max_seconds=budget.max_seconds)
+    except Exception as exc:  # noqa: BLE001
+        had_error = exc
+        logger.warning("case_investigation.graph_error", case_id=case_id, error=str(exc))
+    finally:
+        if hb_task is not None:
+            hb_task.cancel()
+            try:
+                await hb_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+
+    if had_error is not None or timed_out:
+        merged.setdefault("limitations", []).append("collection_budget_exceeded" if timed_out else "graph_error")
+
+    if persist and tenant_uuid is not None:
+        status = "failed" if had_error is not None else "completed"
+        await ledger_module.complete_run(
+            run_id=run_id,
+            tenant_id=tenant_uuid,
+            status=status,
+            error=str(had_error) if had_error else None,
+        )
+    return merged
