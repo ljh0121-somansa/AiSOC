@@ -8,11 +8,10 @@ Otherwise the alert flows through the full manual pipeline, ending with the
 graph-aware Attack-Path agent that walks Neo4j to compute blast radius.
 """
 
-from __future__ import annotations
 
 import structlog
+from langchain_core.runnables.config import RunnableConfig
 from langgraph.graph import END, StateGraph
-from typing import Any
 
 from app.agents.attack_path_agent import run_attack_path
 from app.agents.auto_triage_agent import AutoTriageError, run_auto_triage
@@ -163,17 +162,36 @@ escalation_graph = build_escalation_graph()
 # a passthrough that U11 will fill with the LLM synthesis call; persist is a
 # passthrough that U5/U13 will fill with the result-comment + report read.
 
-async def _case_edr_collect(state: dict, config: Any = None) -> dict:
-    """Case EDR collection node (skeleton — U9 wires the real logic)."""
-    return state
+async def _case_edr_collect(state: dict, config: RunnableConfig | None = None) -> dict:
+    """Case EDR collection node (plan U9, spec §5 stages 0-9)."""
+    from app.graph.case_workflow import edr_collect_node
+
+    return await edr_collect_node(state, config)
 
 
-async def _case_synthesis(state: dict, config: Any = None) -> dict:
-    """Case LLM synthesis node (skeleton — U11 wires the real logic)."""
-    return state
+async def _case_synthesis(state: dict, config: RunnableConfig | None = None) -> dict:
+    """Case LLM synthesis node (plan U11, spec §5.2/§5.3/§6.1)."""
+    from app.graph.case_synthesis import case_synthesis
+
+    result = await case_synthesis(
+        state.get("bundle") or {},
+        case_context=state.get("case_context"),
+        tenant_id=((config or {}).get("configurable") or {}).get("tenant_id"),
+    )
+    out = dict(state)
+    out["verdict"] = result.verdict
+    out["synthesis_performed"] = result.synthesis_performed
+    out["confidence"] = result.confidence
+    out["report"] = result.report
+    lims = list(state.get("limitations") or [])
+    for lim in result.limitations:
+        if lim not in lims:
+            lims.append(lim)
+    out["limitations"] = lims
+    return out
 
 
-async def _case_persist(state: dict, config: Any = None) -> dict:
+async def _case_persist(state: dict, config: RunnableConfig | None = None) -> dict:
     """Case persist node (skeleton — U5/U13 wire result comment + report)."""
     return state
 

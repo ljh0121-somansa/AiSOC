@@ -24,6 +24,7 @@ import uuid
 from dataclasses import dataclass
 
 import structlog
+from langchain_core.runnables.config import RunnableConfig
 
 from app.agents.dispositions import NEEDS_REVIEW
 from app.investigator import ledger as ledger_module
@@ -224,15 +225,38 @@ async def run_case_investigation(
             raw_alert=state.get("raw_case") or {},
             model_used="graph:case_investigation",
         )
+        # Start event (spec §3): the case run is marked case-scoped so the
+        # Ledger can distinguish it from the Alert-unit runs (incident id in
+        # case_id). Recorded right after the run is opened, under the shared
+        # RunSequence so its seq never collides with heartbeat/graph-step events.
+        await ledger_module.record_event(
+            run_id=run_id,
+            tenant_id=tenant_uuid,
+            seq=await seq_issuer.next(),
+            kind="start",
+            agent="runner",
+            summary="case investigation started",
+            payload={"scope": "case"},
+        )
 
     merged: dict = dict(state)
     hb_task: asyncio.Task | None = None
     timed_out = False
     had_error: Exception | None = None
-    config = config or {}
-    config["run_id"] = run_id
-    config["tenant_id"] = tenant_uuid
-    config["seq_issuer"] = seq_issuer
+    # LangGraph forwards only ``config["configurable"]`` to nodes (U7b): the
+    # per-run recorder handle (seq_issuer) plus run/tenant ids must live under
+    # ``configurable`` so nodes can actually pick them up.
+    cfg: RunnableConfig = config or {}
+    cfg["configurable"] = {
+        # Caller-supplied configurable keys are merged first; the runtime
+        # run/tenant/seq_issuer are placed last so they always win over any
+        # caller-supplied values (U7b invariant: nodes must see the real
+        # per-run recorder, never a caller-injected one).
+        **(cfg.get("configurable") or {}),
+        "run_id": run_id,
+        "tenant_id": tenant_uuid,
+        "seq_issuer": seq_issuer,
+    }
 
     try:
         if persist and tenant_uuid is not None:
@@ -240,12 +264,32 @@ async def run_case_investigation(
                 _heartbeat_loop(run_id, tenant_uuid, seq_issuer, heartbeat_interval)
             )
         async with asyncio.timeout(budget.max_seconds):
-            async for step in case_graph.astream(state, config):
+            async for step in case_graph.astream(state, cfg):
                 if not isinstance(step, dict):
                     continue
                 for node, out in step.items():
                     if isinstance(out, dict):
                         merged.update(out)
+                    # Q3 fallback (spec §3): when nodes had no injected
+                    # recorder, the node accumulates edr_call records in
+                    # ``_pending_ledger_events``; the runner flushes them at
+                    # the tier boundary (node transition) preserving the
+                    # original call timestamps.
+                    pending = out.get("_pending_ledger_events") if isinstance(out, dict) else None
+                    if pending and tenant_uuid is not None:
+                        for ev in pending:
+                            await ledger_module.record_event(
+                                run_id=run_id,
+                                tenant_id=tenant_uuid,
+                                seq=await seq_issuer.next(),
+                                kind=ev.get("kind", "edr_call"),
+                                agent=ev.get("agent", "edr_collect"),
+                                summary=str(ev.get("summary", ""))[:8000],
+                                payload=ev.get("payload"),
+                                input_hash=ev.get("input_hash"),
+                                output_hash=ev.get("output_hash"),
+                                duration_ms=int(ev.get("duration_ms", 0)),
+                            )
                     if tenant_uuid is not None:
                         await ledger_module.record_event(
                             run_id=run_id,

@@ -290,21 +290,29 @@ class EdrClient:
         categories: list[str] | None = None,
         action_types: list[int] | None = None,
         limit: int = 100,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
         """GET /investigations/{source_kind}/{event_id}/timeline (spec §5 stage 3).
 
         static source_kind is not supported: skip the call and report
         unavailable (spec §5 "unavailable" strict rule — pre-decision, no HTTP
         call is made, so no error code is needed).
+        Pagination (spec §16): when the previous page returned ``has_more``/
+        ``next_cursor``, resend ONLY the opaque ``cursor`` — never the original
+        filters/time range.
         """
         if source_kind == "static":
             return {"status": "unavailable", "reason_code": "timeline_unavailable(static)"}
 
-        params: dict[str, Any] = {"before": before, "after": after, "limit": limit}
-        if categories:
-            params["categories"] = ",".join(categories)
-        if action_types:
-            params["action_types"] = ",".join(str(a) for a in action_types)
+        params: dict[str, Any]
+        if cursor is not None:
+            params = {"cursor": cursor}
+        else:
+            params = {"before": before, "after": after, "limit": limit}
+            if categories:
+                params["categories"] = ",".join(categories)
+            if action_types:
+                params["action_types"] = ",".join(str(a) for a in action_types)
 
         return await self._request(
             "GET", f"/investigations/{source_kind}/{event_id}/timeline", params=params
