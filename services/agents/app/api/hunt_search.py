@@ -17,8 +17,8 @@ from typing import Any, Literal
 
 import httpx
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, field_validator
 
 from app.security.tenant_scope import require_console_or_service_auth
 
@@ -401,8 +401,7 @@ async def hunt_search(query: HuntQuery) -> HuntResponse:
     """Execute a hunt query and return matching telemetry events."""
     start = time.monotonic()
 
-    hits_list = None
-
+    live_hits = None
     lang = query.language.lower()
     if lang == "sql":
         sql = _prepare_sql_query(
@@ -410,7 +409,7 @@ async def hunt_search(query: HuntQuery) -> HuntResponse:
             start_iso=query.startTime,
             end_iso=query.endTime,
         )
-        hits_list = await _execute_clickhouse_query(sql, query.limit)
+        live_hits = await _execute_clickhouse_query(sql, query.limit)
     else:
         # Non-SQL dialects (esql, kql, spl, lucene): extract terms & filter ClickHouse
         sql = _build_clickhouse_query_for_non_sql(
@@ -419,16 +418,32 @@ async def hunt_search(query: HuntQuery) -> HuntResponse:
             start_iso=query.startTime,
             end_iso=query.endTime,
         )
-        hits_list = await _execute_clickhouse_query(sql, query.limit)
-    hits_list = [HuntHit(**h) for h in (hits_list or [])]
-
+        live_hits = await _execute_clickhouse_query(sql, query.limit)
     took_ms = int((time.monotonic() - start) * 1000)
+
+    # Provenance contract (test_response_provenance): when the live lake query
+    # fails (returns None), fall back to labelled synthetic hits so the UI
+    # workbench is not blank, and mark the response as sample + a human-
+    # readable notice so a caller can tell synthetic data from live data.
+    if live_hits is None:
+        hits_list = [HuntHit(**h) for h in _synthetic_hits(query.query, query.limit)]
+        source = "sample"
+        notice = (
+            "Showing synthetic sample events, not results from your telemetry "
+            "(live ClickHouse lake unreachable)."
+        )
+    else:
+        hits_list = [HuntHit(**h) for h in live_hits]
+        source = "live"
+        notice = None
 
     return HuntResponse(
         query=query.query,
         total=len(hits_list),
         took_ms=took_ms,
         hits=hits_list,
+        source=source,
+        notice=notice,
     )
 
 

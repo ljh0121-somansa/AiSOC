@@ -20,14 +20,16 @@ PRIMARY_ENV = "AISOC_AGENTS_SERVICE_TOKEN"
 LEGACY_ENV = "AISOC_SERVICE_TOKEN"
 
 
-def service_token() -> str:
+def service_token(*, strict: bool = False) -> str:
     """Return the shared service token, or ``""`` when unset.
 
-    Reads ``AISOC_AGENTS_SERVICE_TOKEN`` first, falling back to the legacy
-    ``AISOC_SERVICE_TOKEN``. An empty return means "do not call" the API's
-    service path.
+    Default mode: read ``AISOC_AGENTS_SERVICE_TOKEN`` first, falling back
+    to the legacy ``AISOC_SERVICE_TOKEN``. ``strict=True`` reads only the
+    primary var (no legacy fallback), so a caller whose refusal semantics
+    must stay byte-identical to its pre-helper behavior (the playbook action
+    bridge) keeps working as before.
     """
-    return (
-        os.getenv(PRIMARY_ENV, "").strip()
-        or os.getenv(LEGACY_ENV, "").strip()
-    )
+    primary = os.getenv(PRIMARY_ENV, "").strip()
+    if strict:
+        return primary
+    return primary or os.getenv(LEGACY_ENV, "").strip()

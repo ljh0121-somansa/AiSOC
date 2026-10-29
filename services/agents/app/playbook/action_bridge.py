@@ -33,6 +33,7 @@ from typing import Any
 
 import httpx
 
+from app.core.service_token import service_token
 from .errors import PermanentStepFailure
 
 #: HTTP statuses in the 4xx range that ask to be retried rather than refusing.
@@ -75,8 +76,8 @@ def actions_execute() -> bool:
 
 
 def _service_token() -> str:
-    """Shared secret for the API's service path. Empty means "do not call"."""
-    return os.getenv("AISOC_AGENTS_SERVICE_TOKEN", "").strip()
+    """Shared secret for the API's service path (delegated to app.core.service_token, strict)."""
+    return service_token(strict=True)
 
 
 class BridgeUnavailable(RuntimeError):
